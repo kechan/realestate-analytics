@@ -1,5 +1,8 @@
 from typing import Dict, List, Union
 import pandas as pd
+import numpy as np
+
+import logging
 
 from datetime import datetime, date, timedelta
 from tqdm.auto import tqdm
@@ -64,81 +67,204 @@ def compute_metrics(df, geo_level):
 
 class SoldMedianMetricsProcessor:
   def __init__(self, datastore: Datastore, cache_dir: Union[str, Path] = None):
+    self.logger = logging.getLogger(self.__class__.__name__)
+
     self.datastore = datastore
     self.cache_dir = Path(cache_dir) if cache_dir else None
     if self.cache_dir:
       self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     self.cache = FileBasedCache(cache_dir=self.cache_dir)  
-    print(self.cache.cache_dir)
+    self.logger.info(f'cache dir: {self.cache.cache_dir}')
+
+    self.last_run_key = "SoldMedianMetricsProcessor_last_run"
+    last_run = self.cache.get(self.last_run_key)
+    self.logger.info(f"Last run: {last_run}")
 
     self.sold_listing_df = None
     self.geo_entry_df = None
 
   def extract(self, from_cache=False):
+    self.logger.info("Extract")
     if from_cache:
       self._load_from_cache()
     else:
       self._extract_from_datastore()
-      if self.cache_dir:
-        self._save_to_cache()
+  
   
   def _extract_from_datastore(self):
-    current_date = datetime.now()
-    start_time = datetime(current_date.year - 5, current_date.month, 1)
+    last_run = self.cache.get(self.last_run_key)
+    self.logger.info(f"Last run: {last_run}")
 
-    _, self.sold_listing_df = self.datastore.get_sold_listings(
-      start_time = start_time,
-      selects=[
+    try: 
+      # first run
+      if last_run is None:
+
+        end_time = self.get_current_datetime()
+        start_time = datetime(end_time.year - 5, end_time.month, 1)
+
+        success, self.sold_listing_df = self.datastore.get_sold_listings(
+          start_time = start_time,
+          end_time = end_time,
+          selects=[
+              'mls',
+              'lastTransition', 'transitions', 
+              'listingType', 'searchCategoryType', 
+              'listingStatus',
+              'beds', 'bedsInt', 'baths', 'bathsInt',        
+              'price','soldPrice',
+              'daysOnMarket',
+              'lat', 'lng',
+              'city','neighbourhood',
+              'provState',
+              'guid'
+              ])
+        if not success:
+          self.logger.error(f"Failed to retrieve sold listings from {start_time} to {end_time}")
+          raise ValueError("Failed to retrieve sold listings")
+
+      else:   # inc/delta load
+        # Load existing data from cache
+        self.sold_listing_df = self.cache.get('five_years_sold_listing')
+        if self.sold_listing_df is None:
+          self.logger.error("Cache is inconsistent. Missing prior sold_listing_df.")
+          raise ValueError("Cache is inconsistent. Missing prior sold_listing_df.")
+        
+        # get the sold listings from last run till now
+        start_time = last_run - timedelta(days=21)    # load from 21 days before last run to have bigger margin of safety.
+        end_time = self.get_current_datetime()
+
+        success, delta_sold_listing_df = self.datastore.get_sold_listings(
+          start_time=start_time,
+          end_time=end_time,
+          selects=[
           'mls',
           'lastTransition', 'transitions', 
-          'listingType', 'searchCategoryType', 
-          'listingStatus',
-          'beds', 'bedsInt', 'baths', 'bathsInt',        
-          'price','soldPrice',
+          'lastUpdate',
+          'listingType', 'searchCategoryType',
+          'listingStatus',       
+          'beds', 'bedsInt', 'baths', 'bathsInt',
+          'price','soldPrice',      
           'daysOnMarket',
           'lat', 'lng',
-          'city','neighbourhood',
+          'city', 'neighbourhood',
           'provState',
           'guid'
           ])
-      # geo_entr_df is only available thru cache, not datastore 
-      # this dataframe shouldnt be needed during deployment, it is here to only fix legacy data (a 1 time operation)
+        if not success:
+          self.logger.error(f"Failed to retrieve delta sold listings from {start_time} to {end_time}")
+          raise ValueError("Failed to retrieve delta sold listings")
+        self.logger.info(f'Loaded {len(delta_sold_listing_df)} sold listings from {start_time} to {end_time}')
+
+        # merge delta with whole
+        self.sold_listing_df = pd.concat([self.sold_listing_df, delta_sold_listing_df], axis=0, ignore_index=True)
+        self.sold_listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='last')
+
+        # get rid of stuff older than 5 years (but incl. the full 1st month)
+        len_sold_listing_df_before_delete = len(self.sold_listing_df)
+        five_years_ago_from_now = datetime(end_time.year - 5, end_time.month, 1)
+        drop_idxs = self.sold_listing_df.q("lastTransition < @five_years_ago_from_now").index
+        self.sold_listing_df.drop(index=drop_idxs, inplace=True)
+        self.sold_listing_df.reset_index(drop=True, inplace=True)
+        len_sold_listing_df_after_delete = len(self.sold_listing_df)
+        self.logger.info(f'removed {len_sold_listing_df_before_delete - len_sold_listing_df_after_delete} sold listings older than 5 years')
+
+      # if all operations are successful, update the cache
+      if self.cache.cache_dir:
+        self._save_to_cache()
+        self.cache.set(key=self.last_run_key, value=end_time)
+
+    except Exception as e:
+      self.logger.error(f"Error occurred during extract: {e}")
+      raise
+
+
     
   def _load_from_cache(self):
     if not self.cache.cache_dir:
+      self.logger.error("Cache directory not set. Cannot load from cache.")
       raise ValueError("Cache directory not set. Cannot load from cache.")
 
     self.sold_listing_df = self.cache.get('five_years_sold_listing')
     self.geo_entry_df = self.cache.get('all_geo_entry')
 
-    print(f"Loaded {len(self.sold_listing_df)} sold listings and {len(self.geo_entry_df)} geo entries from cache.")
+    self.logger.info(f"Loaded {len(self.sold_listing_df)} sold listings and {len(self.geo_entry_df)} geo entries from cache.")
 
   def _save_to_cache(self):
-    if not self.cache_dir:
+    if not self.cache.cache_dir:
       raise ValueError("Cache directory not set. Cannot save to cache.")
 
     self.cache.set('five_years_sold_listing', self.sold_listing_df)
-
-    print(f"Saved {len(self.sold_listing_df)} sold listings to cache.")
+    self.logger.info(f"Saved {len(self.sold_listing_df)} sold listings to cache.")
 
 
   def transform(self):
+    self.logger.info("Transform")
     # Add geog_ids to sold listings, this is needed only for legacy data
     self.add_geog_ids_to_sold_listings()
-    price_series, dom_series = self.compute_5_year_metrics()
+    self.compute_5_year_metrics()
+
+    # optimize such that we don't update on things that didnt change from last run
+    prev_price_series = self.cache.get('five_years_price_series')
+    prev_dom_series = self.cache.get('five_years_dom_series')
+    if prev_price_series is None or prev_dom_series is None:
+      self.logger.info("No previous times series found. Keeping entire currently computed time series.")
+      self.diff_price_series = self.final_price_series
+      self.diff_dom_series = self.final_dom_series
+    else:
+      self.logger.info("Previous times series found. Computing update delta.")
+      self.diff_price_series = self._get_delta_dataframe(self.final_price_series, prev_price_series)
+      self.diff_dom_series = self._get_delta_dataframe(self.final_dom_series, prev_dom_series)
+
+    self.logger.info(f'Prepared to update {len(self.diff_price_series)} price time series, and {len(self.diff_dom_series)} DOM time series.')
+
+    # Cache the current data for the next run
+    self.cache.set('five_years_price_series', self.final_price_series)
+    self.cache.set('five_years_dom_series', self.final_dom_series)
 
   def load(self):
+    self.logger.info("Load")
     success, failed = self.update_mkt_trends_ts_index()
     return success, failed
+  
+  def cleanup(self):
+    if not self.cache.cache_dir:
+      self.logger.error("Cache directory not set. Cannot cleanup cache.")      
+      raise ValueError("Cache directory not set. Cannot cleanup cache.")
+    
+    cache_keys = ['five_years_sold_listing',
+                  'five_years_dom_series_df',
+                  'five_years_price_series_df',
+                  self.last_run_key
+                  ]
+    
+    for key in cache_keys:
+      try:
+        self.cache.delete(key)
+      except Exception as e:
+        self.logger.error(f"Error deleting cache key {key}: {e}")
+
+    self.logger.info("Cache cleanup complete.")
+      
+
+  def reset(self):
+    self.cleanup()
+
+
+  def full_refresh(self):
+    self.cleanup()
+    self.extract(from_cache=False)
+    self.transform()
+    self.load()
 
 
   def compute_5_year_metrics(self):
     # Construct date range for the past 60 full months plus the current month to date.
-    current_date = datetime.now().date()
+
+    current_date = self.get_current_datetime().date()
     current_month_start = date(current_date.year, current_date.month, 1)
     start_date = (current_month_start.replace(day=1) - pd.DateOffset(months=12*5)).date()
-    print(f'start_date: {start_date}\ncurrent_date: {current_date}')
+    self.logger.info(f'Computing 5 yr metrics for start_date: {start_date} to current_date: {current_date}')
 
     self.sold_listing_df.lastTransition = pd.to_datetime(self.sold_listing_df.lastTransition)
 
@@ -149,6 +275,7 @@ class SoldMedianMetricsProcessor:
     ]
 
     if df.empty:
+      self.logger.error("No data available for the specified date range")
       raise ValueError("No data available for the specified date range")
 
     # Compute metrics for each geographic level and concat into a single dataframe
@@ -169,6 +296,7 @@ class SoldMedianMetricsProcessor:
 
 
   def add_geog_ids_to_sold_listings(self):    
+    legacy_data_path = False   # TODO: remove this when guid bug is fixed on the ES.
 
     # Function to parse geog_ids
     def parse_geog_ids(geog_string):
@@ -183,11 +311,7 @@ class SoldMedianMetricsProcessor:
           parsed[f'geog_id_{level}'] = geog_id
       return parsed
     
-    if 'guid' in self.sold_listing_df.columns:
-      geo_data = self.sold_listing_df.guid.apply(parse_geog_ids)
-      for level in ['10', '20', '30', '40']:
-        self.sold_listing_df[f'geog_id_{level}'] = geo_data.apply(lambda x: x.get(f'geog_id_{level}'))
-    else:
+    if legacy_data_path:
       # legacy data path
       # Merge the geo_entry_df with the sold_listing_df
       self.sold_listing_df = join_df(self.sold_listing_df, 
@@ -200,66 +324,104 @@ class SoldMedianMetricsProcessor:
       geog_data = self.sold_listing_df.GEOGRAPHIES.apply(parse_geog_ids)
       for level in ['10', '20', '30', '40']:
         self.sold_listing_df[f'geog_id_{level}'] = geog_data.apply(lambda x: x.get(f'geog_id_{level}'))
+    else:
+      if 'guid' in self.sold_listing_df.columns:
+        geo_data = self.sold_listing_df.guid.apply(parse_geog_ids)
+        for level in ['10', '20', '30', '40']:
+          self.sold_listing_df[f'geog_id_{level}'] = geo_data.apply(lambda x: x.get(f'geog_id_{level}'))
+      else:
+        self.logger.error("No GUID column found in sold_listing_df. Cannot proceed with geog_id mapping.")
+        raise ValueError("No GUID column found in sold_listing_df. Cannot proceed with geog_id mapping.")
+    
     
   
   def update_mkt_trends_ts_index(self):
-
+    """
+    
+    """
     def generate_actions():
-        # Merge price and DOM series on geog_id, propertyType, and geo_level
-        merged_df = pd.merge(self.final_price_series, self.final_dom_series, 
-                             on=['geog_id', 'propertyType', 'geo_level'], 
-                             suffixes=('_price', '_dom'))
-        
-        for _, row in merged_df.iterrows():
-            doc = {
-                "geog_id": row['geog_id'],
-                "propertyType": 'ALL' if row['propertyType'] is None else row['propertyType'],
-                "geo_level": int(row['geo_level']),
-                "metrics": {
-                    "median_price": [],
-                    "median_dom": []
-                },
-                "last_updated": datetime.now().isoformat()
+      merged_df = pd.merge(self.diff_price_series, self.diff_dom_series, 
+                          on=['geog_id', 'propertyType', 'geo_level'], 
+                          suffixes=('_price', '_dom'))
+      
+      for _, row in merged_df.iterrows():
+        new_metrics = {
+          "median_price": [],
+          "median_dom": []
+        }
+
+        for col in merged_df.columns:
+          if col.startswith('20') and col.endswith('_price'):
+            date = col.split('_')[0]
+            value = row[col]
+            if pd.notna(value):
+              new_metrics["median_price"].append({
+                "date": date,
+                "value": float(value)
+              })
+          elif col.startswith('20') and col.endswith('_dom'):
+            date = col.split('_')[0]
+            value = row[col]
+            if pd.notna(value):
+              new_metrics["median_dom"].append({
+                "date": date,
+                "value": int(value)
+              })
+
+        property_type_id = "ALL" if row['propertyType'] is None else row['propertyType']            
+        composite_id = f"{row['geog_id']}_{property_type_id}"
+
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_id": composite_id,
+          "script": {
+            "source": """
+            if (ctx._source.metrics == null) {
+              ctx._source.metrics = new HashMap();
             }
-
-            for col in merged_df.columns:
-                if col.startswith('20') and col.endswith('_price'):
-                    date = col.split('_')[0]
-                    value = row[col]
-                    if pd.notna(value):
-                        doc["metrics"]["median_price"].append({
-                            "date": date,
-                            "value": float(value)
-                        })
-                elif col.startswith('20') and col.endswith('_dom'):
-                    date = col.split('_')[0]
-                    value = row[col]
-                    if pd.notna(value):
-                        doc["metrics"]["median_dom"].append({
-                            "date": date,
-                            "value": int(value)
-                        })
-
-            property_type_id = "ALL" if row['propertyType'] is None else row['propertyType']            
-
-            # Composite _id using geog_id and propertyType
-            composite_id = f"{row['geog_id']}_{property_type_id}"
-
-            yield {
-              "_op_type": "update",
-              "_index": self.datastore.mkt_trends_ts_index_name,
-              "_id": composite_id,
-              "doc": doc,
-              "doc_as_upsert": True
+            ctx._source.metrics.median_price = params.new_metrics.median_price;
+            ctx._source.metrics.median_dom = params.new_metrics.median_dom;
+            ctx._source.geog_id = params.geog_id;
+            ctx._source.propertyType = params.propertyType;
+            ctx._source.geo_level = params.geo_level;
+            ctx._source.last_updated = params.last_updated;
+            """,
+            "params": {
+              "new_metrics": new_metrics,
+              "geog_id": row['geog_id'],
+              "propertyType": property_type_id,
+              "geo_level": int(row['geo_level']),
+              "last_updated": datetime.now().isoformat()
             }
+          },
+          "upsert": {
+            "geog_id": row['geog_id'],
+            "propertyType": property_type_id,
+            "geo_level": int(row['geo_level']),
+            "metrics": new_metrics,
+            "last_updated": datetime.now().isoformat()
+          }
+        }
 
     # Perform bulk insert
     success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
 
-    print(f"Successfully updated {success} documents")
-    if failed: print(f"Failed to update {len(failed)} documents")
+    self.logger.info(f"Successfully updated {success} documents")
+    if failed: self.logger.error(f"Failed to update {len(failed)} documents")
 
     return success, failed
+
+  
+  def delete_all_mkt_trends_ts(self):
+    query = {
+      "query": {
+        "match_all": {}
+      }
+    }
+    response = self.datastore.es.delete_by_query(index=self.datastore.mkt_trends_ts_index_name, body=query)
+    deleted_count = response["deleted"]
+    self.logger.info(f"Deleted {deleted_count} documents from {self.datastore.mkt_trends_ts_index_name}")
 
 
   def _update_es_sold_listings_with_guid(self) -> None:
@@ -282,287 +444,164 @@ class SoldMedianMetricsProcessor:
     bulk(self.datastore.es, generate_updates())
 
 
-
-
-  # everything is obsolete below this line
-'''
-  def build_loc_info_geog_id_map(self):
+  def _get_delta_dataframe(self, current_df, prev_df) -> pd.DataFrame:
     """
-    Builds a mapping of location information keys to geographic identifiers (geog_ids) at various levels.
+    Identify the delta changes between the current and previous DataFrames.
 
-    This method iterates over unique location information extracted from the sold listings dataframe,
-    querying for geographic identifiers (geog_ids) for each location. It constructs a dictionary where
-    each key is a location information key (constructed from province/state, city, and neighbourhood names),
-    and the value is another dictionary mapping 'geog_id_{level}' to the corresponding geographic identifier.
-
-    The process involves:
-    - Extracting unique location information from the sold listings dataframe.
-    - For each unique location, constructing a location key.
-    - Querying geographic identifiers for each location at various levels of granularity.
-    - Handling any exceptions during the querying process and breaking the loop in case of errors.
-    - Constructing the final mapping of location keys to their respective geographic identifiers.
-
-    Returns:
-        dict: A dictionary where each key is a location information key and the value is another dictionary
-              mapping 'geog_id_{level}' to geographic identifiers. The levels indicate the granularity of the
-              geographic area, with lower numbers being more specific.
-
-    Example of returned dictionary structure:
-    {
-      'ON_Toronto_Casa_Loma': {
-        'geog_id_10': 'g10_dpz82zw0',
-        'geog_id_20': 'g20_dpz83mm2',
-        'geog_id_30': 'g30_dpz89rm7'
-      },
-      'BC_Vancouver_Kitsilano': {
-        'geog_id_30': 'g30_dpz89abc'
-      }
-    }
-    """
-    loc_infos = self.get_unique_loc_infos()
-    hash = {}
-    for _, loc_info in tqdm(loc_infos.iterrows()):
-      loc_info = loc_info.to_dict()
-
-      try:
-        results = self.get_geog_ids(loc_info)
-      except Exception as e:
-        print(f"Error while processing {loc_info}: {e}")
-        raise e   # debug further. #TODO: log errors in the future.
-
-      loc_info_key = self.build_loc_info_key(loc_info)
-    
-      hash[loc_info_key] = {f"geog_id_{result['level']}": result['geog_id'] for result in results}
-
-    return hash
-
-  def build_geog_id_level_df(self):
-    """
-    build a dataframe with loc_info_key (as defined in build_loc_info_key) and 
-    geog_id_10, geog_id_20, geog_id_30 as columns. The geog_ids will be used as gropuby keys
-    when calculating median metrics for sold listings.
-
-    Returns:
-        pandas.DataFrame: A dataframe containing location information keys and geog_ids at different levels.
-
-        E.g. 
-              loc_info_key	                geog_id_30	  geog_id_10	  geog_id_20
-            0	ON_Brockville_Windsor_Heights	g30_drfjtrnn	NaN	          NaN
-            1	NS_Dartmouth_None	            NaN	          NaN	          NaN
-            2	ON_Ottawa_WESTBORO	          g30_f241etq5	g10_f244hr3n	NaN
-    """
-    df = pd.DataFrame(self.build_loc_info_geog_id_map()).T
-    df = df.reset_index().rename(columns={'index': 'loc_info_key'})
-    self._geog_ids_df = df
-    return df
-  
-  def get_unique_loc_infos(self):
-    """
-    Extracts unique location information from the sold listings dataframe.
-
-    This method selects the 'provState', 'city', and 'neighbourhood' columns from the
-    sold_listing_df dataframe, and then drops any duplicate rows to ensure that each
-    combination of province/state, city, and neighbourhood is unique.
-
-    Returns:
-        pandas.DataFrame: A dataframe containing unique combinations of province/state,
-                          city, and neighbourhood from the sold listings.
-    """
-    return self.sold_listing_df[['provState', 'city', 'neighbourhood']].drop_duplicates()
-
-  def get_geog_ids(self, loc_info: Dict[str, str]) -> List[Dict]:
-    """
-    Retrieve geog identifiers (geog_ids) for a given location at various levels of granularity.
-
-    This function queries geo_df (derived from rlp_content_geo_current) to find matching geog_ids for a location,
-    starting from the most specific level (neighborhood) and moving to broader levels (city).
+    This function compares the current DataFrame to the previous DataFrame and identifies
+    rows that are either new or have changed. If the columns have changed between the
+    two DataFrames, it considers the entire current DataFrame as changed. It ensures
+    that the resulting delta DataFrame has the same columns as the original current DataFrame.
 
     Parameters:
-    loc_info (Dict[str, str]): A dictionary containing location information with keys:
-      - 'provState': The province or state code (e.g., 'ON' for Ontario)
-      - 'city': The city name
-      - 'neighbourhood': The neighborhood name
-
-    geo_df (pd.DataFrame): A pandas DataFrame containing geographic data with columns:
-      - 'level': The geo level (10 for most granular, 20, 30 for broader coarser levels)
-      - 'level{level}En': The name of the location at each level (e.g., 'level10En' for neighborhood name)
-      - 'geog_id': The geographic identifier
-      - 'province': The province or state code
-      - 'city': The city name
+    current_df (pd.DataFrame): The current DataFrame with the latest data.
+    prev_df (pd.DataFrame): The previous DataFrame with the data to compare against.
 
     Returns:
-    List[Dict[str, str]]: A list of dictionaries, each containing:
-      - 'geog_id': The geographic identifier
-      - 'level': The level of the geog_id (as a string: '10', '20', or '30')
-
-    The list is ordered from most specific to most general geographic level found.
-
-    Example:
-    >>> loc_info = {'provState': 'ON', 'city': 'Toronto', 'neighbourhood': 'Casa Loma'}
-    >>> geog_ids = get_geog_ids(loc_info, geo_df)
-    >>> print(geog_ids)
-    [{'geog_id': 'g10_dpz82zw0', 'level': '10'}, 
-    {'geog_id': 'g20_dpz83mm2', 'level': '20'}, 
-    {'geog_id': 'g30_dpz89rm7', 'level': '30'}]
+    pd.DataFrame: A DataFrame containing only the rows that are new or have changed,
+                  with the columns in the same order as the original current DataFrame.
     """
+    # Step 1: Check if columns have changed
+    if set(prev_df.columns) != set(current_df.columns):
+      # Columns have changed, consider everything as changed
+      delta_df = current_df.copy()
+    else:
+      original_columns = current_df.columns.tolist()
+      # Columns have not changed, proceed with finding the delta
+      # Ensure both dataframes have the same columns
+      all_columns = list(set(prev_df.columns).union(set(current_df.columns)))
 
-    def query_geo_df(level: int, value: str):
-      # return self.geo_df.q(f"level == {level} and level{level}En == '{value}' and city == '{city}' and province == '{provState}'")
-      mask = (
-        (self.geo_df['level'] == level) &
-        (self.geo_df[f'level{level}En'].fillna('').str.strip() == value) &
-        (self.geo_df['city'].fillna('').str.strip() == city) &
-        (self.geo_df['province'].fillna('').str.strip() == provState)
-      )
-      return self.geo_df[mask]
-    
-    def cleanup_string(s):
-      if s is None:
-        return ''
-      return s.strip() #.replace("'", "''") # no need for escaping since we arent using .q or .query numexpr 
-    
-    provState = cleanup_string(loc_info.get('provState'))
-    city = cleanup_string(loc_info.get('city'))
-    neighbourhood = loc_info.get('neighbourhood')
-    if neighbourhood:
-      neighbourhood = neighbourhood.title()
-      neighbourhood = cleanup_string(neighbourhood)
-    
-    geog_ids = []
-    
-    # Start with the most granular level (10) and stop as soon as we reach a level with a match
-    for level in [10, 20, 30]:
-      first_result = query_geo_df(level, neighbourhood)      
-      if not first_result.empty:
-        geog_ids.append({
-          'geog_id': first_result.iloc[0].geog_id,
-          'level': str(level)
-        })
-        break
+      prev_df = prev_df.reindex(columns=all_columns, fill_value=np.nan)
+      current_df = current_df.reindex(columns=all_columns, fill_value=np.nan)
 
-    # Every parents (up the level) should be present in first_result
-    for upper_level in range(level+10, 40, 10):
-      value = first_result.iloc[0][f'level{upper_level}En']
-      result = query_geo_df(upper_level, value)
-      if not result.empty:
-        geog_ids.append({
-          'geog_id': result.iloc[0].geog_id,
-          'level': str(upper_level)
-        })
+      # Sort dataframes to ensure alignment when comparing
+      prev_df = prev_df.sort_values(by=['geog_id', 'propertyType']).reset_index(drop=True)
+      current_df = current_df.sort_values(by=['geog_id', 'propertyType']).reset_index(drop=True)
 
-    # If no geog_ids were found, just try to find a city-level match
-    if not geog_ids:
-      # city_result = self.geo_df.q(f"level == 30 and level30En == '{city}' and province == '{provState}'")
-      city_result = query_geo_df(30, city)
-      if not city_result.empty:
-        geog_ids.append({
-          'geog_id': city_result.iloc[0].geog_id,
-          'level': '30'
-        })
+      # Merge the dataframes on composite keys to identify new and changed rows
+      merged_df = pd.merge(prev_df, current_df, on=['geog_id', 'propertyType'], how='outer', suffixes=('_prev', '_curr'), indicator=True)
+
+      # Identify new rows and changed rows
+      def row_changed(row):
+        for col in all_columns:
+          if col not in ['geog_id', 'propertyType', '_merge']:
+            if not pd.isna(row[f'{col}_prev']) or not pd.isna(row[f'{col}_curr']):
+              if row[f'{col}_prev'] != row[f'{col}_curr']:
+                return True
+        return False
+
+      new_or_changed_rows = merged_df[
+          (merged_df['_merge'] == 'right_only') | 
+          ((merged_df['_merge'] == 'both') & merged_df.apply(row_changed, axis=1))
+      ]
+
+      # Extract the relevant columns for the delta dataframe
+      relevant_columns = ['geog_id', 'propertyType'] + [col for col in current_df.columns if col not in ['geog_id', 'propertyType']]
+      delta_df = new_or_changed_rows[['geog_id', 'propertyType'] + [f'{col}_curr' for col in relevant_columns if col not in ['geog_id', 'propertyType']]].copy()
+      delta_df.columns = ['geog_id', 'propertyType'] + [col.replace('_curr', '') for col in delta_df.columns if col not in ['geog_id', 'propertyType']]
+
+      # Drop the rows where all values except 'geog_id' and 'propertyType' are NaN (if such rows are not meaningful)
+      delta_df = delta_df.dropna(how='all', subset=[col for col in delta_df.columns if col not in ['geog_id', 'propertyType']])
+
+      # Rearrange columns to match the original order of current_df
+      delta_df = delta_df[original_columns]
+      current_df = current_df[original_columns]
+      prev_df = prev_df[original_columns]
     
-    return geog_ids
+    return delta_df
+
   
-  def build_loc_info_key(self, loc_info: Dict[str, str]) -> str:
+  def get_current_datetime(self):
     """
-    Constructs a key from location information for consistent identification.
-
-    This method takes a dictionary containing location information, specifically the province/state,
-    city, and neighbourhood, and constructs a unique key by concatenating these values. Spaces in the
-    neighbourhood name are replaced with underscores to ensure the key is a valid identifier.
-
-    Parameters:
-        loc_info (Dict[str, str]): A dictionary containing the location information with keys 'provState',
-                                  'city', and 'neighbourhood'.
-
-    Returns:
-        str: A unique location key constructed from the provided location information, formatted as
-            'provState_city_neighbourhood'. If the neighbourhood is not provided, it is omitted from the key.
-
-    Example:
-        >>> loc_info = {'provState': 'ON', 'city': 'Toronto', 'neighbourhood': 'Casa Loma'}
-        >>> key = build_loc_info_key(loc_info)
-        >>> print(key)
-        'ON_Toronto_Casa_Loma'
+    Returns the current datetime. This method can be overridden for testing purposes.
     """
-    
-    provState = loc_info['provState']
-    city = loc_info['city']
-    neighbourhood = loc_info['neighbourhood']
-    if neighbourhood:
-      neighbourhood = neighbourhood.replace(' ', '_')
-
-    return f"{provState}_{city}_{neighbourhood}"
-  
-  def old_add_geog_ids_to_sold_listings(self):
-    """
-    # def create_loc_info_key(row):
-    #   return self.build_loc_info_key(row[['provState', 'city', 'neighbourhood']].to_dict())
-    
-    # self.sold_listing_df['loc_info_key'] = self.sold_listing_df.apply(create_loc_info_key, axis=1)
-
-    # if self._geog_ids_df is None:
-    #   self.build_geog_id_level_df()
-
-    # self.sold_listing_df = join_df(self.sold_listing_df, 
-    #                               self._geog_ids_df, 
-    #                               left_on='loc_info_key', 
-    #                               right_on='loc_info_key', 
-    #                               how='left')
-    # self.sold_listing_df.drop(columns=['loc_info_key'], inplace=True)
-    """
-    pass
-
-  def workaround(self):
-    # WORKAROUND: to fill in missing geog_ids with only ['CITY', 'PROV_STATE'] as the FKs
-    missing_mask = self.sold_listing_df[['geog_id_10', 'geog_id_20', 'geog_id_30', 'geog_id_40']].isnull().all(axis=1)
-    if not missing_mask.any(): return
-
-    def count_geog_ids(geographies):
-      if pd.isna(geographies) or not isinstance(geographies, str):
-        return 0
-      return len(geographies.split(','))
-    
-    self.geo_entry_df['geog_id_count'] = self.geo_entry_df['GEOGRAPHIES'].apply(count_geog_ids)  # add geog_id count
-
-    # Create a reduced version of geo_entry_df with unique CITY and PROV_STATE
-    unique_geo_entry = (self.geo_entry_df
-                        .sort_values('geog_id_count', ascending=False)
-                        .groupby(['CITY', 'PROV_STATE'])
-                        .first()
-                        .reset_index()[['CITY', 'PROV_STATE', 'GEOGRAPHIES']])
-
-
-    # Perform the join without MLS
-    filled_df = join_df(
-      self.sold_listing_df.loc[missing_mask, ['city', 'provState']],  # only CITY and PROV_STATE are needed for the join
-      unique_geo_entry,
-      left_on=['city', 'provState'],
-      right_on=['CITY', 'PROV_STATE'],
-      how='left'
-    )
-
-    geog_data = filled_df['GEOGRAPHIES'].apply(parse_geog_ids)
-    for level in ['10', '20', '30', '40']:
-      self.sold_listing_df.loc[missing_mask, f'geog_id_{level}'] = geog_data.apply(lambda x: x.get(f'geog_id_{level}'))
-'''
+    # return datetime.now() - timedelta(days=290) # simulate test
+    return datetime.now()
 
 if __name__ == '__main__':
   datastore = Datastore(host='localhost', port=9201)
 
   processor = SoldMedianMetricsProcessor(datastore)
-  
-  # build_geog_id_level_df is responsible for building the mapping from 
-  # loc_info (city and neighborhood) to geog_ids at different levels.
-  # this shouldn't be necessary if the sold listings have geog_ids stamped onto them
-  # but as of July2024, this is not true and we need to do this at least for legacy historic data.
+
   # add_geog_ids_to_sold_listings will append the mapped geog_ids to the sold_listing_df (sold listing)
   # before the median metrics are calculated.
-
   # _ = processor.build_geog_id_level_df()
 
-  processor.extract(from_cache=True)  
+  processor.extract(from_cache=False)  # run on PROD to get real data
 
+  processor.extract(from_cache=True)  # run on UAT during dev.
   processor.transform()
+  success, failed = processor.load()    # load into UAT during dev
 
-  processor.load()
+  # wait a few days 
+  processor.extract(from_cache=False)  # run on PROD to get real data
 
+  processor.extract(from_cache=True)  # run on UAT during dev.
+  processor.transform()
+  success, failed = processor.load()    # load into UAT during dev
+
+
+""" Sample doc from the mkt_trends_ts index: 
+{'geog_id': 'g30_dpz89rm7',
+  'propertyType': 'SEMI-DETACHED',
+  'geo_level': 30,
+  'metrics': {'median_price': [{'date': '2023-01', 'value': 1035000.0},
+    {'date': '2023-02', 'value': 1152500.0},
+    {'date': '2023-03', 'value': 1260000.0},
+    {'date': '2023-05', 'value': 1363500.0},
+    {'date': '2023-06', 'value': 1358500.0},
+    {'date': '2023-07', 'value': 1169694.5},
+    {'date': '2023-08', 'value': 1100000.0},
+    {'date': '2023-09', 'value': 1207500.0},
+    {'date': '2023-10', 'value': 1192000.0},
+    {'date': '2023-11', 'value': 1037500.0},
+    {'date': '2023-12', 'value': 976000.0},
+    {'date': '2024-01', 'value': 1075000.0},
+    {'date': '2024-02', 'value': 1201054.0},
+    {'date': '2024-03', 'value': 1175333.0},
+    {'date': '2024-04', 'value': 1170500.0},
+    {'date': '2024-05', 'value': 1220000.0},
+    {'date': '2024-06', 'value': 1150000.0},
+    {'date': '2024-07', 'value': 950000.0}],
+   'median_dom': [{'date': '2023-01', 'value': 3},
+    {'date': '2023-02', 'value': 8},
+    {'date': '2023-03', 'value': 8},
+    {'date': '2023-05', 'value': 18},
+    {'date': '2023-06', 'value': 8},
+    {'date': '2023-07', 'value': 8},
+    {'date': '2023-08', 'value': 9},
+    {'date': '2023-09', 'value': 9},
+    {'date': '2023-10', 'value': 9},
+    {'date': '2023-11', 'value': 15},
+    {'date': '2023-12', 'value': 33},
+    {'date': '2024-01', 'value': 9},
+    {'date': '2024-02', 'value': 8},
+    {'date': '2024-03', 'value': 8},
+    {'date': '2024-04', 'value': 8},
+    {'date': '2024-05', 'value': 9},
+    {'date': '2024-06', 'value': 9},
+    {'date': '2024-07', 'value': 14}],
+   'last_mth_median_asking_price': {'date': '2024-06', 'value': 1150000.0},
+   'last_mth_new_listings': {'date': '2024-06', 'value': 48}},
+   'last_updated': '2024-07-26T11:14:33.586348'}
+"""
+
+""" Sample price times series df
++--------------+-------------+----------+----------+----------+------+----------+----------+----------+----------+
+| geog_id      | propertyType| 2023-01  | 2023-02  | 2023-03  | ...  | 2024-05  | 2024-06  | 2024-07  | geo_level|
++--------------+-------------+----------+----------+----------+------+----------+----------+----------+----------+
+| g40_f8543be9 | None        | NaN      | 162550.0 | 367450.0 | ...  | 289000.0 | 389900.0 | 300000.0 | 40       |
+| g40_f8543be9 | DETACHED    | NaN      | 162550.0 | 367450.0 | ...  | 286000.0 | 389900.0 | 300000.0 | 40       |
+| g40_f85dce8h | None        | NaN      | 74900.0  | 165625.0 | ...  | 196000.0 | 367000.0 | 252500.0 | 40       |
++--------------+-------------+----------+----------+----------+------+----------+----------+----------+----------+
+
+Sample DOM times series df
++--------------+-------------+----------+----------+----------+------+----------+----------+----------+----------+
+| geog_id      | propertyType| 2023-01  | 2023-02  | 2023-03  | ...  | 2024-05  | 2024-06  | 2024-07  | geo_level|
++--------------+-------------+----------+----------+----------+------+----------+----------+----------+----------+
+| g40_f8543be9 | None        | NaN      | 22.0     | 23.5     | ...  | 83.0     | 30.0     | 24.0     | 40       |
+| g40_f8543be9 | DETACHED    | NaN      | 22.0     | 23.5     | ...  | 67.0     | 30.0     | 24.0     | 40       |
+| g40_f85dce8h | None        | NaN      | 16.0     | 18.0     | ...  | 32.5     | 33.0     | 19.0     | 40       |
++--------------+-------------+----------+----------+----------+------+----------+----------+----------+----------+
+
+"""

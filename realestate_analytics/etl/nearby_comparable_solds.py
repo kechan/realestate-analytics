@@ -1,6 +1,6 @@
 from typing import Dict, List, Tuple, Union
 
-import time, math
+import time, math, json, logging
 from collections import defaultdict
 import numpy as np
 import pandas as pd
@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 
 from ..data.caching import FileBasedCache
 from ..data.es import Datastore
+from ..data.bq import BigQueryDatastore
 from elasticsearch.helpers import scan, bulk
 
 import realestate_core.common.class_extensions
@@ -91,14 +92,20 @@ def compare_comparable_results(prev_result: Dict[str, Dict[str, List]],
   return diff_result
 
 class NearbyComparableSoldsProcessor:
-  def __init__(self, datastore: Datastore, cache_dir: Union[str, Path] = None):
+  def __init__(self, datastore: Datastore, 
+               bq_datastore: BigQueryDatastore = None,
+               cache_dir: Union[str, Path] = None):
+    self.logger = logging.getLogger(self.__class__.__name__)
+
     self.datastore = datastore
+    self.bq_datastore = bq_datastore
+
     self.cache_dir = Path(cache_dir) if cache_dir else None
     if self.cache_dir:
       self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     self.cache = FileBasedCache(cache_dir=self.cache_dir)
-    print(self.cache.cache_dir)
+    self.logger.info(f'cache dir: {self.cache.cache_dir}')
 
     self.last_run_key = 'NearbyComparableSoldsProcessor_last_run'
 
@@ -113,153 +120,221 @@ class NearbyComparableSoldsProcessor:
     self.listing_profile_partition = None #self.sold_listing_df.groupby(self.comparable_criteria).size().reset_index(name='population')
 
   def extract(self, from_cache=False):
+    self.logger.info("Extract")
     if from_cache:
       self._load_from_cache()
     else:
       self._extract_from_datastore()
-      if self.cache.cache_dir:
-        self._save_to_cache()
     
     self._process_listing_profile_partition()
 
 
   def _extract_from_datastore(self):
     last_run = self.cache.get(self.last_run_key)
+    self.logger.info(f"last_run: {last_run}")
 
-    # first run
-    if last_run is None:
-      end_time = datetime.now()
+    try:
+      # first run
+      if last_run is None:
+        end_time = datetime.now()
 
-      # get the sold listings from the last year till now
-      _, self.sold_listing_df = self.datastore.get_sold_listings(
-        start_time=end_time - timedelta(days=365),
-        end_time=end_time,
-        selects=[
-        'mls',
-        'lastTransition', 'transitions', 
-        'lastUpdate',
-        'listingType', 'searchCategoryType',
-        'listingStatus',       
-        'beds', 'bedsInt', 'baths', 'bathsInt',
-        'price','soldPrice',      
-        'daysOnMarket',
-        'lat', 'lng',
-        'city', 'neighbourhood',
-        'provState',
-        'guid'
-        ])
+        # get the sold listings from the last year till now
+        success, self.sold_listing_df = self.datastore.get_sold_listings(
+          start_time=end_time - timedelta(days=365),
+          end_time=end_time,
+          selects=[
+          'mls',
+          'lastTransition', 'transitions', 
+          'lastUpdate',
+          'listingType', 'searchCategoryType',
+          'listingStatus',       
+          'beds', 'bedsInt', 'baths', 'bathsInt',
+          'price','soldPrice',      
+          'daysOnMarket',
+          'lat', 'lng',
+          'city', 'neighbourhood',
+          'provState',
+          'guid'
+          ])
+        if not success:
+          self.logger.error(f"Failed to get sold listings from {end_time - timedelta(days=365)} to {end_time}")
+          raise ValueError("Failed to get sold listings.")
         
-      # get everything up till now    
-      _, self.listing_df = self.datastore.get_current_active_listings(
-        selects=[
-        'listingType', 'searchCategoryType',
-        'guid',
-        'beds', 'bedsInt', 
-        'baths', 'bathsInt',
-        'lat', 'lng',
-        'price',
-        'addedOn',
-        'lastUpdate'
-        ],
-        prov_code='ON',
-        addedOn_end_time=end_time,
-        updated_end_time=end_time
+        # get everything up till now    
+        start_time = datetime(1970, 1, 1)     # distant past
+        success, self.listing_df = self.datastore.get_current_active_listings(
+          use_script_for_last_update=True,      # TODO: remove after dev 
+          addedOn_start_time=start_time,
+          updated_start_time=start_time,
+          addedOn_end_time=end_time,
+          updated_end_time=end_time,
+          selects=[
+          'listingType', 'searchCategoryType',
+          'guid',
+          'beds', 'bedsInt', 
+          'baths', 'bathsInt',
+          'lat', 'lng',
+          'price',
+          'addedOn',
+          'lastUpdate'
+          ],
+          prov_code='ON'
         )
+        if not success:
+          self.logger.error(f"failed to get current listings from {start_time} to {end_time}")
+          raise ValueError("Failed to get current listings.")
 
-      self.cache.set(self.last_run_key, end_time)   # save last run to cache
-    else:    # incremental/delta load 
-      # Load existing data from cache
-      self.sold_listing_df = self.cache.get('one_year_sold_listing')
-      self.listing_df = self.cache.get('on_listing')
+      else:    # incremental/delta load 
+        # Load existing data from cache
+        self.sold_listing_df = self.cache.get('one_year_sold_listing')
+        self.listing_df = self.cache.get('on_listing')
 
-      if self.sold_listing_df is None or self.listing_df is None:
-        raise ValueError("Cache is inconsistent. Missing sold_listing_df or listing_df.")
+        if self.sold_listing_df is None or self.listing_df is None:
+          self.logger.error("Cache is inconsistent. Missing prior sold_listing_df or listing_df.")
+          raise ValueError("Cache is inconsistent. Missing prior sold_listing_df or listing_df.")
 
-      start_time = last_run - timedelta(days=21)   # load from 21 days before last run to have bigger margin of safety.
-      end_time = datetime.now()
+        # get the sold listings from last run till now
+        start_time = last_run - timedelta(days=21)   # load from 21 days before last run to have bigger margin of safety.
+        end_time = datetime.now()
+        
+        success, delta_sold_listing_df = self.datastore.get_sold_listings(
+          start_time=start_time,
+          end_time=end_time,
+          selects=[
+            'mls',
+            'lastTransition', 'transitions', 
+            'lastUpdate',
+            'listingType', 'searchCategoryType',
+            'listingStatus',       
+            'beds', 'bedsInt', 'baths', 'bathsInt',
+            'price','soldPrice',      
+            'daysOnMarket',
+            'lat', 'lng',
+            'city', 'neighbourhood',
+            'provState',
+            'guid'
+          ])
+        if not success:
+          self.logger.error(f"Failed to retrieve delta sold listings from {start_time} to {end_time}")
+          raise ValueError("Failed to retrieve delta sold listings")
+        self.logger.info(f'Loaded {len(delta_sold_listing_df)} sold listings from {start_time} to {end_time}')
+        
+        # get the current listings from last run till now
+        start_time = last_run - timedelta(days=3)   # load from 3 days before last run to have some margin of safety.
+        # end time is same as above
+        success, delta_listing_df = self.datastore.get_current_active_listings(
+          use_script_for_last_update=True,      # TODO: remove after dev
+          addedOn_start_time=start_time,
+          addedOn_end_time=end_time,
+          updated_start_time=start_time,
+          updated_end_time=end_time,
+          selects=[
+          'listingType', 'searchCategoryType',
+          'guid',
+          'beds', 'bedsInt', 
+          'baths', 'bathsInt',
+          'lat', 'lng',
+          'price',
+          'addedOn',
+          'lastUpdate'
+          ],
+          prov_code='ON'
+          )
+        if not success:
+          self.logger.error(f"Failed to retrieve delta current active listings from {start_time} to {end_time}")
+          raise ValueError("Failed to retrieve delta current active listings")
+        self.logger.info(f'Loaded {len(delta_listing_df)} current listings from {start_time} to {end_time}')
 
-      # get the sold listings from last run till now
-      _, delta_sold_listing_df = self.datastore.get_sold_listings(
-        start_time=start_time,
-        end_time=end_time,
-        selects=[
-        'mls',
-        'lastTransition', 'transitions', 
-        'lastUpdate',
-        'listingType', 'searchCategoryType',
-        'listingStatus',       
-        'beds', 'bedsInt', 'baths', 'bathsInt',
-        'price','soldPrice',      
-        'daysOnMarket',
-        'lat', 'lng',
-        'city', 'neighbourhood',
-        'provState',
-        'guid'
-        ])
+        # Merge delta with whole
 
-      # get the current listings from last run till now
-      _, delta_listing_df = self.datastore.get_current_active_listings(
-        selects=[
-        'listingType', 'searchCategoryType',
-        'guid',
-        'beds', 'bedsInt', 
-        'baths', 'bathsInt',
-        'lat', 'lng',
-        'price',
-        'addedOn',
-        'lastUpdate'
-        ],
-        prov_code='ON',
-        addedOn_start_time=start_time,
-        addedOn_end_time=end_time,
-        updated_start_time=start_time,
-        updated_end_time=end_time
-        )
-      
-      # merge delta with whole
-      self.sold_listing_df = pd.concat([self.sold_listing_df, delta_sold_listing_df], axis=0)
-      self.sold_listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='last')
-      # get rid of stuff thats older than a year
-      one_year_ago_from_now = end_time - timedelta(days=365)
-      drop_idxs = self.sold_listing_df.q("lastTransition < @one_year_ago_from_now").index
-      self.sold_listing_df.drop(index=drop_idxs, inplace=True)
+        # For sold listings
+        self.sold_listing_df = pd.concat([self.sold_listing_df, delta_sold_listing_df], axis=0, ignore_index=True)
+        self.sold_listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='last')
+        # get rid of stuff thats older than a year
+        len_sold_listing_df_before_delete = len(self.sold_listing_df)
+        one_year_ago_from_now = end_time - timedelta(days=365)
+        drop_idxs = self.sold_listing_df.q("lastTransition < @one_year_ago_from_now").index
+        self.sold_listing_df.drop(index=drop_idxs, inplace=True)
+        self.sold_listing_df.reset_index(drop=True, inplace=True)
+        len_sold_listing_df_after_delete = len(self.sold_listing_df)
+        self.logger.info(f'removed {len_sold_listing_df_before_delete - len_sold_listing_df_after_delete} sold listings older than a year')
 
-      self.listing_df = pd.concat([self.listing_df, delta_listing_df], axis=0)
-      self.listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='last')
+        # For current listings
+        self.listing_df = pd.concat([self.listing_df, delta_listing_df], axis=0)
+        self.listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='last')
 
-      self.cache.set(self.last_run_key, end_time)   # save last run to cache
+        # Remove known deletions since last run
+        # TODO: need to work out a sensible schedule, which should be less frequent to save API costs.
+        # Note: it isnt critical to remove these, as updating deleting stuff should be a no op for ES update
+        
+        deleted_listings_df = self.bq_datastore.get_deleted_listings(start_time=last_run, end_time=end_time)
+        if len(deleted_listings_df) > 0:
+          len_listing_df_before_delete = len(self.listing_df)
+
+          deleted_listing_ids = deleted_listings_df['listingId'].tolist()
+          idxs_to_remove = self.listing_df.q("_id.isin(@deleted_listing_ids)").index
+          self.listing_df.drop(index=idxs_to_remove, inplace=True)
+          self.listing_df.reset_index(drop=True, inplace=True)
+          len_listing_df_after_delete = len(self.listing_df)
+          self.logger.info(f'removed {len_listing_df_before_delete - len_listing_df_after_delete} deleted listings since last run')
+
+      # if all operations are successful, update the cache      
+      if self.cache.cache_dir:
+        self._save_to_cache()
+        self.cache.set(self.last_run_key, end_time)   # save to cache: last run time, and the data.
+
+    except Exception as e:
+      self.logger.error(f"Error occurred during extract: {e}")
+      raise  
 
   def _load_from_cache(self):
     if not self.cache.cache_dir:
+      self.logger.error("Cache directory not set. Cannot load from cache.")
       raise ValueError("Cache directory not set. Cannot load from cache.")
     
-    last_run = self.cache.get(self.last_run_key)
     self.sold_listing_df = self.cache.get('one_year_sold_listing')
     self.listing_df = self.cache.get("on_listing")
 
     if self.sold_listing_df is None or self.listing_df is None:
+      self.logger.error("Missing sold_listing_df or listing_df in cache.")
       raise ValueError("Missing sold_listing_df or listing_df in cache.")
 
-    print(f"Loaded {len(self.sold_listing_df)} sold listings and {len(self.listing_df)} current listings from cache.")
+    self.logger.info(f"Loaded {len(self.sold_listing_df)} sold listings and {len(self.listing_df)} current listings from cache.")
 
   def _save_to_cache(self):
     if not self.cache.cache_dir:
+      self.logger.error("Cache directory not set. Cannot save to cache.")
       raise ValueError("Cache directory not set. Cannot save to cache.")
     
     self.cache.set('one_year_sold_listing', self.sold_listing_df)
     self.cache.set('on_listing', self.listing_df)
 
-    print(f"Saved {len(self.sold_listing_df)} sold listings and {len(self.listing_df)} current listings to cache.")
+    self.logger.info(f"Saved {len(self.sold_listing_df)} sold listings and {len(self.listing_df)} current listings to cache.")
 
   def _process_listing_profile_partition(self):
     self.listing_profile_partition = self.sold_listing_df.groupby(self.comparable_criteria).size().reset_index(name='population')
 
 
   def transform(self):
+    self.logger.info("Transform")
     self.comparable_sold_listings_result, _ = self.get_sold_listings()
 
+    # optimize such that we dont update on things that didnt change from last run.
     # Retrieve previous result from cache
-    prev_result = self.cache.get('comparable_sold_listings_result')
+    # prev_result = eval(self.cache.get('comparable_sold_listings_result')) # it deserializes back to dict
+    prev_result_json = self.cache.get('comparable_sold_listings_result').replace("'", '"')
+    if prev_result_json:
+      self.logger.info("Found previous comparable_sold_listings_result in cache. Deserializing...")
+      try:
+        prev_result = json.loads(prev_result_json)   # Deserialize JSON safely
+        self.logger.info("Successfully deserialized comparable_sold_listings_result.")
+      except json.JSONDecodeError:        
+        prev_result = None
+        self.logger.error("Failed to deserialize comparable_sold_listings_result. Setting to None. Please investigate")
+    else:
+      prev_result = None
+      self.logger.info("No previous comparable_sold_listings_result found in cache.")
+
     if prev_result is not None:    
       self.diff_result = compare_comparable_results(prev_result, self.comparable_sold_listings_result)
     else:
@@ -268,7 +343,10 @@ class NearbyComparableSoldsProcessor:
     # Cache the full current result for next time
     self.cache.set('comparable_sold_listings_result', self.comparable_sold_listings_result)
 
+    self.logger.info(f"{len(self.diff_result)} listings to be updated.")
+
   def load(self):
+    self.logger.info("Load")    
     success, failed = self.update_datastore(self.diff_result)
     return success, failed
       
@@ -289,18 +367,21 @@ class NearbyComparableSoldsProcessor:
     self.comparable_sold_listings_result = None
     self.diff_result = None
 
-    print("Cleanup completed. All cached data has been cleared and instance variables reset.")
+    self.logger.info("Cleanup completed. All cached data has been cleared and instance variables reset.")
+
+  def reset(self):
+    self.cleanup()
 
   def full_refresh(self):
     """
     Perform a full refresh of the data, resetting to initial state and re-extracting all data.
     """
-    print("Starting full refresh...")
+    self.logger.info("Starting full refresh...")
     self.cleanup()
     self.extract(from_cache=False)
     self.transform()
     self.load()
-    print("Full refresh completed.")
+    self.logger.info("Full refresh completed.")
 
   def get_sold_listings(self):
     """
@@ -342,7 +423,7 @@ class NearbyComparableSoldsProcessor:
       listing_partition_df = self._get_partitioned_df(self.listing_df, property_type, bedsInt, bathsInt)
 
       if not listing_partition_df.empty:
-        print(f'Profile: {profile_key}, # of sold: {len(sold_partition_df)}, # of current: {len(listing_partition_df)}')
+        self.logger.info(f'Profile: {profile_key}, # of sold: {len(sold_partition_df)}, # of current: {len(listing_partition_df)}')
         
         filtered_distances, filtered_indices = self._compute_nearest_sold_properties(
             listing_partition_df[['lat', 'lng']].values,
@@ -354,6 +435,15 @@ class NearbyComparableSoldsProcessor:
         results.update(profile_results)
 
       profile_timings[profile_key] = time.time() - profile_start_time
+
+    self.logger.info(f"Processed {len(results)} listings")
+
+    # results
+    #  {'21483963': {'sold_listing_id': ['on-17-c7280822'],
+    #   'distance_km': [0.39653338615963163]},
+    #  '21969076': {'sold_listing_id': ['on-13-1353569'],
+    #   'distance_km': [0.45767571332477264]},
+    #  '21954935': {'sold_listing_id': ['on-13-1373402',
 
     return results, profile_timings
   
@@ -381,9 +471,9 @@ class NearbyComparableSoldsProcessor:
             }
         }
     success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
-    print(f"Successfully updated {success} documents")
+    self.logger.info(f"Successfully updated {success} documents")
     if failed:
-      print(f"Failed to update {len(failed)} documents")
+      self.logger.error(f"Failed to update {len(failed)} documents")
 
     return success, failed
   
@@ -457,6 +547,8 @@ class NearbyComparableSoldsProcessor:
         }
     return results
   
+  def close(self):
+    self.datastore.es.close()
 
 if __name__ == '__main__':
   datastore = Datastore(host='localhost', port=9201)
@@ -469,3 +561,34 @@ if __name__ == '__main__':
 
   success, failed = processor.load()
 
+""" Sample json appended to listing in ES:
+  {
+   etc. etc. 
+   'comparable_sold_listings': 
+    {'sold_listing_ids': ['on-17-e8018264', 'on-17-e8069306', 'on-17-e8142602'],
+  'distances_km': [0.7, 0.9, 0.9]
+  }
+"""
+
+# from realestate_analytics.etl.nearby_comparable_solds import compare_comparable_results
+
+# # Test cases
+# prev_result = {
+#     '21483963': {'sold_listing_id': ['on-17-c7280822'], 'distance_km': [0.39653338615963163]},
+#     '21969076': {'sold_listing_id': ['on-13-1353569'], 'distance_km': [0.45767571332477264]},
+#     '21000001': {'sold_listing_id': ['on-17-c1111111', 'on-17-c2222222'], 'distance_km': [0.1, 0.2]},
+#     '21000002': {'sold_listing_id': ['on-17-c3333333'], 'distance_km': [0.3]},
+#     '21000003': {'sold_listing_id': ['on-17-c4444444'], 'distance_km': [0.4]},
+# }
+
+# current_result = {
+#     '21483963': {'sold_listing_id': ['on-17-c7280822'], 'distance_km': [0.39653338615963163]},  # Unchanged
+#     '21969076': {'sold_listing_id': ['on-13-1353569', 'on-17-new123'], 'distance_km': [0.45767571332477264, 0.5]},  # Changed
+#     '21549819': {'sold_listing_id': ['on-17-c6693166', 'on-17-c6680498'], 'distance_km': [0.1, 0.2]},  # New
+#     '21000001': {'sold_listing_id': ['on-17-c1111111', 'on-17-c2222222'], 'distance_km': [0.1, 0.20000001]},  # Slight change in distance
+#     '21000002': {'sold_listing_id': ['on-17-c3333333', 'on-17-c5555555'], 'distance_km': [0.3, 0.5]},  # Added new sold listing
+#     '21000004': {'sold_listing_id': [], 'distance_km': []},  # New empty listing
+# }
+
+# diff_result = compare_comparable_results(prev_result, current_result)
+# pprint(diff_result)

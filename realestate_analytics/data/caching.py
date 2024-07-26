@@ -1,4 +1,4 @@
-from typing import Any, Union, Optional, List
+from typing import Any, Union, Optional, List, Dict
 
 from pathlib import Path
 import pandas as pd
@@ -34,13 +34,14 @@ class FileBasedCache:
     
     return sorted(valid_keys)
 
-  def _get_cache_path(self, key: str, is_df=True) -> Path:
-    suffix = '_df' if is_df else '.txt'   # TODO: only pandas dataframes or text files for now
+  def _get_cache_path(self, key: str, suffix: str) -> Path:
+    # suffix = '_df' if is_df else '.txt'   # TODO: only pandas dataframes or text files for now
     return self.cache_dir / f'{key}{suffix}'
   
   def set(self, key: str, value: Any, expiry: Optional[timedelta] = None):
-    is_df = isinstance(value, pd.DataFrame)
-    cache_path = self._get_cache_path(key, is_df)
+    # is_df = isinstance(value, pd.DataFrame)
+    suffix = '_df' if isinstance(value, pd.DataFrame) else '.txt'
+    cache_path = self._get_cache_path(key, suffix=suffix)
 
     # Store expiry information in a separate file
     expiry_path = cache_path.with_suffix('.expiry')
@@ -50,7 +51,7 @@ class FileBasedCache:
     elif expiry_path.exists():
       expiry_path.unlink()  # Remove expiry file if no expiry is set
 
-    if is_df:
+    if suffix == '_df':
       value.to_feather(cache_path)
     else:
       if isinstance(value, datetime):
@@ -60,8 +61,10 @@ class FileBasedCache:
       cache_path.write_text(value)
 
   def get(self, key: str) -> Optional[Any]:
-    for is_df in [True, False]:  # Try text file first, then DataFrame
-      cache_path = self._get_cache_path(key, is_df)
+    # for is_df in [True, False]:  # Try text file first, then DataFrame
+      # cache_path = self._get_cache_path(key, is_df)
+    for suffix in ['_df', '.txt']:
+      cache_path = self._get_cache_path(key, suffix)
       if cache_path.exists():
         # Check expiry, getting something thats expired will trigger its deletion and return None
         expiry_path = cache_path.with_suffix('.expiry')
@@ -71,7 +74,7 @@ class FileBasedCache:
             self.delete(key)
             return None
 
-        if is_df:
+        if suffix == '_df':
           return pd.read_feather(cache_path)
         else:
           value = cache_path.read_text()          
@@ -83,8 +86,10 @@ class FileBasedCache:
     return None
   
   def delete(self, key: str) -> None:
-    for is_df in [True, False]:
-      cache_path = self._get_cache_path(key, is_df)
+    # for is_df in [True, False]:
+    #   cache_path = self._get_cache_path(key, is_df)
+    for suffix in ['_df', '.txt']:
+      cache_path = self._get_cache_path(key, suffix)
       expiry_path = cache_path.with_suffix('.expiry')
       for path in [cache_path, expiry_path]:
         if path.exists():

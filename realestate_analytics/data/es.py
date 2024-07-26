@@ -1,14 +1,16 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
-import json
+import json, time, traceback
 from datetime import datetime, timedelta
 import pandas as pd
 
 from .caching import FileBasedCache
 
 from elasticsearch import Elasticsearch
-from elasticsearch.exceptions import NotFoundError
+from elasticsearch.exceptions import NotFoundError, ConnectionError, RequestError, TransportError
 from elasticsearch.helpers import scan, bulk
+
+import logging
 
 def derive_property_type(row):
   listing_type = row.get('listingType', '').split(', ')  # Assuming listingType is a comma-separated string
@@ -38,7 +40,11 @@ def format_listingType(x: List[str]):
 
 class Datastore:
   def __init__(self, host: str, port: int):
-    self.es = Elasticsearch([f'http://{host}:{port}/'], timeout=30, retry_on_timeout=True, max_retries=3)
+    self.logger = logging.getLogger(self.__class__.__name__)
+
+    self.es_host = host
+    self.es_port = port
+    self.es = Elasticsearch([f'http://{self.es_host}:{self.es_port}/'], timeout=30, retry_on_timeout=True, max_retries=3)
 
     # hardcode these often used indexes
     self.sold_listing_index_name = 'rlp_archive_current'
@@ -57,23 +63,28 @@ class Datastore:
     self.mkt_trends_ts_index_name = "rlp_mkt_trends_ts_current"
 
     if not self.ping():
-      raise Exception("Unable to connect to Elasticsearch.")
+      self.logger.error(f"Unable to connect to ES at {host}:{port}")
+      # raise Exception("Unable to connect to Elasticsearch.")
 
     # get mappings
-    self.sold_listing_index_mapping = self.get_mapping(index=self.sold_listing_index_name)
-    self.listing_index_mapping = self.get_mapping(index=self.listing_index_name)
-    self.geo_index_mapping = self.get_mapping(index=self.geo_index_name)
-    self.geo_details_en_index_mapping = self.get_mapping(index=self.geo_details_en_index_name)
-
     try:
-      self.listing_tracking_index_mapping = self.get_mapping(index=self.listing_tracking_index_name)
-    except NotFoundError:
-      print(f"Warning: Index '{self.listing_tracking_index_name}' not found.")
+      self.sold_listing_index_mapping = self.get_mapping(index=self.sold_listing_index_name)
+      self.listing_index_mapping = self.get_mapping(index=self.listing_index_name)
+      self.geo_index_mapping = self.get_mapping(index=self.geo_index_name)
+      self.geo_details_en_index_mapping = self.get_mapping(index=self.geo_details_en_index_name)    
 
-    try:
-      self.mkt_trends_ts_index_mapping = self.get_mapping(index=self.mkt_trends_ts_index_name)
-    except NotFoundError:
-      print(f"Warning: Index '{self.mkt_trends_ts_index_name}' not found.")
+      try:
+        self.listing_tracking_index_mapping = self.get_mapping(index=self.listing_tracking_index_name)
+      except NotFoundError:
+        self.logger.warning(f"Index '{self.listing_tracking_index_name}' not found.")
+
+      try:
+        self.mkt_trends_ts_index_mapping = self.get_mapping(index=self.mkt_trends_ts_index_name)
+      except NotFoundError:
+        self.logger.warning(f"Index '{self.mkt_trends_ts_index_name}' not found.")
+
+    except ConnectionError as e:
+      self.logger.error(f"Error connecting to ES at {host}:{port} mappings not retrieved.")
 
     self.cache = FileBasedCache()
     
@@ -95,6 +106,7 @@ class Datastore:
       {"term": {"searchCategoryType": 103}}
     ]
 
+    
   def ping(self) -> bool:
     return self.es.ping()
   
@@ -110,9 +122,12 @@ class Datastore:
       node_names = [node['name'] for node in nodes_info]
       # print(f"Name: {node['name']}, IP: {node['ip']}, Roles: {node['node.role']}, Master: {node['master']}, Heap Percent: {node['heap.percent']}, RAM Percent: {node['ram.percent']}, CPU: {node['cpu']}, Load 1m: {node['load_1m']}, Load 5m: {node['load_5m']}, Load 15m: {node['load_15m']}")
       return node_names
+    except ConnectionError:
+      self.logger.error(f"Error connecting to ES at {self.es_host}:{self.es_port}")
+      return None
     except Exception as e:
-      print(f"Error retrieving node names: {e}")
-      return []
+      self.logger.error(f"Unexpected error retrieving node names: {e}")
+      return None
     
   def env(self) -> str:
     """
@@ -123,11 +138,12 @@ class Datastore:
            'UAT' if the cluster is in the staging environment.
     """
     node_names = self.get_cluster_node_names()
-    for name in node_names:
-      if 'prod' in name.lower():
-        return 'PROD'
-      elif 'uat' in name.lower():
-        return 'UAT'
+    if node_names:
+      for name in node_names:
+        if 'prod' in name.lower():
+          return 'PROD'
+        elif 'uat' in name.lower():
+          return 'UAT'
     return 'Unknown'
 
   def get_alias(self) -> Dict:
@@ -250,11 +266,12 @@ class Datastore:
 
     Note: if _id is provided, all other criteria are ignored and just retrieves that doc.
     """
-
+    self.logger.debug(f"Adhoc searching index '{index}'")
     if _id:
       try:
         return [self.es.get(index=index, id=_id, _source=selects or True)['_source']]
       except NotFoundError:
+        self.logger.warning(f"Document with ID '{_id}' not found in index '{index}'.")
         return []
 
     if index == self.sold_listing_index_name:
@@ -276,7 +293,7 @@ class Datastore:
     
     query_body = self._build_query(pertinent_time_field, start_time, end_time, date_format,
                                    filters)
-    print(query_body)
+    self.logger.debug(f"Constructed query: {query_body}")
     if size is None:
       results = []
       for hit in scan(self.es, index=index, query=query_body, _source=selects or True):
@@ -294,78 +311,84 @@ class Datastore:
       return [hit['_source'] for hit in response['hits']['hits']]
 
   def get_sold_listings(self, start_time: datetime = None, end_time: datetime = None, 
-                        date_field: str = "lastTransition", selects: List[str]=None, return_df=True):
+                        date_field: str = "lastTransition", selects: List[str]=None) -> Tuple[bool, pd.DataFrame]:
     """
     Query sold listings from the past year filtered by property types:
     - CONDO, SEMI-DETACHED, TOWNHOUSE, DETACHED
-
     Parameters:
     - start_time (datetime, optional): The start of the time range for the search. Defaults to one year ago.
     - end_time (datetime, optional): The end of the time range for the search. Defaults to None (current time).
     - date_field (str, optional): The field to use for date filtering. Defaults to "lastTransition".
     - selects (List[str], optional): List of fields to retrieve. If None, all fields are retrieved.
-    - return_df (bool): If True, returns a DataFrame along with the raw data. Defaults to True.
-
     Returns:
-    DataFrame: A DataFrame representing the sold listings.
-    List[dict]: A list of dictionaries where each dictionary represents a sold listing.   
-  """
+    Tuple[bool, pd.DataFrame]: A tuple containing:
+        - A boolean indicating success (True) or failure (False)
+        - A DataFrame representing the sold listings.
+    """
     
-    must_clauses = [
-      {
-        "match": {"listingStatus": "SOLD"},
-      },
-      {
-        "match": {"transactionType": "SALE"}
-      },
-      {
-        "bool": {
-          "should": self.property_type_query_mappings
-        }
-      }
-    ]
-
-    if start_time is None:
-      start_time = datetime.now() - timedelta(days=365)  # one year ago
-
-    if date_field == "lastTransition":
-      date_format = '%Y-%m-%dT%H:%M:%S'
-    elif date_field == "lastUpdate":
-      date_format = '%y-%m-%d:%H:%M:%S'
-    else:
-      raise ValueError(f"Unsupported date_field: {date_field}")
-
-    time_range_filter = {
-      "range": {
-        date_field: {
-          "gte": start_time.strftime(date_format)
-        }
-      }
-    }
-
-    #  Add end_time to the query if provided
-    if end_time:
-      time_range_filter["range"][date_field]["lte"] = end_time.strftime(date_format)
-
-    must_clauses.append(time_range_filter)
-    
-    query_body = {
-      "query": {
-        "bool": {
-          "must": must_clauses
-        }
-      },
-      "_source": selects or True  # Select all fields if no fields are specified
-    }
-
-    page = self.es.search(index=self.sold_listing_index_name, body=query_body, scroll='5m', size=500)
-    scroll_id = page['_scroll_id']
-    hits = page['hits']['hits']
-    sources = []
+    self.logger.info(f"Fetching sold listings from {start_time if start_time else 'unspecified'} to {end_time if end_time else 'unspecified'}")
+    start_process_time = time.time()
 
     try:
+      must_clauses = [
+        {
+          "match": {"listingStatus": "SOLD"},
+        },
+        {
+          "match": {"transactionType": "SALE"}
+        },
+        {
+          "bool": {
+            "should": self.property_type_query_mappings
+          }
+        }
+      ]
+
+      if start_time is None:
+        start_time = datetime.now() - timedelta(days=365)  # one year ago
+
+      if date_field == "lastTransition":
+        date_format = '%Y-%m-%dT%H:%M:%S'
+      elif date_field == "lastUpdate":
+        date_format = '%y-%m-%d:%H:%M:%S'
+      else:
+        raise ValueError(f"Unsupported date_field: {date_field}")
+
+      time_range_filter = {
+        "range": {
+          date_field: {
+            "gte": start_time.strftime(date_format)
+          }
+        }
+      }
+
+      #  Add end_time to the query if provided
+      if end_time:
+        time_range_filter["range"][date_field]["lte"] = end_time.strftime(date_format)
+
+      must_clauses.append(time_range_filter)
+      
+      query_body = {
+        "query": {
+          "bool": {
+            "must": must_clauses
+          }
+        },
+        "_source": selects or True  # Select all fields if no fields are specified
+      }
+      self.logger.debug(f"Constructed query: {query_body}")
+      
+      scroll_id = None
+      sources = []
+    
+      page = self.es.search(index=self.sold_listing_index_name, body=query_body, scroll='5m', size=500)
+      scroll_id = page['_scroll_id']
+      total_hits = page['hits']['total']['value']
+      self.logger.info(f"Total hits: {total_hits}")
+
+      hits = page['hits']['hits']
+
       while hits:
-        # sources.extend(hit['_source'] for hit in hits)
         for hit in hits:
           doc = hit['_source']
           doc['_id'] = hit['_id']  # incl. as primary key
@@ -374,15 +397,29 @@ class Datastore:
         page = self.es.scroll(scroll_id=scroll_id, scroll='5m')
         scroll_id = page['_scroll_id']
         hits = page['hits']['hits']
-
+    except ConnectionError as e:
+      self.logger.error(f"Connection error while fetching sold listings: {str(e)}")
+      return False, pd.DataFrame()
+    
+    except Exception as e:
+      self.logger.error(f"Unexpected error in get_sold_listing: {e}")
+      self._safe_remove_scroll_id(scroll_id)
+      return False, pd.DataFrame()
+    
     finally:
-      self.es.clear_scroll(scroll_id=scroll_id)
+      self._safe_remove_scroll_id(scroll_id)
 
-    if return_df:
+    if not sources:
+      self.logger.info("No sold listings found")
+      return False, pd.DataFrame()
+    
+    self.logger.info(f"Fetched {len(sources)} sold listings")
 
-      def serialize_dict_cols(x: Any):
-        return json.dumps(x) if isinstance(x, dict) else x
-      
+    def serialize_dict_cols(x: Any):
+      return json.dumps(x) if isinstance(x, dict) else x
+    
+    # creating the dataframe
+    try:
       sold_listings_df = pd.DataFrame(sources)
       if 'listingType' in sold_listings_df.columns:
         sold_listings_df.listingType = sold_listings_df.listingType.apply(format_listingType)
@@ -398,65 +435,118 @@ class Datastore:
       if 'lastTransition' in sold_listings_df.columns:
         sold_listings_df.lastTransition = pd.to_datetime(sold_listings_df.lastTransition)
 
-      return sources, sold_listings_df
-    else:
-      return sources
+
+      process_time = time.time() - start_process_time
+      self.logger.info(f"Completed fetching sold listings in {process_time:.2f} seconds")
+      return True, sold_listings_df
+    except Exception as e:
+      self.logger.error(f"Error converting sold listings to DataFrame: {e}")
+      return False, pd.DataFrame()
 
 
   def get_current_active_listings(self, selects: List[str], prov_code: str=None,
                                   addedOn_start_time: datetime=None, addedOn_end_time: datetime=None,
                                   updated_start_time: datetime=None, updated_end_time: datetime=None,
-                                  return_df=True):
+                                  use_script_for_last_update: bool=False  # TODO: should comment out later after dev
+                                  ):
     """
     This is used in context of nearby_comparable_solds.NearbyComparableSoldsProcessor ETL pipeline.
+    Parameters:
+    - selects (List[str]): List of fields to retrieve.
+    - prov_code (str, optional): Province code to filter listings.
+    - addedOn_start_time (datetime, optional): Start time for filtering by addedOn date.
+    - addedOn_end_time (datetime, optional): End time for filtering by addedOn date.
+    - updated_start_time (datetime, optional): Start time for filtering by lastUpdate date.
+    - updated_end_time (datetime, optional): End time for filtering by lastUpdate date.
+
+    Returns:
+    Tuple[bool, pd.DataFrame]: A tuple containing:
+    - A boolean indicating success (True) or failure (False)
+    - A DataFrame representing the current active listings.
     """
-    must_filters = [
-        {"match": {"listingStatus": "ACTIVE"}},
-        {"match": {"transactionType": "SALE"}},
-        {"bool": {"should": self.property_type_query_mappings}}
-    ]
-    if prov_code is not None:
-      must_filters.append({"match": {"provState": prov_code}})
 
-    # Prepare time range filters
-    time_filters = []
-
-    if addedOn_start_time or addedOn_end_time:
-      added_range = {}
-      if addedOn_start_time:
-        added_range["gte"] = addedOn_start_time.strftime('%Y-%m-%dT%H:%M:%S.%f')
-      if addedOn_end_time:
-        added_range["lte"] = addedOn_end_time.strftime('%Y-%m-%dT%H:%M:%S.%f')
-      time_filters.append({"range": {"addedOn": added_range}})
-
-    if updated_start_time or updated_end_time:
-      updated_range = {}
-      if updated_start_time:
-        updated_range["gte"] = updated_start_time.strftime('%y-%m-%d:%H:%M:%S')
-      if updated_end_time:
-        updated_range["lte"] = updated_end_time.strftime('%y-%m-%d:%H:%M:%S')
-      time_filters.append({"range": {"lastUpdate": updated_range}})
-
-    # Add time filters to the query if any are specified
-    if time_filters:
-      must_filters.append({"bool": {"should": time_filters}})
-    
-    query_body = {
-      "query": {
-        "bool": {
-          "must": must_filters
-        }
-      },
-      "_source": selects or True  # Select all fields if no fields are specified
-    }
-    
-    page = self.es.search(index=self.listing_index_name, body=query_body, scroll='5m', size=500)
-    scroll_id = page['_scroll_id']
-    hits = page['hits']['hits']
-
-    sources = []
+    self.logger.info(f"Fetching current active listings for province: {prov_code}")
+    start_process_time = time.time()
 
     try:
+      must_filters = [
+          {"match": {"listingStatus": "ACTIVE"}},
+          {"match": {"transactionType": "SALE"}},
+          {"bool": {"should": self.property_type_query_mappings}}
+      ]
+      if prov_code is not None:
+        must_filters.append({"match": {"provState": prov_code}})
+
+      # Prepare time range filters
+      time_filters = []
+
+      if addedOn_start_time or addedOn_end_time:
+        added_range = {}
+        if addedOn_start_time:
+          added_range["gte"] = addedOn_start_time.strftime('%Y-%m-%dT%H:%M:%S.%f')
+        if addedOn_end_time:
+          added_range["lte"] = addedOn_end_time.strftime('%Y-%m-%dT%H:%M:%S.%f')
+        time_filters.append({"range": {"addedOn": added_range}})
+
+      if updated_start_time or updated_end_time:
+        if use_script_for_last_update:
+          if updated_start_time is None or updated_end_time is None:
+            raise ValueError("Both updated_start_time and updated_end_time must be provided when using script query for lastUpdate")
+
+          script_query = {
+            "script": {
+              "script": {
+                "source": """
+                  DateTimeFormatter formatter = DateTimeFormatter.ofPattern('yy-MM-dd:HH:mm:ss');
+                  LocalDateTime start = LocalDateTime.parse(params.start, formatter);
+                  LocalDateTime end = LocalDateTime.parse(params.end, formatter);
+                  if (doc['lastUpdate.keyword'].size() == 0) {
+                    return false;
+                  }
+                  LocalDateTime lastUpdate = LocalDateTime.parse(doc['lastUpdate.keyword'].value, formatter);
+                  return lastUpdate.isAfter(start) && lastUpdate.isBefore(end);
+                """,
+                "params": {
+                  "start": updated_start_time.strftime('%y-%m-%d:%H:%M:%S'),
+                  "end": updated_end_time.strftime('%y-%m-%d:%H:%M:%S')
+                }
+              }
+            }
+          }
+          
+          time_filters.append(script_query)
+        else:
+          updated_range = {}
+          if updated_start_time:
+            updated_range["gte"] = updated_start_time.strftime('%y-%m-%d:%H:%M:%S')
+          if updated_end_time:
+            updated_range["lte"] = updated_end_time.strftime('%y-%m-%d:%H:%M:%S')
+          time_filters.append({"range": {"lastUpdate": updated_range}})
+
+      # Add time filters to the query if any are specified
+      if time_filters:
+        must_filters.append({"bool": {"should": time_filters}})
+      
+      query_body = {
+        "query": {
+          "bool": {
+            "must": must_filters
+          }
+        },
+        "_source": selects or True  # Select all fields if no fields are specified
+      }
+      
+      self.logger.debug(f"Query body: {query_body}")
+
+      scroll_id = None
+      sources = []
+    
+      page = self.es.search(index=self.listing_index_name, body=query_body, scroll='5m', size=500)
+      scroll_id = page['_scroll_id']
+      total_hits = page['hits']['total']['value']
+      self.logger.info(f"Total hits: {total_hits}")
+      hits = page['hits']['hits']
+
       while hits:
         for hit in hits:
           doc = hit['_source']
@@ -467,10 +557,33 @@ class Datastore:
         scroll_id = page['_scroll_id']
         hits = page['hits']['hits']
 
-    finally:
-      self.es.clear_scroll(scroll_id=scroll_id)
+      self.logger.info(f"Fetched {len(sources)} current active listings")
 
-    if return_df:
+    except ConnectionError as e:
+      self.logger.error(f"Connection error while fetching current active listings: {str(e)}")
+      self._safe_remove_scroll_id(scroll_id)
+      return False, pd.DataFrame()
+    
+    except RequestError as e:
+      self.logger.error(f"Request error while fetching current active listings: {str(e)}")
+      self.logger.error(f"Query body: {query_body}")
+      self._safe_remove_scroll_id(scroll_id)
+      return False, pd.DataFrame()
+  
+    except Exception as e:
+      self.logger.error(f"Unexpected error in get_current_active_listings: {e}")
+      self.logger.error(f"Query body: {query_body}")
+      self._safe_remove_scroll_id(scroll_id)
+      return False, pd.DataFrame()
+    
+    finally:
+      self._safe_remove_scroll_id(scroll_id)
+
+    if not sources:
+      self.logger.info("No current active listings found")
+      return False, pd.DataFrame()
+
+    try:
 
       listings_df = pd.DataFrame(sources)
       if 'listingType' in listings_df.columns:
@@ -485,17 +598,21 @@ class Datastore:
       if 'lastUpdate' in listings_df.columns:
         listings_df.lastUpdate = pd.to_datetime(listings_df.lastUpdate, format='%y-%m-%d:%H:%M:%S')
 
-      return sources, listings_df
-    else:
-      return sources
+      process_time = time.time() - start_process_time
+      self.logger.info(f"Completed fetching current active listings in {process_time:.2f} seconds")
+      return True, listings_df
+    except Exception as e:
+      self.logger.error(f"Error converting current active listings to DataFrame: {e}")
+      return False, pd.DataFrame()
     
 
   def get_listings(self, selects: List[str]=None, prov_code: str=None, 
                    addedOn_start_time: datetime=None, addedOn_end_time: datetime=None,
                    updated_start_time: datetime=None, updated_end_time: datetime=None,
-                   return_df=True):    
+                   use_script_for_last_update: bool=False  # TODO: should comment out later after dev
+                   ):    
     """
-    Retrieves listings from Elasticsearch based on various filters and returns them as a list of dictionaries or a DataFrame.
+    Retrieves listings from Elasticsearch based on various filters and returns them as a DataFrame.
 
     Parameters:
     - selects (List[str], optional): A list of fields to include in the returned documents. If None, all fields are included.
@@ -504,17 +621,20 @@ class Datastore:
     - addedOn_end_time (datetime, optional): The end time for filtering listings based on their added date.
     - updated_start_time (datetime, optional): The start time for filtering listings based on their last update date.
     - updated_end_time (datetime, optional): The end time for filtering listings based on their last update date.
-    - return_df (bool, optional): If True, returns the results as a pandas DataFrame; otherwise, returns a list of dictionaries.
 
     Returns:
-    - Tuple[List[dict], pd.DataFrame] if return_df is True: A tuple containing a list of the raw documents and a pandas DataFrame of the listings.
-    - List[dict] if return_df is False: A list of the raw documents.
+    - Tuple[bool, pd.DataFrame]: A tuple containing:
+      - A boolean indicating success (True) or failure (False)
+      - A pandas DataFrame of the listings.
 
     Note:
     - The method applies filters for transaction type and property type by default.
     - Time filters for 'addedOn' and 'lastUpdate' are applied if corresponding start and end times are provided.
     - The method handles pagination internally using Elasticsearch's scroll API.
     """
+  
+    self.logger.info(f"Fetching listings for province: {prov_code}")
+    start_process_time = time.time()
 
     must_filters = [
       {"match": {"transactionType": "SALE"}},
@@ -535,12 +655,37 @@ class Datastore:
       time_filters.append({"range": {"addedOn": added_range}})
 
     if updated_start_time or updated_end_time:
-      updated_range = {}
-      if updated_start_time:
-        updated_range["gte"] = updated_start_time.strftime('%y-%m-%d:%H:%M:%S')
-      if updated_end_time:
-        updated_range["lte"] = updated_end_time.strftime('%y-%m-%d:%H:%M:%S')
-      time_filters.append({"range": {"lastUpdate": updated_range}})
+      if use_script_for_last_update:
+        if updated_start_time is None or updated_end_time is None:
+          raise ValueError("Both updated_start_time and updated_end_time must be provided when using script query for lastUpdate")
+        script_query = {
+          "script": {
+              "script": {
+                "source": """
+                  DateTimeFormatter formatter = DateTimeFormatter.ofPattern('yy-MM-dd:HH:mm:ss');
+                  LocalDateTime start = LocalDateTime.parse(params.start, formatter);
+                  LocalDateTime end = LocalDateTime.parse(params.end, formatter);
+                  if (doc['lastUpdate.keyword'].size() == 0) {
+                    return false;
+                  }
+                  LocalDateTime lastUpdate = LocalDateTime.parse(doc['lastUpdate.keyword'].value, formatter);
+                  return lastUpdate.isAfter(start) && lastUpdate.isBefore(end);
+                """,
+                "params": {
+                  "start": updated_start_time.strftime('%y-%m-%d:%H:%M:%S'),
+                  "end": updated_end_time.strftime('%y-%m-%d:%H:%M:%S')
+                }
+              }
+            }
+        }
+        time_filters.append(script_query)
+      else:
+        updated_range = {}
+        if updated_start_time:
+          updated_range["gte"] = updated_start_time.strftime('%y-%m-%d:%H:%M:%S')
+        if updated_end_time:
+          updated_range["lte"] = updated_end_time.strftime('%y-%m-%d:%H:%M:%S')
+        time_filters.append({"range": {"lastUpdate": updated_range}})
 
     # Add time filters to the query if any are specified
     if time_filters:
@@ -555,13 +700,18 @@ class Datastore:
       "_source": selects or True  # Select all fields if no fields are specified
     }
 
-    page = self.es.search(index=self.listing_index_name, body=query_body, scroll='5m', size=500)
-    scroll_id = page['_scroll_id']
-    hits = page['hits']['hits']
+    self.logger.debug(f"Query body: {query_body}")
 
+    scroll_id = None
     sources = []
 
     try:
+      page = self.es.search(index=self.listing_index_name, body=query_body, scroll='5m', size=500)
+      scroll_id = page['_scroll_id']
+      total_hits = page['hits']['total']['value']
+      self.logger.info(f"Total hits: {total_hits}")
+      hits = page['hits']['hits']
+    
       while hits:
         for hit in hits:
           doc = hit['_source']
@@ -572,11 +722,33 @@ class Datastore:
         scroll_id = page['_scroll_id']
         hits = page['hits']['hits']
 
+      self.logger.info(f"Fetched {len(sources)} current listings")
+    
+    except ConnectionError as e:
+      self.logger.error(f"Connection error while fetching listings: {str(e)}")
+      self._safe_remove_scroll_id(scroll_id)
+      return False, pd.DataFrame()
+    
+    except RequestError as e:
+      self.logger.error(f"Request error while fetching listings: {str(e)}")
+      self.logger.error(f"Query body: {query_body}")
+      self._safe_remove_scroll_id(scroll_id)
+      return False, pd.DataFrame()
+
+    except Exception as e:
+      self.logger.error(f"Unexpected error in get_listings: {e}")
+      self.logger.error(f"Query body: {query_body}")
+      self._safe_remove_scroll_id(scroll_id)
+      return False, pd.DataFrame()
+
     finally:
-      self.es.clear_scroll(scroll_id=scroll_id)
+      self._safe_remove_scroll_id(scroll_id)
 
-    if return_df:
+    if not sources:
+      self.logger.info("No listings found")
+      return False, pd.DataFrame()
 
+    try:
       listings_df = pd.DataFrame(sources)
       if 'listingType' in listings_df.columns:
         listings_df.listingType = listings_df.listingType.apply(format_listingType)
@@ -589,10 +761,14 @@ class Datastore:
         listings_df.addedOn = pd.to_datetime(listings_df.addedOn)
       if 'lastUpdate' in listings_df.columns:
         listings_df.lastUpdate = pd.to_datetime(listings_df.lastUpdate, format='%y-%m-%d:%H:%M:%S')
-
-      return sources, listings_df
-    else:
-      return sources
+  
+      process_time = time.time() - start_process_time
+      self.logger.info(f"Completed fetching listings in {process_time:.2f} seconds")
+      
+      return True, listings_df
+    except Exception as e:
+      self.logger.error(f"Error converting listings to DataFrame: {e}")
+      return False, pd.DataFrame()
 
 
   def get_geo_entry_df(self) -> pd.DataFrame:
@@ -702,3 +878,9 @@ class Datastore:
       return {"query": {"match_all": {}}}
     
 
+  def _safe_remove_scroll_id(self, scroll_id: str = None):
+    if scroll_id:
+      try:
+        self.es.clear_scroll(scroll_id=scroll_id)
+      except Exception as e:
+        self.logger.error(f"Error removing scroll ID: {e}")
