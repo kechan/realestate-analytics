@@ -116,3 +116,5 @@ class TestDatastore(unittest.TestCase):
     # Assert that the two dataframes have the same number of rows
     self.assertEqual(set(delta_ids), set(filtered_ids), "Mismatch in number of rows between filtered and delta_active_listing_df")
 
+if __name__ == '__main__':
+  unittest.main()

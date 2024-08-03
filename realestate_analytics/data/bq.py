@@ -39,9 +39,6 @@ class BigQueryDatastore:
     except Exception as e:
       return False
 
-    
-
-
   @retry.Retry(predicate=retry.if_exception_type(exceptions.GoogleAPICallError, exceptions.RetryError),
                initial=1, maximum=30, multiplier=2)
   def query(self, query: str, timeout=30) -> pd.DataFrame:

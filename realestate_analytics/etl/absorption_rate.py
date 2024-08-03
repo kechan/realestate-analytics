@@ -1,0 +1,347 @@
+from typing import Dict, List, Union
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from pathlib import Path
+import pytz, logging
+
+from ..data.caching import FileBasedCache
+from ..data.es import Datastore
+from ..data.archive import Archiver
+from elasticsearch.helpers import scan, bulk
+
+import realestate_core.common.class_extensions
+from realestate_core.common.class_extensions import *
+
+class AbsorptionRateProcessor:
+  def __init__(self, datastore: Datastore, 
+               cache_dir: Union[str, Path] = None, 
+               archive_dir: Union[str, Path] = None):
+    self.logger = logging.getLogger(self.__class__.__name__)
+    
+    self.datastore = datastore
+
+    self.cache_dir = Path(cache_dir) if cache_dir else None
+    if self.cache_dir:
+      self.cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    self.cache = FileBasedCache(cache_dir=self.cache_dir)
+    self.logger.info(f'Cache dir: {self.cache.cache_dir}')
+    
+    self.last_run_key = 'AbsorptionRateProcessor_last_run'
+    last_run = self.cache.get(self.last_run_key)
+    self.logger.info(f"Last run: {last_run}")
+    
+    self.sold_listing_df = None
+    self.listing_df = None
+    self.absorption_rates = None
+
+    self.archiver = Archiver(archive_dir or self.cache.cache_dir / 'archives')
+
+    # Flag to determine whether to use UTC or local time
+    self.use_utc = True  # Set this to True to use UTC
+
+  def extract(self, from_cache=True):
+    self.logger.info("Extract")
+    if from_cache:
+      self._load_from_cache()
+    else:
+      self.logger.error("Direct extraction from datastore not implemented. Use from_cache=True.")
+      self.logger.error("Cached data from NearbyComparableSoldsProcessor should be used.")
+      raise NotImplementedError("Direct extraction from datastore not implemented. Cached data from NearbyComparableSoldsProcessor should be used.")
+    
+  def transform(self):
+    self.logger.info("Transform")
+    self._calculate_absorption_rates()
+
+    if hasattr(self, 'absorption_rates') and self.absorption_rates is not None:
+      if not self.archiver.archive(self.absorption_rates, 'absorption_rates'):
+        self.logger.error("Failed to archive absorption rates")
+        raise ValueError("Fatal error archiving absorption_rates. This must be successful to proceed.")
+      else:
+        self.logger.info("Successfully archived absorption rates.")
+    else:
+      self.logger.error("absorption_rates not found or is None. Unable to archive.")
+
+  def load(self):
+    self.logger.info("Load")
+    success, failed = self.update_mkt_trends_ts_index()
+    return success, failed
+
+  
+  def _calculate_absorption_rates(self):
+    if self.sold_listing_df is None or self.listing_df is None:
+      self.logger.error("Missing sold_listing_df or listing_df. Cannot calculate absorption rates.")
+      raise ValueError("Missing sold_listing_df or listing_df. Cannot calculate absorption rates.")
+    
+    try:
+      # Ensure datetime columns are in datetime format
+      self.sold_listing_df['lastTransition'] = pd.to_datetime(self.sold_listing_df['lastTransition'])
+      self.listing_df['addedOn'] = pd.to_datetime(self.listing_df['addedOn'])
+
+      # Get the current date and the start of the previous month
+      current_date = self.get_current_datetime()
+      last_month = current_date.replace(day=1) - timedelta(days=1)    
+      last_month_yearmonth = last_month.strftime('%Y-%m')
+      self.logger.info(f'Calculating absorption rates for month: {last_month_yearmonth}')
+
+      # Add a year-month column to the sold_listing_df
+      self.sold_listing_df['yearmonth'] = self.sold_listing_df['lastTransition'].dt.strftime('%Y-%m')
+
+      # Filter sold listings for the previous month
+      prev_month_sold = self.sold_listing_df[self.sold_listing_df['yearmonth'] == last_month_yearmonth]
+
+      self.logger.info(f"Found {len(prev_month_sold)} sold listings for {last_month_yearmonth}.")
+
+      def expand_guid(df):
+        return df.assign(geog_id=df['guid'].str.split(',')).explode('geog_id')
+      
+      # Expand guid for both sold and current listings
+      expanded_sold = expand_guid(prev_month_sold)
+      expanded_current = expand_guid(self.listing_df)
+
+      # Group by geog_id and propertyType
+      sold_counts = expanded_sold.groupby(['geog_id', 'propertyType']).size().reset_index(name='sold_count')
+      current_counts = expanded_current.groupby(['geog_id', 'propertyType']).size().reset_index(name='current_count')
+
+      # Merge the counts
+      merged_counts = pd.merge(sold_counts, current_counts, on=['geog_id', 'propertyType'], how='outer').fillna(0)
+
+      # Calculate absorption rate
+      merged_counts['absorption_rate'] = merged_counts['sold_count'] / merged_counts['current_count']
+      merged_counts['absorption_rate'] = merged_counts['absorption_rate'].replace([np.inf, -np.inf], np.nan)
+
+      self.absorption_rates = merged_counts
+
+      self.logger.info(f"Calculated absorption rates for {len(self.absorption_rates)} geog_id-propertyType combinations.")
+
+      # Calculate metrics for 'ALL' property type
+      all_property_types = merged_counts.groupby('geog_id').agg({
+        'sold_count': 'sum',
+        'current_count': 'sum'
+      }).reset_index()
+      all_property_types['propertyType'] = 'ALL'
+      all_property_types['absorption_rate'] = all_property_types['sold_count'] / all_property_types['current_count']
+      all_property_types['absorption_rate'] = all_property_types['absorption_rate'].replace([np.inf, -np.inf], np.nan)
+
+      # Combine results
+      self.absorption_rates = pd.concat([self.absorption_rates, all_property_types], ignore_index=True)
+
+      self.logger.info(f"Final absorption rates calculated for {len(self.absorption_rates)} geog_id-propertyType combinations, including 'ALL' property type.")
+    except Exception as e:
+      self.logger.error(f"Unexpected error calculating absorption rates: {e}")
+      raise
+
+
+  def _load_from_cache(self):
+    if not self.cache.cache_dir:
+      self.logger.error("Cache directory not set. Cannot load from cache.")
+      raise ValueError("Cache directory not set. Cannot load from cache.")
+    
+    self.sold_listing_df = self.cache.get('one_year_sold_listing')
+    self.listing_df = self.cache.get('on_listing')
+    
+    if self.sold_listing_df is None or self.listing_df is None:
+      self.logger.error("Missing sold_listing_df or listing_df.")
+      raise ValueError("Missing sold_listing_df or listing_df.")
+    
+    self.logger.info(f"Loaded {len(self.sold_listing_df)} sold listings and {len(self.listing_df)} current listings from cache.")
+
+
+  def update_mkt_trends_ts_index(self):
+    def generate_actions():
+      current_date = self.get_current_datetime()
+      last_month = current_date.replace(day=1) - timedelta(days=1)
+      last_month_str = last_month.strftime('%Y-%m')
+
+      for _, row in self.absorption_rates.iterrows():
+        property_type = row['propertyType'] if row['propertyType'] != 'ALL' else None
+        composite_id = f"{row['geog_id']}_{property_type or 'ALL'}"
+
+        # Handle NaN values and round to 3 decimal places
+        absorption_rate = row['absorption_rate']
+        if pd.isna(absorption_rate):
+          absorption_rate = None
+        else:
+          absorption_rate = round(float(absorption_rate), 4)
+
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_id": composite_id,
+          "script": {
+            "source": """
+            if (ctx._source.metrics == null) {
+              ctx._source.metrics = new HashMap();
+            }
+            if (ctx._source.metrics.absorption_rate == null) {
+              ctx._source.metrics.absorption_rate = [];
+            }
+            // Check if an entry for this month already exists
+            int existingIndex = -1;
+            for (int i = 0; i < ctx._source.metrics.absorption_rate.size(); i++) {
+              if (ctx._source.metrics.absorption_rate[i].date == params.new_metric.date) {
+                existingIndex = i;
+                break;
+              }
+            }
+            if (existingIndex >= 0) {
+              // Replace existing entry
+              if (params.new_metric.value != null) {
+                ctx._source.metrics.absorption_rate[existingIndex] = params.new_metric;
+              } else {
+                ctx._source.metrics.absorption_rate.remove(existingIndex);
+              }
+            } else {
+              // Append new entry
+              if (params.new_metric.value != null) {
+                ctx._source.metrics.absorption_rate.add(params.new_metric);
+              }
+            }
+            ctx._source.geog_id = params.geog_id;
+            ctx._source.propertyType = params.propertyType;
+            ctx._source.geo_level = params.geo_level;
+            ctx._source.last_updated = params.last_updated;
+            """,
+            "params": {
+              "new_metric": {
+                "date": last_month_str,
+                "value": absorption_rate
+              },
+              "geog_id": row['geog_id'],
+              "propertyType": property_type or "ALL",
+              "geo_level": int(row['geog_id'].split('_')[0][1:]),
+              "last_updated": current_date.isoformat()
+            }
+          },
+          "upsert": {
+            "geog_id": row['geog_id'],
+            "propertyType": property_type or "ALL",
+            "geo_level": int(row['geog_id'].split('_')[0][1:]),
+            "metrics": {
+              "absorption_rate": [] if absorption_rate is None else [{
+                "date": last_month_str,
+                "value": absorption_rate
+              }]
+            },
+            "last_updated": current_date.isoformat()
+          }
+        }
+
+    # Perform bulk update
+    success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
+
+    self.logger.info(f"Successfully updated {success} documents")
+    if failed:
+      self.logger.error(f"Failed to update {len(failed)} documents")
+      # self.datastore.summarize_update_failures(failed)
+
+    return success, failed
+
+
+  def delete_all_absorption_rates(self):
+    """
+    Deletes the 'absorption_rate' field from all documents in the market trends time series index.
+    """
+    def generate_actions():
+      query = {
+        "query": {
+          "exists": {
+            "field": "metrics.absorption_rate"
+          }
+        }
+      }
+      for hit in scan(self.datastore.es, index=self.datastore.mkt_trends_ts_index_name, query=query):
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_id": hit["_id"],
+          "script": {
+            "source": """
+            if (ctx._source.metrics != null) {
+              ctx._source.metrics.remove('absorption_rate');
+            }
+            """
+          }
+        }
+
+    success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
+    
+    self.logger.info(f"Delete absorption rates: Successfully updated {success} documents")
+    if failed:
+      self.logger.error(f"Delete absorption rates: Failed to update {len(failed)} documents")
+      self.datastore.summarize_update_failures(failed)
+
+    return success, failed
+
+  
+  def get_current_datetime(self):
+    """
+    Returns the current datetime in UTC or local time based on the use_utc flag.
+    """
+    if self.use_utc:
+      return datetime.now(pytz.utc).replace(tzinfo=None)
+    else:
+      return datetime.now()
+
+  def close(self):
+    self.datastore.close()
+
+# for dev
+if __name__ == '__main__':
+  datastore = Datastore()
+
+  processor = AbsorptionRateProcessor(datastore=datastore)
+  processor.extract()
+
+  processor.transform()
+
+  success, failed = processor.load()
+
+  # datastore.search(index=datastore.mkt_trends_ts_index_name, _id='g30_dpz89rm7_DETACHED')[0]
+
+
+""" Sample absorption_rates dataframe:
++-------------+---------------+---------------+--------------+----------------+
+| geog_id     | propertyType  | sold_count    | current_count| absorption_rate|
++-------------+---------------+---------------+--------------+----------------+
+| g30_dpz89rm7| CONDO         | 54.0          | 3768.0       | 0.014331       |
+| g30_dpz89rm7| DETACHED      | 51.0          | 1363.0       | 0.037417       |
+| g30_dpz89rm7| SEMI-DETACHED | 12.0          | 201.0        | 0.059701       |
+| g30_dpz89rm7| TOWNHOUSE     | 11.0          | 501.0        | 0.021956       |
+| g30_dpz89rm7| ALL           | 128.0         | 5833.0       | 0.021944       |
++-------------+---------------+---------------+--------------+----------------+
+"""
+
+""" Sample doc from the mkt_trends_ts index: 
+{'geog_id': 'g30_dpz89rm7',
+ 'propertyType': 'DETACHED',
+ 'geo_level': 30,
+ 'metrics': {'median_price': [{'date': '2023-01', 'value': 1789000.0},
+   {'date': '2023-02', 'value': 1320000.0},
+   {'date': '2023-03', 'value': 1352500.0},
+   {'date': '2023-04', 'value': 1550000.0},
+   {'date': '2023-05', 'value': 1900000.0},
+   {'date': '2023-06', 'value': 1915000.0},
+      etc
+   {'date': '2024-06', 'value': 1350000.0},
+   {'date': '2024-07', 'value': 1261750.0}],
+
+  'median_dom': [{'date': '2023-01', 'value': 2.0},
+   {'date': '2023-02', 'value': 7.0},
+   {'date': '2023-03', 'value': 7.0},
+   {'date': '2023-04', 'value': 8.0},
+   {'date': '2023-05', 'value': 11.5},
+   {'date': '2023-06', 'value': 9.0},
+   {'date': '2023-07', 'value': 11.0},
+      etc.
+   {'date': '2024-06', 'value': 9.0},
+   {'date': '2024-07', 'value': 14.5}],
+
+  'last_mth_median_asking_price': {'date': '2024-07', 'value': 1500000.0},
+  'last_mth_new_listings': {'date': '2024-07', 'value': 887},
+
+  'absorption_rate': [{'date': '2024-07', 'value': 0.0374}]},
+
+ 'last_updated': '2024-08-02T04:51:04.199475'}
+"""  

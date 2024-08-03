@@ -8,13 +8,21 @@ import logging
 from ..data.caching import FileBasedCache
 from ..data.es import Datastore
 from ..data.bq import BigQueryDatastore
+from ..data.archive import Archiver
 from elasticsearch.helpers import scan, bulk
 from elasticsearch.exceptions import NotFoundError, ConnectionError, RequestError, TransportError
+
+import logging, sys, pytz
+
+# Set up logging to write to stdout
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 class LastMthMetricsProcessor:
   def __init__(self, datastore: Datastore, 
                bq_datastore: BigQueryDatastore = None,
-               cache_dir: Union[str, Path] = None):
+               cache_dir: Union[str, Path] = None,
+               archive_dir: Union[str, Path] = None):
     self.logger = logging.getLogger(self.__class__.__name__)
 
     self.datastore = datastore
@@ -33,6 +41,11 @@ class LastMthMetricsProcessor:
     self.last_run_key = 'LastMthMetrics_last_run'
     last_run = self.cache.get(self.last_run_key)
     self.logger.info(f"Last run: {last_run}")
+
+    self.archiver = Archiver(archive_dir or self.cache.cache_dir / 'archives')
+
+    self.use_utc = True  # Set this to True to use UTC
+
 
   def extract(self, from_cache=False):
     try:      
@@ -70,7 +83,7 @@ class LastMthMetricsProcessor:
   def _initialize_extract_from_datastore(self):
     # get everything till now
     start_time = datetime(1970, 1, 1)     # distant past
-    end_time = datetime.now()
+    end_time = self.get_current_datetime()
     success, self.listing_df = self.datastore.get_listings(
       use_script_for_last_update=True,    # TODO: Undo after dev.
 
@@ -103,7 +116,7 @@ class LastMthMetricsProcessor:
     
   def _delta_extract_from_datastore(self, last_run: datetime):
     start_time = last_run
-    end_time = datetime.now()
+    end_time = self.get_current_datetime()
 
     success, self.delta_listing_df = self.datastore.get_listings(
       use_script_for_last_update=True,    # TODO: Undo after dev.
@@ -142,13 +155,25 @@ class LastMthMetricsProcessor:
 
 
   def end_of_mth_run(self):
-    today = datetime.now()
+    today = self.get_current_datetime()
     if today.day == 1:
       self.compute_last_month_metrics()
+
+      if hasattr(self, 'last_mth_metrics_results') and self.last_mth_metrics_results is not None:
+        if not self.archiver.archive(self.last_mth_metrics_results, 'last_mth_metrics_results'):
+          self.logger.error("Failed to archive last month's metrics results")
+          raise ValueError("Fatal error archiving last_mth_metrics_results. This must be successful to proceed.")
+        else:
+          self.logger.info("Successfully archived last month's metrics results")
+      else:
+        self.logger.error("Fatal error last_mth_metrics_results not found or is None. Unable to archive.")
+        raise ValueError("Fatal error archiving last_mth_metrics_results. This must be successful to proceed.")
+
       success, failed = self.remove_deleted_listings()  # TODO: should we handle success and failure here?
       success, failed = self.update_mkt_trends()
     else:
       self.logger.warning("Today is not the 1st of the month.")
+
 
   def update_es_tracking_index(self):
 
@@ -156,7 +181,7 @@ class LastMthMetricsProcessor:
     # straight through
     if self.delta_listing_df is None:
       self.delta_listing_df = self.cache.get('delta_on_current_listing')
-      if self.delta_listing_df:
+      if self.delta_listing_df is not None:
         self.logger.info(f"Loaded {len(self.delta_listing_df)} delta listings from cache.")
 
     if self.delta_listing_df is not None:
@@ -190,13 +215,15 @@ class LastMthMetricsProcessor:
 
     return success, failed
 
-
+  
   def compute_last_month_metrics(self):
     """
-    this is to be run at the 1st min of a new month, so the last month can be calculated.
+    This is to be run at the 1st min of a new month, so the last month metrics can be calculated.
+    It calculates the median price and new listings count for each geog_id-propertyType pair.
+    There's also entry of propertType 'ALL' which is the sum of all property types within the geog_id.
     """
     # Determine the last month
-    today = datetime.now()
+    today = self.get_current_datetime()
     last_month = (today.replace(day=1) - pd.Timedelta(days=1)).strftime('%Y-%m')
     self.logger.info(f'Calculating metrics for {last_month}')
 
@@ -209,34 +236,27 @@ class LastMthMetricsProcessor:
     # Expand guid column
     expanded_df = self.listing_df.assign(geog_id=self.listing_df['guid'].str.split(',')).explode('geog_id')
 
-    # Calculate median price
-    median_prices = expanded_df.groupby(['geog_id', 'propertyType'])['price'].median().reset_index()
+    # Function to calculate metrics for both specific property types and 'ALL'
+    def calculate_metrics(group):
+        return pd.Series({
+            'median_price': group['price'].median(),
+            'new_listings_count': (group['addedOn'].dt.to_period('M').astype(str) == last_month).sum()
+        })
 
-    # Calculate new listings count
-    new_listings = expanded_df[expanded_df['addedOn'].dt.to_period('M').astype(str) == last_month]
-    new_listings_count = new_listings.groupby(['geog_id', 'propertyType']).size().reset_index(name='new_listings_count')
-
-    # Merge median prices and new listings count
-    results = pd.merge(median_prices, new_listings_count, on=['geog_id', 'propertyType'], how='outer')
-
-    # Fill NaN values with 0 for new_listings_count
-    results['new_listings_count'] = results['new_listings_count'].fillna(0)
+    # Calculate metrics for specific property types
+    results = expanded_df.groupby(['geog_id', 'propertyType']).apply(calculate_metrics).reset_index()
 
     # Calculate metrics for 'ALL' property type
-    all_property_types = results.groupby('geog_id').agg({
-        'price': 'median',
-        'new_listings_count': 'sum'
-    }).reset_index()
+    all_property_types = expanded_df.groupby('geog_id').apply(calculate_metrics).reset_index()
     all_property_types['propertyType'] = 'ALL'
 
     # Combine results
     final_results = pd.concat([results, all_property_types], ignore_index=True)
 
     # Reorder columns
-    final_results = final_results[['geog_id', 'propertyType', 'price', 'new_listings_count']]
+    final_results = final_results[['geog_id', 'propertyType', 'median_price', 'new_listings_count']]
 
-    # Rename 'price' column to 'median_price'
-    final_results.rename(columns={'price': 'median_price'}, inplace=True)
+    self.logger.info(f'Calculated metrics for {len(final_results)} (geog_id, propertyType) pairs, including "ALL" property type')
 
     self.last_mth_metrics_results = final_results
   
@@ -248,7 +268,7 @@ class LastMthMetricsProcessor:
     We do not want deleted stuff to roll over to next month.
     """
 
-    current_date = datetime.now()
+    current_date = self.get_current_datetime()
 
     first_day_current_month = current_date.replace(day=1)
     last_month_start = (first_day_current_month - timedelta(days=1)).replace(day=1)
@@ -282,7 +302,7 @@ class LastMthMetricsProcessor:
           "_id": row['listingId']
         }
 
-    success, failed = bulk(self.datastore.es, generate_actions(), stats_only=True, raise_on_error=False)
+    success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
     self.logger.info(f"Successfully deleted {success} documents from Elasticsearch")
     if failed:
       self.logger.error(f"Failed to delete {len(failed)} documents from Elasticsearch")
@@ -298,7 +318,7 @@ class LastMthMetricsProcessor:
     Update the market trends index with last month's median asking price and new listings count.
     """
     
-    last_month = (datetime.now().replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
+    last_month = (self.get_current_datetime().replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
     # Modified last_month to simulate a diff month
     # last_month = (datetime.now().replace(day=1) + timedelta(days=1)).strftime('%Y-%m')
     
@@ -332,7 +352,7 @@ class LastMthMetricsProcessor:
                 "date": last_month,
                 "value": int(row['new_listings_count'])
               },
-              "last_updated": datetime.now().isoformat()
+              "last_updated": self.get_current_datetime().isoformat()
             }
           },
           "upsert": {
@@ -349,12 +369,12 @@ class LastMthMetricsProcessor:
                 "value": int(row['new_listings_count'])
               }
             },
-            "last_updated": datetime.now().isoformat()
+            "last_updated": self.get_current_datetime().isoformat()
           }
         }
 
     # Perform bulk update with error handling
-    success, failed = bulk(self.datastore.es, generate_actions(), stats_only=False, raise_on_error=False, raise_on_exception=False)
+    success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
     
     self.logger.info(f"Successfully updated {success} documents in market trends index")
     if failed:
@@ -362,6 +382,48 @@ class LastMthMetricsProcessor:
     
     return success, failed
   
+
+  def remove_last_mth_metrics(self):
+    """
+    Remove 'last_mth_median_asking_price' and 'last_mth_new_listings' from all items
+    in the mkt_trends_ts index on Elasticsearch.
+    """
+    def generate_actions():
+      query = {
+        "query": {
+          "match_all": {}
+        }
+      }
+      for hit in scan(self.datastore.es, 
+                      index=self.datastore.mkt_trends_ts_index_name, 
+                      query=query):
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_id": hit["_id"],
+          "script": {
+            "source": """
+            if (ctx._source.metrics.containsKey('last_mth_median_asking_price')) {
+              ctx._source.metrics.remove('last_mth_median_asking_price')
+            }
+            if (ctx._source.metrics.containsKey('last_mth_new_listings')) {
+              ctx._source.metrics.remove('last_mth_new_listings')
+            }
+            """
+          }
+        }
+
+    success, failed = bulk(self.datastore.es, generate_actions(), 
+                           raise_on_error=False, 
+                           raise_on_exception=False)
+    
+    self.logger.info(f"Successfully removed last_mth metrics from {success} documents")
+    if failed:
+      self.logger.error(f"Failed to remove last_mth metrics from {len(failed)} documents")
+    
+    return success, failed
+
+
   def _load_from_cache(self):
     # cache_file = self.cache_dir / f"{'full' if first_load else 'delta'}_listing_cache_df"
     if not self.cache.cache_dir:
@@ -395,24 +457,37 @@ class LastMthMetricsProcessor:
 
     self.logger.info("Cleanup completed. All cached data has been cleared and instance variables reset.")
 
+
+  def close(self):
+    self.datastore.close()
+    self.bq_datastore.close()
+
+
+  def get_current_datetime(self):
+    """
+    Returns the current datetime in UTC or local time based on the use_utc flag.
+    """
+    if self.use_utc:
+      return datetime.now(pytz.utc).replace(tzinfo=None)
+    else:
+      return datetime.now()
+    
 # For dev
 if __name__ == "__main__":
   datastore = Datastore()  # Assume this is properly initialized
 
   metrics = LastMthMetricsProcessor(datastore=datastore)
   
-  # First run
-
-  # run this with production ES
-  metrics.extract(from_cache=False)
-
-  # run this with test ES
-  metrics.extract(from_cache=True)
+  metrics.extract(from_cache=False)   # run this against PROD
+  # switch SSH tunneling/IP if needed.
+  metrics.extract(from_cache=True)    # run this against UAT
   success, failed = metrics.load()
   
-  # Subsequent runs (do this later)
-  # metrics.extract(first_load=False)
-  # metrics.load()
+  # Repeat the above about once a day (to ensure we capture listings before they get deleted)/
+
+  # At the 1st min of a new month
+  metrics.end_of_mth_run()
+
 
 """ Sample last_mth_metrics_results dataframe
 +--------------+----------------+---------------+-------------------+

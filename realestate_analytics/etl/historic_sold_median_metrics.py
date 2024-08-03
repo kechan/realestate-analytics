@@ -5,6 +5,7 @@ import numpy as np
 import logging
 
 from datetime import datetime, date, timedelta
+import pytz
 from tqdm.auto import tqdm
 
 from ..data.caching import FileBasedCache
@@ -83,6 +84,8 @@ class SoldMedianMetricsProcessor:
 
     self.sold_listing_df = None
     self.geo_entry_df = None
+
+    self.use_utc = True  # Set this to True to use UTC
 
   def extract(self, from_cache=False):
     self.logger.info("Extract")
@@ -245,6 +248,10 @@ class SoldMedianMetricsProcessor:
         self.logger.error(f"Error deleting cache key {key}: {e}")
 
     self.logger.info("Cache cleanup complete.")
+
+    # remove metrics from mkt_trends_ts index
+    # updated, failures = self.remove_metrics_from_mkt_trends_ts()
+    # self.logger.info(f"Removed metrics from {updated} doc in mkt_trends_ts index with {len(failures)} failures.")
       
 
   def reset(self):
@@ -337,35 +344,26 @@ class SoldMedianMetricsProcessor:
   
   def update_mkt_trends_ts_index(self):
     """
-    
+    Updates the market trends time series index in Elasticsearch with new median price and days on market (DOM) metrics.
+
+    Returns:
+        tuple: A tuple containing the number of successfully updated documents and a list of any failures.    
     """
     def generate_actions():
-      merged_df = pd.merge(self.diff_price_series, self.diff_dom_series, 
-                          on=['geog_id', 'propertyType', 'geo_level'], 
-                          suffixes=('_price', '_dom'))
-      
-      for _, row in merged_df.iterrows():
+      # Process price series
+      for _, row in self.diff_price_series.iterrows():
         new_metrics = {
-          "median_price": [],
-          "median_dom": []
+          "median_price": []
         }
 
-        for col in merged_df.columns:
-          if col.startswith('20') and col.endswith('_price'):
-            date = col.split('_')[0]
+        for col in self.diff_price_series.columns:
+          if col.startswith('20'):
+            date = col
             value = row[col]
             if pd.notna(value):
               new_metrics["median_price"].append({
                 "date": date,
                 "value": float(value)
-              })
-          elif col.startswith('20') and col.endswith('_dom'):
-            date = col.split('_')[0]
-            value = row[col]
-            if pd.notna(value):
-              new_metrics["median_dom"].append({
-                "date": date,
-                "value": int(value)
               })
 
         property_type_id = "ALL" if row['propertyType'] is None else row['propertyType']            
@@ -381,6 +379,56 @@ class SoldMedianMetricsProcessor:
               ctx._source.metrics = new HashMap();
             }
             ctx._source.metrics.median_price = params.new_metrics.median_price;
+            ctx._source.geog_id = params.geog_id;
+            ctx._source.propertyType = params.propertyType;
+            ctx._source.geo_level = params.geo_level;
+            ctx._source.last_updated = params.last_updated;
+            """,
+            "params": {
+              "new_metrics": new_metrics,
+              "geog_id": row['geog_id'],
+              "propertyType": property_type_id,
+              "geo_level": int(row['geo_level']),
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          },
+          "upsert": {
+            "geog_id": row['geog_id'],
+            "propertyType": property_type_id,
+            "geo_level": int(row['geo_level']),
+            "metrics": new_metrics,
+            "last_updated": self.get_current_datetime().isoformat()
+          }
+        }
+
+      # Process DOM series
+      for _, row in self.diff_dom_series.iterrows():
+        new_metrics = {
+          "median_dom": []
+        }
+
+        for col in self.diff_dom_series.columns:
+          if col.startswith('20'):
+            date = col
+            value = row[col]
+            if pd.notna(value):
+              new_metrics["median_dom"].append({
+                "date": date,
+                "value": float(value)
+              })
+
+        property_type_id = "ALL" if row['propertyType'] is None else row['propertyType']            
+        composite_id = f"{row['geog_id']}_{property_type_id}"
+
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_id": composite_id,
+          "script": {
+            "source": """
+            if (ctx._source.metrics == null) {
+              ctx._source.metrics = new HashMap();
+            }
             ctx._source.metrics.median_dom = params.new_metrics.median_dom;
             ctx._source.geog_id = params.geog_id;
             ctx._source.propertyType = params.propertyType;
@@ -392,7 +440,7 @@ class SoldMedianMetricsProcessor:
               "geog_id": row['geog_id'],
               "propertyType": property_type_id,
               "geo_level": int(row['geo_level']),
-              "last_updated": datetime.now().isoformat()
+              "last_updated": self.get_current_datetime().isoformat()
             }
           },
           "upsert": {
@@ -400,15 +448,15 @@ class SoldMedianMetricsProcessor:
             "propertyType": property_type_id,
             "geo_level": int(row['geo_level']),
             "metrics": new_metrics,
-            "last_updated": datetime.now().isoformat()
+            "last_updated": self.get_current_datetime().isoformat()
           }
         }
 
-    # Perform bulk insert
+    # Perform bulk update
     success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
 
-    self.logger.info(f"Successfully updated {success} documents")
-    if failed: self.logger.error(f"Failed to update {len(failed)} documents")
+    self.logger.info(f"Successfully updated {success} docs")
+    if failed: self.logger.error(f"Failed to update {len(failed)} docs")
 
     return success, failed
 
@@ -422,6 +470,31 @@ class SoldMedianMetricsProcessor:
     response = self.datastore.es.delete_by_query(index=self.datastore.mkt_trends_ts_index_name, body=query)
     deleted_count = response["deleted"]
     self.logger.info(f"Deleted {deleted_count} documents from {self.datastore.mkt_trends_ts_index_name}")
+
+
+  def remove_metrics_from_mkt_trends_ts(self):
+    def generate_actions():
+      # Use scan to efficiently retrieve all documents that have a 'metrics' field
+      for hit in scan(self.datastore.es, 
+                      index=self.datastore.mkt_trends_ts_index_name, 
+                      query={"query": {"exists": {"field": "metrics"}}}):
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_id": hit["_id"],
+          "script": {
+            "source": "ctx._source.remove('metrics')",
+          }
+        }
+
+    # Perform bulk update
+    success, failed = bulk(self.datastore.es, generate_actions(), stats_only=True, raise_on_error=False)
+
+    self.logger.info(f"Successfully updated {success} documents")
+    if failed:
+      self.logger.error(f"Failed to update {len(failed)} documents")
+
+    return success, failed
 
 
   def _update_es_sold_listings_with_guid(self) -> None:
@@ -513,32 +586,34 @@ class SoldMedianMetricsProcessor:
   
   def get_current_datetime(self):
     """
-    Returns the current datetime. This method can be overridden for testing purposes.
+    Returns the current datetime in UTC or local time based on the use_utc flag.
+    
+    1. can be adjusted for timezone based on self.use_utc flag.
+    2. This method can also be overridden for testing purposes.
     """
     # return datetime.now() - timedelta(days=290) # simulate test
-    return datetime.now()
+    if self.use_utc:
+      return datetime.now(pytz.utc).replace(tzinfo=None)
+    else:
+      return datetime.now()
 
+
+  def close(self):
+    self.datastore.close()
+
+    
 if __name__ == '__main__':
   datastore = Datastore(host='localhost', port=9201)
 
   processor = SoldMedianMetricsProcessor(datastore)
 
-  # add_geog_ids_to_sold_listings will append the mapped geog_ids to the sold_listing_df (sold listing)
-  # before the median metrics are calculated.
-  # _ = processor.build_geog_id_level_df()
-
   processor.extract(from_cache=False)  # run on PROD to get real data
 
   processor.extract(from_cache=True)  # run on UAT during dev.
   processor.transform()
   success, failed = processor.load()    # load into UAT during dev
 
-  # wait a few days 
-  processor.extract(from_cache=False)  # run on PROD to get real data
-
-  processor.extract(from_cache=True)  # run on UAT during dev.
-  processor.transform()
-  success, failed = processor.load()    # load into UAT during dev
+  # repeat the above steps every few days, this will allow a "running" current month calculation.
 
 
 """ Sample doc from the mkt_trends_ts index: 

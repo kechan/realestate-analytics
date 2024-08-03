@@ -2,6 +2,7 @@ from typing import List, Dict, Any, Tuple
 
 import json, time, traceback
 from datetime import datetime, timedelta
+from collections import Counter
 import pandas as pd
 
 from .caching import FileBasedCache
@@ -16,21 +17,17 @@ def derive_property_type(row):
   listing_type = row.get('listingType', '').split(', ')  # Assuming listingType is a comma-separated string
   search_category_type = row.get('searchCategoryType', None)
   
-  # Check for CONDO
+
   if search_category_type == 101 and any(lt in ['CONDO', 'REC'] for lt in listing_type):
-      return 'CONDO'
-  # Check for SEMI-DETACHED
+    return 'CONDO'
   elif search_category_type == 104:
-      return 'SEMI-DETACHED'
-  # Check for TOWNHOUSE
+    return 'SEMI-DETACHED'
   elif search_category_type == 102:
-      return 'TOWNHOUSE'
-  # Check for DETACHED
+    return 'TOWNHOUSE'
   elif search_category_type == 103:
-      return 'DETACHED'
-  # Default case
+    return 'DETACHED'
   else:
-      return 'OTHER'
+    return 'OTHER'
   
 
 def format_listingType(x: List[str]):
@@ -171,16 +168,16 @@ class Datastore:
     # Create the index if it doesn't already exist
     if not self.es.indices.exists(index=index_name):
       self.es.indices.create(index=index_name, body=index_schema)
-      print(f"Index '{index_name}' created successfully.")
+      self.logger.info(f"Index '{index_name}' created successfully.")
     else:
-      print(f"Index '{index_name}' already exists.")
+      self.logger.info(f"Index '{index_name}' already exists.")
 
     # Check if the alias already exists
     if not self.es.indices.exists_alias(name=alias_name):
-        self.es.indices.put_alias(index=index_name, name=alias_name)
-        print(f"Alias '{alias_name}' created for index '{index_name}'.")
+      self.es.indices.put_alias(index=index_name, name=alias_name)
+      self.logger.info(f"Alias '{alias_name}' created for index '{index_name}'.")
     else:
-        print(f"Alias '{alias_name}' already exists.")
+      self.logger.info(f"Alias '{alias_name}' already exists.")
 
   def create_mkt_trends_ts_index(self):
     index_name = "rlp_mkt_trends_ts_1"
@@ -205,7 +202,7 @@ class Datastore:
                         "type": "nested",
                         "properties": {
                             "date": {"type": "date", "format": "yyyy-MM"},
-                            "value": {"type": "integer"}
+                            "value": {"type": "float"}
                         }
                     }
                 }
@@ -218,16 +215,16 @@ class Datastore:
     # Create the index if it doesn't already exist
     if not self.es.indices.exists(index=index_name):
       self.es.indices.create(index=index_name, body=index_schema)
-      print(f"Index '{index_name}' created successfully.")
+      self.logger.info(f"Index '{index_name}' created successfully.")
     else:
-      print(f"Index '{index_name}' already exists.")
+      self.logger.info(f"Index '{index_name}' already exists.")
 
     # Check if the alias already exists
     if not self.es.indices.exists_alias(name=alias_name):
       self.es.indices.put_alias(index=index_name, name=alias_name)
-      print(f"Alias '{alias_name}' created for index '{index_name}'.")
+      self.logger.info(f"Alias '{alias_name}' created for index '{index_name}'.")
     else:
-      print(f"Alias '{alias_name}' already exists.")
+      self.logger.info(f"Alias '{alias_name}' already exists.")
 
 
   def get_mapping(self, index: str) -> dict:
@@ -384,7 +381,7 @@ class Datastore:
       page = self.es.search(index=self.sold_listing_index_name, body=query_body, scroll='5m', size=500)
       scroll_id = page['_scroll_id']
       total_hits = page['hits']['total']['value']
-      self.logger.info(f"Total hits: {total_hits}")
+      self.logger.info(f"Total hits for sold listings: {total_hits}")
 
       hits = page['hits']['hits']
 
@@ -447,7 +444,8 @@ class Datastore:
   def get_current_active_listings(self, selects: List[str], prov_code: str=None,
                                   addedOn_start_time: datetime=None, addedOn_end_time: datetime=None,
                                   updated_start_time: datetime=None, updated_end_time: datetime=None,
-                                  use_script_for_last_update: bool=False  # TODO: should comment out later after dev
+                                  use_script_for_last_update: bool=False,  # TODO: should comment out later after dev
+                                  active=True
                                   ):
     """
     This is used in context of nearby_comparable_solds.NearbyComparableSoldsProcessor ETL pipeline.
@@ -470,10 +468,15 @@ class Datastore:
 
     try:
       must_filters = [
-          {"match": {"listingStatus": "ACTIVE"}},
+          # {"match": {"listingStatus": "ACTIVE"}},
           {"match": {"transactionType": "SALE"}},
           {"bool": {"should": self.property_type_query_mappings}}
       ]
+      if active:
+        must_filters.append({"match": {"listingStatus": "ACTIVE"}})
+      else:
+        must_filters.append({"bool": {"must_not": {"match": {"listingStatus": "ACTIVE"}}}})
+
       if prov_code is not None:
         must_filters.append({"match": {"provState": prov_code}})
 
@@ -544,7 +547,7 @@ class Datastore:
       page = self.es.search(index=self.listing_index_name, body=query_body, scroll='5m', size=500)
       scroll_id = page['_scroll_id']
       total_hits = page['hits']['total']['value']
-      self.logger.info(f"Total hits: {total_hits}")
+      self.logger.info(f"Total hits for current active listings: {total_hits}")
       hits = page['hits']['hits']
 
       while hits:
@@ -709,7 +712,7 @@ class Datastore:
       page = self.es.search(index=self.listing_index_name, body=query_body, scroll='5m', size=500)
       scroll_id = page['_scroll_id']
       total_hits = page['hits']['total']['value']
-      self.logger.info(f"Total hits: {total_hits}")
+      self.logger.info(f"Total hits for listings: {total_hits}")
       hits = page['hits']['hits']
     
       while hits:
@@ -764,7 +767,7 @@ class Datastore:
   
       process_time = time.time() - start_process_time
       self.logger.info(f"Completed fetching listings in {process_time:.2f} seconds")
-      
+
       return True, listings_df
     except Exception as e:
       self.logger.error(f"Error converting listings to DataFrame: {e}")
@@ -884,3 +887,20 @@ class Datastore:
         self.es.clear_scroll(scroll_id=scroll_id)
       except Exception as e:
         self.logger.error(f"Error removing scroll ID: {e}")
+
+  def close(self):
+    if self.es:
+      self.es.close()
+
+  # helper to summarize update failures
+  def summarize_update_failures(self, update_failures):
+    reasons = Counter()
+
+    for failure in update_failures:
+      error = failure['update'].get('error', {})
+      reason = error.get('type', 'unknown')
+      reasons[reason] += 1
+
+    self.logger.info("Update failure reasons summary and counts")
+    for reason, count in reasons.items():
+      self.logger.info(f"\t\"{reason}\", {count}")

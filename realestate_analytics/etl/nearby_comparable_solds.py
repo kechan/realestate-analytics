@@ -7,6 +7,7 @@ import pandas as pd
 from math import radians, sin, cos, sqrt, atan2
 from pathlib import Path
 from datetime import datetime, timedelta
+import pytz
 
 from ..data.caching import FileBasedCache
 from ..data.es import Datastore
@@ -112,12 +113,27 @@ class NearbyComparableSoldsProcessor:
     self.sold_listing_df = None
     self.listing_df = None
 
+    self.current_listing_selects = [
+      'listingType', 'searchCategoryType',
+      'guid',
+      'beds', 'bedsInt', 
+      'baths', 'bathsInt',
+      'lat', 'lng',
+      'price',
+      'addedOn',
+      'lastUpdate',
+      'listingStatus'
+    ]
+
     # definition of "comparables"
     # In totality, the vicinity of the property and time of sale are also involved, but these are the simpler ones
     # so we partition our sold listing set by comparable_criteria first.
     self.comparable_criteria = ['propertyType', 'bedsInt', 'bathsInt']
 
     self.listing_profile_partition = None #self.sold_listing_df.groupby(self.comparable_criteria).size().reset_index(name='population')
+
+    # Flag to determine whether to use UTC or local time
+    self.use_utc = True  # Set this to True to use UTC
 
   def extract(self, from_cache=False):
     self.logger.info("Extract")
@@ -136,7 +152,7 @@ class NearbyComparableSoldsProcessor:
     try:
       # first run
       if last_run is None:
-        end_time = datetime.now()
+        end_time = self.get_current_datetime()
 
         # get the sold listings from the last year till now
         success, self.sold_listing_df = self.datastore.get_sold_listings(
@@ -195,7 +211,7 @@ class NearbyComparableSoldsProcessor:
 
         # get the sold listings from last run till now
         start_time = last_run - timedelta(days=21)   # load from 21 days before last run to have bigger margin of safety.
-        end_time = datetime.now()
+        end_time = self.get_current_datetime()
         
         success, delta_sold_listing_df = self.datastore.get_sold_listings(
           start_time=start_time,
@@ -219,7 +235,7 @@ class NearbyComparableSoldsProcessor:
           raise ValueError("Failed to retrieve delta sold listings")
         self.logger.info(f'Loaded {len(delta_sold_listing_df)} sold listings from {start_time} to {end_time}')
         
-        # get the current listings from last run till now
+        # Get the current ACTIVE listings from last run till now
         start_time = last_run - timedelta(days=3)   # load from 3 days before last run to have some margin of safety.
         # end time is same as above
         success, delta_listing_df = self.datastore.get_current_active_listings(
@@ -228,26 +244,33 @@ class NearbyComparableSoldsProcessor:
           addedOn_end_time=end_time,
           updated_start_time=start_time,
           updated_end_time=end_time,
-          selects=[
-          'listingType', 'searchCategoryType',
-          'guid',
-          'beds', 'bedsInt', 
-          'baths', 'bathsInt',
-          'lat', 'lng',
-          'price',
-          'addedOn',
-          'lastUpdate'
-          ],
+          selects=self.current_listing_selects,
           prov_code='ON'
           )
         if not success:
           self.logger.error(f"Failed to retrieve delta current active listings from {start_time} to {end_time}")
           raise ValueError("Failed to retrieve delta current active listings")
-        self.logger.info(f'Loaded {len(delta_listing_df)} current listings from {start_time} to {end_time}')
+        self.logger.info(f'Loaded {len(delta_listing_df)} current active listings from {start_time} to {end_time}')
+
+        # Get the current NON ACTIVE listings from last run till now
+        success, delta_inactive_listing_df = self.datastore.get_current_active_listings(
+          use_script_for_last_update=True,      # TODO: remove after dev
+          addedOn_start_time=start_time,
+          addedOn_end_time=end_time,
+          updated_start_time=start_time,
+          updated_end_time=end_time,
+          selects=self.current_listing_selects,
+          prov_code='ON',
+          active=False
+        )
+        if not success:
+          self.logger.error(f"Failed to retrieve delta current non active listings from {start_time} to {end_time}")
+          raise ValueError("Failed to retrieve delta current non active listings")
+        self.logger.info(f'Loaded {len(delta_inactive_listing_df)} current non active listings from {start_time} to {end_time}')
 
         # Merge delta with whole
 
-        # For sold listings
+        # Merging for sold listings
         self.sold_listing_df = pd.concat([self.sold_listing_df, delta_sold_listing_df], axis=0, ignore_index=True)
         self.sold_listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='last')
         # get rid of stuff thats older than a year
@@ -259,13 +282,21 @@ class NearbyComparableSoldsProcessor:
         len_sold_listing_df_after_delete = len(self.sold_listing_df)
         self.logger.info(f'removed {len_sold_listing_df_before_delete - len_sold_listing_df_after_delete} sold listings older than a year')
 
-        # For current listings
-        self.listing_df = pd.concat([self.listing_df, delta_listing_df], axis=0)
+        # Merging for active listings
+        self.listing_df = pd.concat([self.listing_df, delta_listing_df], axis=0)   # delta is active at time of this query
         self.listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='last')
+        # For managing non active listings
+        self.listing_df = pd.concat([self.listing_df, delta_inactive_listing_df], axis=0)   # delta is non active at time of this query
+        self.listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='last')
+        # drop the non active listings
+        inactive_indices = self.listing_df.q("listingStatus != 'ACTIVE'").index
+        self.logger.info(f"Dropping {len(inactive_indices)} non active listings")
+        self.listing_df.drop(inactive_indices, inplace=True)
 
         # Remove known deletions since last run
-        # TODO: need to work out a sensible schedule, which should be less frequent to save API costs.
-        # Note: it isnt critical to remove these, as updating deleting stuff should be a no op for ES update
+        # TODO: need to work out a sensible schedule, which should take into account BQ querying cost.
+        # Note: for the purpose of computing nearby solds, it isnt critical to remove these, 
+        # as updating an already deleted listing should be a no op for ES update
         
         deleted_listings_df = self.bq_datastore.get_deleted_listings(start_time=last_run, end_time=end_time)
         if len(deleted_listings_df) > 0:
@@ -322,8 +353,9 @@ class NearbyComparableSoldsProcessor:
     # optimize such that we dont update on things that didnt change from last run.
     # Retrieve previous result from cache
     # prev_result = eval(self.cache.get('comparable_sold_listings_result')) # it deserializes back to dict
-    prev_result_json = self.cache.get('comparable_sold_listings_result').replace("'", '"')
+    prev_result_json = self.cache.get('comparable_sold_listings_result')
     if prev_result_json:
+      prev_result_json = prev_result_json.replace("'", '"')
       self.logger.info("Found previous comparable_sold_listings_result in cache. Deserializing...")
       try:
         prev_result = json.loads(prev_result_json)   # Deserialize JSON safely
@@ -368,6 +400,11 @@ class NearbyComparableSoldsProcessor:
     self.diff_result = None
 
     self.logger.info("Cleanup completed. All cached data has been cleared and instance variables reset.")
+
+    # remove comparable_sold_listings from all in index.
+    # updated, failures = self.delete_comparable_sold_listings()
+    # self.logger.info(f"Removed comparable_sold_listings from {updated} documents with {len(failures)} failures.")
+
 
   def reset(self):
     self.cleanup()
@@ -548,7 +585,54 @@ class NearbyComparableSoldsProcessor:
     return results
   
   def close(self):
-    self.datastore.es.close()
+    self.datastore.close()
+    self.bq_datastore.close()
+
+
+  def delete_comparable_sold_listings(self):
+    """
+    Delete the 'comparable_sold_listings' node from all docs in the listing index using bulk.
+    This method can be used in conjunction with cleanup() to reset everything from scratch.
+    """
+    def generate_actions():
+      query = {
+        "query": {
+          "exists": {
+            "field": "comparable_sold_listings"
+          }
+        }
+      }
+      for hit in scan(self.datastore.es,
+                      index=self.datastore.listing_index_name,
+                      query=query):
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.listing_index_name,
+          "_id": hit["_id"],
+          "script": {
+            "source": "ctx._source.remove('comparable_sold_listings')"
+          }
+        }
+
+    success, failed = bulk(self.datastore.es, generate_actions(),
+                          raise_on_error=False,
+                          raise_on_exception=False)
+    
+    self.logger.info(f"Successfully removed 'comparable_sold_listings' from {success} documents")
+    if failed:
+      self.logger.error(f"Failed to remove 'comparable_sold_listings' from {len(failed)} documents")
+    
+    return success, failed
+    
+  def get_current_datetime(self):
+    """
+    Returns the current datetime in UTC or local time based on the use_utc flag.
+    """
+    if self.use_utc:
+      return datetime.now(pytz.utc).replace(tzinfo=None)
+    else:
+      return datetime.now()
+
 
 if __name__ == '__main__':
   datastore = Datastore(host='localhost', port=9201)
@@ -561,6 +645,8 @@ if __name__ == '__main__':
 
   success, failed = processor.load()
 
+  # this can be run daily.
+
 """ Sample json appended to listing in ES:
   {
    etc. etc. 
@@ -570,6 +656,25 @@ if __name__ == '__main__':
   }
 """
 
+""" Sample comparable_sold_listings_result:
+{'21969076': {'sold_listing_id': ['on-13-1353569'],
+  'distance_km': [0.45767571332477264]},
+ '21483963': {'sold_listing_id': ['on-17-c7280822'],
+  'distance_km': [0.39653338615963163]},
+ '21954935': {'sold_listing_id': ['on-13-1373402',
+   'on-17-x7294514',
+   'on-13-1369153'],
+  'distance_km': [0.21228468386441926,
+   0.25941478772296306,
+   0.26068223623936243]},
+ '22073425': {'sold_listing_id': ['on-17-x7029200'],
+  'distance_km': [0.17871279268886067]},
+  ... 
+
+}
+"""
+
+""" testing compare_comparable_results
 # from realestate_analytics.etl.nearby_comparable_solds import compare_comparable_results
 
 # # Test cases
@@ -592,3 +697,4 @@ if __name__ == '__main__':
 
 # diff_result = compare_comparable_results(prev_result, current_result)
 # pprint(diff_result)
+"""
