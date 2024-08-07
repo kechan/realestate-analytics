@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import pytz
 
+from .base_etl import BaseETLProcessor
 from ..data.caching import FileBasedCache
 from ..data.es import Datastore
 from ..data.bq import BigQueryDatastore
@@ -92,26 +93,29 @@ def compare_comparable_results(prev_result: Dict[str, Dict[str, List]],
 
   return diff_result
 
-class NearbyComparableSoldsProcessor:
-  def __init__(self, datastore: Datastore, 
+class NearbyComparableSoldsProcessor(BaseETLProcessor):
+  def __init__(self, job_id: str, datastore: Datastore, 
                bq_datastore: BigQueryDatastore = None,
                cache_dir: Union[str, Path] = None):
-    self.logger = logging.getLogger(self.__class__.__name__)
-
-    self.datastore = datastore
-    self.bq_datastore = bq_datastore
-
-    self.cache_dir = Path(cache_dir) if cache_dir else None
-    if self.cache_dir:
-      self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-    self.cache = FileBasedCache(cache_dir=self.cache_dir)
-    self.logger.info(f'cache dir: {self.cache.cache_dir}')
-
-    self.last_run_key = 'NearbyComparableSoldsProcessor_last_run'
+    super().__init__(job_id=job_id, datastore=datastore, bq_datastore=bq_datastore, cache_dir=cache_dir)
 
     self.sold_listing_df = None
     self.listing_df = None
+
+    self.sold_listing_selects = [
+      'mls',
+      'lastTransition', 'transitions', 
+      'lastUpdate',
+      'listingType', 'searchCategoryType',
+      'listingStatus',       
+      'beds', 'bedsInt', 'baths', 'bathsInt',
+      'price','soldPrice',      
+      'daysOnMarket',
+      'lat', 'lng',
+      'city', 'neighbourhood',
+      'provState',
+      'guid'
+    ]
 
     self.current_listing_selects = [
       'listingType', 'searchCategoryType',
@@ -129,49 +133,34 @@ class NearbyComparableSoldsProcessor:
     # In totality, the vicinity of the property and time of sale are also involved, but these are the simpler ones
     # so we partition our sold listing set by comparable_criteria first.
     self.comparable_criteria = ['propertyType', 'bedsInt', 'bathsInt']
-
+    
     self.listing_profile_partition = None #self.sold_listing_df.groupby(self.comparable_criteria).size().reset_index(name='population')
 
     # Flag to determine whether to use UTC or local time
     self.use_utc = True  # Set this to True to use UTC
 
   def extract(self, from_cache=False):
-    self.logger.info("Extract")
-    if from_cache:
-      self._load_from_cache()
-    else:
-      self._extract_from_datastore()
-    
-    self._process_listing_profile_partition()
+    super().extract(from_cache=from_cache)
 
 
   def _extract_from_datastore(self):
+    if self._was_success('extract'):  # load the cache and skip instead
+      self._load_from_cache()
+      return
+
     last_run = self.cache.get(self.last_run_key)
     self.logger.info(f"last_run: {last_run}")
 
-    try:
-      # first run
-      if last_run is None:
+    try:      
+      if last_run is None:   # first run
         end_time = self.get_current_datetime()
 
         # get the sold listings from the last year till now
         success, self.sold_listing_df = self.datastore.get_sold_listings(
           start_time=end_time - timedelta(days=365),
           end_time=end_time,
-          selects=[
-          'mls',
-          'lastTransition', 'transitions', 
-          'lastUpdate',
-          'listingType', 'searchCategoryType',
-          'listingStatus',       
-          'beds', 'bedsInt', 'baths', 'bathsInt',
-          'price','soldPrice',      
-          'daysOnMarket',
-          'lat', 'lng',
-          'city', 'neighbourhood',
-          'provState',
-          'guid'
-          ])
+          selects=self.sold_listing_selects
+        )
         if not success:
           self.logger.error(f"Failed to get sold listings from {end_time - timedelta(days=365)} to {end_time}")
           raise ValueError("Failed to get sold listings.")
@@ -184,16 +173,7 @@ class NearbyComparableSoldsProcessor:
           updated_start_time=start_time,
           addedOn_end_time=end_time,
           updated_end_time=end_time,
-          selects=[
-          'listingType', 'searchCategoryType',
-          'guid',
-          'beds', 'bedsInt', 
-          'baths', 'bathsInt',
-          'lat', 'lng',
-          'price',
-          'addedOn',
-          'lastUpdate'
-          ],
+          selects=self.current_listing_selects,
           prov_code='ON'
         )
         if not success:
@@ -216,20 +196,8 @@ class NearbyComparableSoldsProcessor:
         success, delta_sold_listing_df = self.datastore.get_sold_listings(
           start_time=start_time,
           end_time=end_time,
-          selects=[
-            'mls',
-            'lastTransition', 'transitions', 
-            'lastUpdate',
-            'listingType', 'searchCategoryType',
-            'listingStatus',       
-            'beds', 'bedsInt', 'baths', 'bathsInt',
-            'price','soldPrice',      
-            'daysOnMarket',
-            'lat', 'lng',
-            'city', 'neighbourhood',
-            'provState',
-            'guid'
-          ])
+          selects=self.sold_listing_selects
+        )
         if not success:
           self.logger.error(f"Failed to retrieve delta sold listings from {start_time} to {end_time}")
           raise ValueError("Failed to retrieve delta sold listings")
@@ -309,19 +277,18 @@ class NearbyComparableSoldsProcessor:
           len_listing_df_after_delete = len(self.listing_df)
           self.logger.info(f'removed {len_listing_df_before_delete - len_listing_df_after_delete} deleted listings since last run')
 
-      # if all operations are successful, update the cache      
-      if self.cache.cache_dir:
-        self._save_to_cache()
-        self.cache.set(self.last_run_key, end_time)   # save to cache: last run time, and the data.
+      # if all operations are successful, update the data cache 
+      self._save_to_cache()
+      self.cache.set(self.last_run_key, end_time)   # save to cache: last run time, and the data.
+      self._mark_success('extract')
 
     except Exception as e:
       self.logger.error(f"Error occurred during extract: {e}")
       raise  
 
+
   def _load_from_cache(self):
-    if not self.cache.cache_dir:
-      self.logger.error("Cache directory not set. Cannot load from cache.")
-      raise ValueError("Cache directory not set. Cannot load from cache.")
+    super()._load_from_cache()
     
     self.sold_listing_df = self.cache.get('one_year_sold_listing')
     self.listing_df = self.cache.get("on_listing")
@@ -332,62 +299,84 @@ class NearbyComparableSoldsProcessor:
 
     self.logger.info(f"Loaded {len(self.sold_listing_df)} sold listings and {len(self.listing_df)} current listings from cache.")
 
+
   def _save_to_cache(self):
-    if not self.cache.cache_dir:
-      self.logger.error("Cache directory not set. Cannot save to cache.")
-      raise ValueError("Cache directory not set. Cannot save to cache.")
+    super()._save_to_cache()
     
     self.cache.set('one_year_sold_listing', self.sold_listing_df)
     self.cache.set('on_listing', self.listing_df)
 
     self.logger.info(f"Saved {len(self.sold_listing_df)} sold listings and {len(self.listing_df)} current listings to cache.")
 
-  def _process_listing_profile_partition(self):
-    self.listing_profile_partition = self.sold_listing_df.groupby(self.comparable_criteria).size().reset_index(name='population')
-
 
   def transform(self):
-    self.logger.info("Transform")
-    self.comparable_sold_listings_result, _ = self.get_sold_listings()
+    if self._was_success('transform'):  # load the cache and skip instead
+      self.logger.info("Transform already successful. Loading checkpoint from cache.")
+      diff_result_json = self.cache.get(f"{self.job_id}_transform_diff_result").replace("'", '"')
+      diff_result_json = diff_result_json.replace("'", '"')
+      self.diff_result = json.loads(diff_result_json)
+      return
 
-    # optimize such that we dont update on things that didnt change from last run.
-    # Retrieve previous result from cache
-    # prev_result = eval(self.cache.get('comparable_sold_listings_result')) # it deserializes back to dict
-    prev_result_json = self.cache.get('comparable_sold_listings_result')
-    if prev_result_json:
-      prev_result_json = prev_result_json.replace("'", '"')
-      self.logger.info("Found previous comparable_sold_listings_result in cache. Deserializing...")
-      try:
-        prev_result = json.loads(prev_result_json)   # Deserialize JSON safely
-        self.logger.info("Successfully deserialized comparable_sold_listings_result.")
-      except json.JSONDecodeError:        
+    try:
+      self._process_listing_profile_partition()
+      self.comparable_sold_listings_result, _ = self.get_sold_listings()
+
+      # optimize such that we dont update on things that didnt change from last run.
+      # Retrieve previous result from cache
+      # prev_result = eval(self.cache.get('comparable_sold_listings_result')) # it deserializes back to dict
+      prev_result_json = self.cache.get('comparable_sold_listings_result')
+      if prev_result_json:
+        prev_result_json = prev_result_json.replace("'", '"')
+        self.logger.info("Found previous comparable_sold_listings_result in cache. Deserializing...")
+        try:
+          prev_result = json.loads(prev_result_json)   # Deserialize JSON safely
+          self.logger.info("Successfully deserialized comparable_sold_listings_result.")
+        except json.JSONDecodeError:        
+          prev_result = None
+          self.logger.error("Failed to deserialize comparable_sold_listings_result. Setting to None. Please investigate")
+      else:
         prev_result = None
-        self.logger.error("Failed to deserialize comparable_sold_listings_result. Setting to None. Please investigate")
-    else:
-      prev_result = None
-      self.logger.info("No previous comparable_sold_listings_result found in cache.")
+        self.logger.info("No previous comparable_sold_listings_result found in cache.")
 
-    if prev_result is not None:    
-      self.diff_result = compare_comparable_results(prev_result, self.comparable_sold_listings_result)
-    else:
-      self.diff_result = self.comparable_sold_listings_result
-    
-    # Cache the full current result for next time
-    self.cache.set('comparable_sold_listings_result', self.comparable_sold_listings_result)
+      if prev_result is not None:    
+        self.diff_result = compare_comparable_results(prev_result, self.comparable_sold_listings_result)
+      else:
+        self.diff_result = self.comparable_sold_listings_result
+      
+      # Cache the full current result for next time
+      self.cache.set('comparable_sold_listings_result', self.comparable_sold_listings_result)
+      self.logger.info(f"{len(self.diff_result)} listings to be updated.")
+      
+      # checkpoint the diff results
+      self.cache.set(f"{self.job_id}_transform_diff_result", self.diff_result)  # save the diff result in case a recovery is needed.
+      self._mark_success('transform')
 
-    self.logger.info(f"{len(self.diff_result)} listings to be updated.")
+    except Exception as e:
+      self.logger.error(f"Error occurred during transform: {e}")
+      raise
+
 
   def load(self):
-    self.logger.info("Load")    
+    if self._was_success('load'): 
+      self.logger.info("Load already successful.")
+      return 0, []  # nothing to do 
+
     success, failed = self.update_datastore(self.diff_result)
+
+    if success / (success + len(failed)) < 0.5:
+      self.logger.error(f"Less than 50% success rate. Only {success} out of {success + len(failed)} documents updated.")
+
+      self.datastore.summarize_update_failures(failed)
+    else:
+      self._mark_success('load')
+
     return success, failed
-      
+
+
   def cleanup(self):
-    """
-    Clean up all cached data and reset instance variables.
-    """
-    # Clear cache entries
-    self.cache.delete(self.last_run_key)
+    super().cleanup()
+    
+    # remove resident cache data
     self.cache.delete('one_year_sold_listing')
     self.cache.delete('on_listing')
     self.cache.delete('comparable_sold_listings_result')
@@ -401,24 +390,10 @@ class NearbyComparableSoldsProcessor:
 
     self.logger.info("Cleanup completed. All cached data has been cleared and instance variables reset.")
 
-    # remove comparable_sold_listings from all in index.
+    # TODO: remove comparable_sold_listings from all in index.
     # updated, failures = self.delete_comparable_sold_listings()
     # self.logger.info(f"Removed comparable_sold_listings from {updated} documents with {len(failures)} failures.")
 
-
-  def reset(self):
-    self.cleanup()
-
-  def full_refresh(self):
-    """
-    Perform a full refresh of the data, resetting to initial state and re-extracting all data.
-    """
-    self.logger.info("Starting full refresh...")
-    self.cleanup()
-    self.extract(from_cache=False)
-    self.transform()
-    self.load()
-    self.logger.info("Full refresh completed.")
 
   def get_sold_listings(self):
     """
@@ -475,15 +450,9 @@ class NearbyComparableSoldsProcessor:
 
     self.logger.info(f"Processed {len(results)} listings")
 
-    # results
-    #  {'21483963': {'sold_listing_id': ['on-17-c7280822'],
-    #   'distance_km': [0.39653338615963163]},
-    #  '21969076': {'sold_listing_id': ['on-13-1353569'],
-    #   'distance_km': [0.45767571332477264]},
-    #  '21954935': {'sold_listing_id': ['on-13-1373402',
-
     return results, profile_timings
   
+
   def update_datastore(self, active_listing_2_sold_listings: Dict):
     """
       Update datastore (Elasticsearch) with the computed comparable sold listings.
@@ -512,8 +481,14 @@ class NearbyComparableSoldsProcessor:
     if failed:
       self.logger.error(f"Failed to update {len(failed)} documents")
 
+    # TODO: detail tracking of succcess
+    # all_ids = set(self.active_listing_2_sold_listings.keys()) 
+    # failed_ids = {failure['update']['_id'] for failure in failed}           
+    # all_ids - failed_ids    # what succeeded?
+
     return success, failed
-  
+
+
   def _get_partitioned_df(self, df: pd.DataFrame, property_type: str, bedsInt: int, bathsInt: int) -> pd.DataFrame:
     """
       Filter the dataframe based on property type, number of beds, and baths.
@@ -531,6 +506,7 @@ class NearbyComparableSoldsProcessor:
     mask = (df.propertyType == property_type) & (df.bedsInt == bedsInt) & (df.bathsInt == bathsInt)
     return df.loc[mask, ['lat', 'lng', '_id']]
   
+
   def _compute_nearest_sold_properties(self, current_coords: np.ndarray, sold_coords: np.ndarray, max_distance=1.0, max_comps=12):
     """
       Calculate distance matrix between current and sold listings' coords, and keep only maximum of 12 comparables sold within 1 km 
@@ -553,6 +529,7 @@ class NearbyComparableSoldsProcessor:
     mask = sorted_distances < max_distance
     return np.where(mask, sorted_distances, np.nan), np.where(mask, sorted_indices, np.nan)
   
+
   def _postprocess_results(self, 
                              filtered_distances: np.ndarray, 
                              filtered_indices: np.ndarray, 
@@ -584,9 +561,9 @@ class NearbyComparableSoldsProcessor:
         }
     return results
   
-  def close(self):
-    self.datastore.close()
-    self.bq_datastore.close()
+
+  def _process_listing_profile_partition(self):
+    self.listing_profile_partition = self.sold_listing_df.groupby(self.comparable_criteria).size().reset_index(name='population')
 
 
   def delete_comparable_sold_listings(self):
@@ -624,28 +601,39 @@ class NearbyComparableSoldsProcessor:
     
     return success, failed
     
-  def get_current_datetime(self):
-    """
-    Returns the current datetime in UTC or local time based on the use_utc flag.
-    """
-    if self.use_utc:
-      return datetime.now(pytz.utc).replace(tzinfo=None)
-    else:
-      return datetime.now()
+
+  def delete_checkpoints_data(self):
+    self.cache.delete(f"{self.job_id}_transform_diff_result")
 
 
 if __name__ == '__main__':
-  datastore = Datastore(host='localhost', port=9201)
-  
-  processor = NearbyComparableSoldsProcessor(datastore=datastore)
+  job_id = 'nearby_solds_xxx'
 
-  processor.extract(from_cache=True)
+  uat_datastore = Datastore(host='localhost', port=9201)
+  prod_datastore = Datastore(host='localhost', port=9202)
+  bq_datastore = BigQueryDatastore()
   
-  processor.transform()
+  processor = NearbyComparableSoldsProcessor(
+    job_id=job_id,
+    datastore=prod_datastore, 
+    bq_datastore=bq_datastore
+  )
 
-  success, failed = processor.load()
+  # during dev, we extract from PROD but update the UAT as a temporary workaround
+  processor.simulate_failure_at = 'transform'  
+  processor.run()
+
+  # during dev, continue to run against UAT
+  processor = NearbyComparableSoldsProcessor(
+    job_id=job_id,
+    datastore=uat_datastore,
+    bq_datastore=bq_datastore
+  )
+  
+  processor.run()
 
   # this can be run daily.
+  # since we have a constant stream of new sold data and new listings.
 
 """ Sample json appended to listing in ES:
   {

@@ -1,10 +1,11 @@
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Callable
 import pandas as pd
 from datetime import datetime, date, timedelta
 
 from pathlib import Path
 import logging
 
+from ..etl.base_etl import BaseETLProcessor
 from ..data.caching import FileBasedCache
 from ..data.es import Datastore
 from ..data.bq import BigQueryDatastore
@@ -18,34 +19,66 @@ import logging, sys, pytz
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-class LastMthMetricsProcessor:
-  def __init__(self, datastore: Datastore, 
+class LastMthMetricsProcessor(BaseETLProcessor):
+  def __init__(self, job_id:str, datastore: Datastore, 
                bq_datastore: BigQueryDatastore = None,
                cache_dir: Union[str, Path] = None,
                archive_dir: Union[str, Path] = None):
-    self.logger = logging.getLogger(self.__class__.__name__)
-
-    self.datastore = datastore
-    self.bq_datastore = bq_datastore
-
+    super().__init__(job_id=job_id, datastore=datastore, bq_datastore=bq_datastore, 
+                         cache_dir=cache_dir, archive_dir=archive_dir)
+    
     self.listing_df = None
     self.delta_listing_df = None
+    self.last_mth_metrics_results = None
 
-    self.cache_dir = Path(cache_dir) if cache_dir else None
-    if self.cache_dir:
-      self.cache_dir.mkdir(parents=True, exist_ok=True)
+    self.listing_selects = ['listingType', 'searchCategoryType', 
+                'guid',
+                'beds', 'bedsInt', 
+                'baths', 'bathsInt',
+                'lat', 'lng',
+                'price',
+                'addedOn',
+                'lastUpdate'
+                ]
 
-    self.cache = FileBasedCache(cache_dir=self.cache_dir)
-    self.logger.info(f'Cache dir: {self.cache.cache_dir}')
+  def setup_extra_stages(self, 
+                         add_extra_stage: Callable[[str], None], 
+                         add_extra_cleanup_stage: Callable[[str], None]) -> None:
+    add_extra_stage('end_of_mth_run')
+    add_extra_cleanup_stage('compute_last_month_metrics')
+    add_extra_cleanup_stage('remove_deleted_listings')
+    add_extra_cleanup_stage('update_mkt_trends')
+  
+  """
+  def run(self):
+    if self._was_success('all'):
+      self.logger.info(f"Job {self.job_id} has already run successfully.")
+      return
 
-    self.last_run_key = 'LastMthMetrics_last_run'
-    last_run = self.cache.get(self.last_run_key)
-    self.logger.info(f"Last run: {last_run}")
+    self._extract()
+    self._transform()
+    success, failed = self._load()
 
-    self.archiver = Archiver(archive_dir or self.cache.cache_dir / 'archives')
+    self.end_of_mth_run()
 
-    self.use_utc = True  # Set this to True to use UTC
+    # if the whole job is successful, clean up the temporary checkpoints and markers
 
+    stages = ['extract', 'transform', 'load', 'end_of_mth_run']
+    all_stages_successful = all(self._was_success(stage) for stage in stages)
+
+    if all_stages_successful:
+      # remove all possible checkpt markers
+      for stage in ['extract', 'transform', 'load', 'compute_last_month_metrics', 'remove_deleted_listings', 'update_mkt_trends', 'end_of_mth_run']:
+        self._unmark_success(stage)
+
+      # remove intermediate result cached by transform
+      self.delete_checkpoints_data()
+  
+      # finally mark it as all success
+      self._mark_success('all')
+
+      self.logger.info(f"Job {self.job_id} completed successfully.")
+  """
 
   def extract(self, from_cache=False):
     try:      
@@ -60,7 +93,7 @@ class LastMthMetricsProcessor:
         else:
           self._delta_extract_from_datastore(last_run=last_run)
 
-        self._save_to_cache()
+        self._mark_success('extract')
 
     except (ConnectionError, RequestError, TransportError) as e:
       self.logger.error(f"Elasticsearch error during extract: {e}", exc_info=True)
@@ -69,18 +102,53 @@ class LastMthMetricsProcessor:
       self.logger.error(f"Unexpected error during extract: {e}", exc_info=True)
       raise
 
+
+  def transform(self):
+    if self._was_success('transform'):
+      self.logger.info("Transform stage already completed. Loading checkpoints from cache.")
+      self.delta_listing_df = self.cache.get(f'{self.job_id}_delta_on_current_listing')
+      return
+
+    # there's no transform needed
+    if self.delta_listing_df is None:
+      self.logger.info("No transform needed. Just loading checkpoints from cache.")
+      self.delta_listing_df = self.cache.get(f'{self.job_id}_delta_on_current_listing')
+    
+    self._mark_success('transform')
+
+  
   def load(self):
+    if self._was_success('load'):
+      self.logger.info("Load already successful.")
+      return 0, []
+      
     try:
       success, failed = self.update_es_tracking_index()
+      total_attempts = success + len(failed)
+
+      if total_attempts != 0 and success / total_attempts < 0.5:
+        self.logger.error(f"Less than 50% success rate. Only {success} out of {total_attempts} documents updated.")
+        self.datastore.summarize_update_failures(failed)
+      else:
+        self._mark_success('load')
+
       return success, failed
+    
     except (ConnectionError, RequestError, TransportError) as e:
       self.logger.error(f"Elasticsearch error during load: {e}", exc_info=True)
       raise
+
     except Exception as e:
       self.logger.error(f"Unexpected error during load: {e}", exc_info=True)
       raise
 
+
   def _initialize_extract_from_datastore(self):
+    if self._was_success('extract'):
+      self.logger.info("Extract stage already completed. Loading from cache.")
+      self._load_from_cache()
+      return
+
     # get everything till now
     start_time = datetime(1970, 1, 1)     # distant past
     end_time = self.get_current_datetime()
@@ -93,17 +161,9 @@ class LastMthMetricsProcessor:
       addedOn_end_time=end_time,
       updated_end_time=end_time,
 
-      selects=['listingType', 'searchCategoryType', 
-                'guid',
-                'beds', 'bedsInt', 
-                'baths', 'bathsInt',
-                'lat', 'lng',
-                'price',
-                'addedOn',
-                'lastUpdate'
-                ],
-                prov_code='ON'                
-                )
+      selects=self.listing_selects,
+      prov_code='ON'                
+    )
     
     if not success:
       self.logger.error(f"Failed to load listings from {start_time} to {end_time}")
@@ -111,10 +171,20 @@ class LastMthMetricsProcessor:
     
     self.logger.info(f"Initially extracted {len(self.listing_df)} listings.")
     
+    self._save_to_cache()
     self.cache.set(key=self.last_run_key, value=end_time)
+
+    # checkpoint such that listing_df can be picked on on rerun 
+    self.cache.set(key=f'{self.job_id}_delta_on_current_listing', value=self.listing_df)
+
 
     
   def _delta_extract_from_datastore(self, last_run: datetime):
+    if self._was_success('extract'):
+      self.logger.info("Extract stage already completed. Loading from cache.")
+      self._load_from_cache()
+      return
+
     start_time = last_run
     end_time = self.get_current_datetime()
 
@@ -125,17 +195,9 @@ class LastMthMetricsProcessor:
       updated_start_time=start_time,
       updated_end_time=end_time,
                 
-      selects=['listingType', 'searchCategoryType', 
-                'guid',
-                'beds', 'bedsInt', 
-                'baths', 'bathsInt',
-                'lat', 'lng',
-                'price',
-                'addedOn',
-                'lastUpdate'
-                ],
-                prov_code='ON'                
-                )
+      selects=self.listing_selects,
+      prov_code='ON'                
+    )
     
     if not success:
       self.logger.error(f"Failed to load delta listings from {start_time} to {end_time}")
@@ -147,38 +209,71 @@ class LastMthMetricsProcessor:
     self.listing_df = pd.concat([listing_df, self.delta_listing_df], ignore_index=True)
 
     # if all operations are successful, update the cache
+    self._save_to_cache()
     self.cache.set(key=self.last_run_key, value=end_time)
 
-    # save the delta by itself to cache
-    # TODO: this is needed only during dev where we extract from PROD but load to UAT
-    self.cache.set(key='delta_on_current_listing', value=self.delta_listing_df)
+    # checkpoint the delta cache, such that this can be picked on on rerun 
+    self.cache.set(key=f'{self.job_id}_delta_on_current_listing', value=self.delta_listing_df)
 
 
   def end_of_mth_run(self):
+    self.logger.info("End of month run")
+    self.pre_end_of_mth_run()
+
+    if self._was_success('end_of_mth_run'):
+      self.logger.info("End of month run already successful.")
+      return
+
     today = self.get_current_datetime()
-    if today.day == 1:
-      self.compute_last_month_metrics()
+    if today.day != 1:
+      self.logger.warning("Today is not the 1st of the month. Skipping end of month run.")
+      self._mark_success('end_of_mth_run')   # 'cos nothing needs to be done, this is still marked a "success"
+      return
 
-      if hasattr(self, 'last_mth_metrics_results') and self.last_mth_metrics_results is not None:
-        if not self.archiver.archive(self.last_mth_metrics_results, 'last_mth_metrics_results'):
-          self.logger.error("Failed to archive last month's metrics results")
-          raise ValueError("Fatal error archiving last_mth_metrics_results. This must be successful to proceed.")
+    try:
+      # (1) Compute last month's metrics
+      if not self._was_success('compute_last_month_metrics'):
+        self.compute_last_month_metrics()
+        self._archive_results()
+        self._mark_success('compute_last_month_metrics')
+
+      # (2) Remove deleted listings from df and ES tracking index
+      if not self._was_success('remove_deleted_listings'):
+        success, failed = self.remove_deleted_listings()
+        total_attempts = success + len(failed)
+        if total_attempts != 0 and success / total_attempts < 0.5:
+          self.logger.error(f"Less than 50% success rate. Only {success} out of {total_attempts} documents deleted.")
+          raise ValueError("Failed to remove deleted listings. This must be successful to proceed.")      
         else:
-          self.logger.info("Successfully archived last month's metrics results")
-      else:
-        self.logger.error("Fatal error last_mth_metrics_results not found or is None. Unable to archive.")
-        raise ValueError("Fatal error archiving last_mth_metrics_results. This must be successful to proceed.")
+          self._mark_success('remove_deleted_listings')
 
-      success, failed = self.remove_deleted_listings()  # TODO: should we handle success and failure here?
-      success, failed = self.update_mkt_trends()
-    else:
-      self.logger.warning("Today is not the 1st of the month.")
+      # (3) Update market trends index
+      if not self._was_success('update_mkt_trends'):
+        if self.last_mth_metrics_results is None:
+          # load from archive
+          self.last_mth_metrics_results = self.archiver.retrieve('last_mth_metrics_results')
+          self.logger.info("Loaded last month's metrics results from archive.")
 
+        success, failed = self.update_mkt_trends()
+        total_attempts = success + len(failed)
+        if success / total_attempts < 0.5:
+          self.logger.error(f"Less than 50% success rate. Only {success} out of {total_attempts} documents updated.")
+          raise ValueError("Failed to update market trends index. This must be successful to proceed.")
+        else:
+          self._mark_success('update_mkt_trends')
 
+      self._mark_success('end_of_mth_run')
+
+    except Exception as e:
+      self.logger.error(f"Unexpected error during end of month run: {e}", exc_info=True)
+      raise
+
+    finally:
+      self.post_end_of_mth_run()
+
+      
   def update_es_tracking_index(self):
 
-    # TODO: this is needed on during dev as we store delta in cache, instead of running
-    # straight through
     if self.delta_listing_df is None:
       self.delta_listing_df = self.cache.get('delta_on_current_listing')
       if self.delta_listing_df is not None:
@@ -285,6 +380,7 @@ class LastMthMetricsProcessor:
     if len(deleted_listings_df) == 0:  # no deleted listings
       return
 
+    # (1) Remove from self.listing_df
     deleted_listing_ids = deleted_listings_df['listingId'].tolist()
     idxs_to_remove = self.listing_df.q("_id.isin(@deleted_listing_ids)").index
     self.listing_df.drop(index=idxs_to_remove, inplace=True)
@@ -293,7 +389,7 @@ class LastMthMetricsProcessor:
 
     self.logger.info(f'Removed {len_before - len_after} deleted listings from current listings')
 
-    # Remove from Elasticsearch tracking index
+    # (2) Remove from Elasticsearch tracking index
     def generate_actions():
       for _, row in deleted_listings_df.iterrows():
         yield {
@@ -425,69 +521,82 @@ class LastMthMetricsProcessor:
 
 
   def _load_from_cache(self):
-    # cache_file = self.cache_dir / f"{'full' if first_load else 'delta'}_listing_cache_df"
-    if not self.cache.cache_dir:
-      raise ValueError("Cache directory not set. Cannot load from cache.")
-    
+    super()._load_from_cache()
+
     # regard less of first_load, we will always load from the same cache
     self.listing_df = self.cache.get('on_current_listing')
     self.logger.info(f"Loaded {len(self.listing_df)} listings from cache.")
-    
-    
+
+
   def _save_to_cache(self):
-    if not self.cache.cache_dir:
-      self.logger.error("Cache directory not set. Cannot save to cache.")
-      raise ValueError("Cache directory not set. Cannot save to cache.")
-    self.cache.set(key='on_current_listing', value=self.listing_df)
-
+    super()._save_to_cache()
+    self.cache.set('on_current_listing', self.listing_df)
     self.logger.info(f"Saved {len(self.listing_df)} listings to cache.")
-    
-  def cleanup(self):
-    """
-    Clean up all cached data and reset instance variables.
-    """
-    # Clear cache entries
-    self.cache.delete(self.last_run_key)
-    self.cache.delete('on_current_listing')
-    self.cache.delete('delta_on_current_listing')
 
-    # Reset instance variables
+
+  def _archive_results(self):
+    if hasattr(self, 'last_mth_metrics_results') and self.last_mth_metrics_results is not None:
+      if not self.archiver.archive(self.last_mth_metrics_results, 'last_mth_metrics_results'):
+        self.logger.error("Failed to archive last month's metrics results")
+        raise ValueError("Fatal error archiving last_mth_metrics_results. This must be successful to proceed.")
+      else:
+        self.logger.info("Successfully archived last month's metrics results")
+    else:
+      self.logger.error("Fatal error: last_mth_metrics_results not found or is None. Unable to archive.")
+      raise ValueError("Fatal error: last_mth_metrics_results not found or is None")
+
+
+  def cleanup(self):
+    super().cleanup()
+    self.cache.delete('on_current_listing')
+    # self.cache.delete('delta_on_current_listing')
+
+    # reset instance variables
     self.listing_df = None
     self.delta_listing_df = None
+    self.last_mth_metrics_results = None
 
     self.logger.info("Cleanup completed. All cached data has been cleared and instance variables reset.")
 
 
-  def close(self):
-    self.datastore.close()
-    self.bq_datastore.close()
+  def delete_checkpoints_data(self):
+    self.cache.delete(f'{self.job_id}_delta_on_current_listing')
 
-
-  def get_current_datetime(self):
-    """
-    Returns the current datetime in UTC or local time based on the use_utc flag.
-    """
-    if self.use_utc:
-      return datetime.now(pytz.utc).replace(tzinfo=None)
-    else:
-      return datetime.now()
+  def pre_end_of_mth_run(self):
+    if getattr(self, 'simulate_failure_at', None) == 'end_of_mth_run':
+      raise Exception("Simulated failure in end_of_mth_run")
     
+  def post_end_of_mth_run(self):
+    pass
+
 # For dev
 if __name__ == "__main__":
-  datastore = Datastore()  # Assume this is properly initialized
+  job_id = 'last_mth_metrics_xxx'
 
-  metrics = LastMthMetricsProcessor(datastore=datastore)
+  uat_datastore = Datastore(host='localhost', port=9201)
+  prod_datastore = Datastore(host='localhost', port=9202)
+  bq_datastore = BigQueryDatastore()
+
+
+  processor = LastMthMetricsProcessor(
+    job_id=job_id,
+    datastore=prod_datastore,
+    bq_datastore=bq_datastore
+  )
+  # during dev, we extract from PROD but update the UAT as a temporary workaround
+  processor.simulate_failure_at = 'transform'  
+  processor.run()
   
-  metrics.extract(from_cache=False)   # run this against PROD
-  # switch SSH tunneling/IP if needed.
-  metrics.extract(from_cache=True)    # run this against UAT
-  success, failed = metrics.load()
-  
-  # Repeat the above about once a day (to ensure we capture listings before they get deleted)/
+  # during dev, continue with the UAT datastore
+  processor = LastMthMetricsProcessor(
+    job_id=job_id,
+    datastore=uat_datastore,
+    bq_datastore=bq_datastore
+  )
+  processor.run()  
 
-  # At the 1st min of a new month
-  metrics.end_of_mth_run()
-
+  # Repeat the above about once a day (to ensure we capture listings before they get deleted)
+  # end of month won't run unless the day is on the 1st of the month
 
 """ Sample last_mth_metrics_results dataframe
 +--------------+----------------+---------------+-------------------+

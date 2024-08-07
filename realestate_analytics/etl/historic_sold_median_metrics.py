@@ -8,6 +8,7 @@ from datetime import datetime, date, timedelta
 import pytz
 from tqdm.auto import tqdm
 
+from .base_etl import BaseETLProcessor
 from ..data.caching import FileBasedCache
 from ..data.es import Datastore
 from elasticsearch.helpers import scan, bulk
@@ -66,42 +67,48 @@ def compute_metrics(df, geo_level):
 
   return price_series, dom_series
 
-class SoldMedianMetricsProcessor:
-  def __init__(self, datastore: Datastore, cache_dir: Union[str, Path] = None):
-    self.logger = logging.getLogger(self.__class__.__name__)
-
-    self.datastore = datastore
-    self.cache_dir = Path(cache_dir) if cache_dir else None
-    if self.cache_dir:
-      self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-    self.cache = FileBasedCache(cache_dir=self.cache_dir)  
-    self.logger.info(f'cache dir: {self.cache.cache_dir}')
-
-    self.last_run_key = "SoldMedianMetricsProcessor_last_run"
-    last_run = self.cache.get(self.last_run_key)
-    self.logger.info(f"Last run: {last_run}")
+class SoldMedianMetricsProcessor(BaseETLProcessor):
+  def __init__(self, job_id: str, datastore: Datastore, cache_dir: Union[str, Path] = None):
+    super().__init__(job_id=job_id, datastore=datastore, cache_dir=cache_dir)
 
     self.sold_listing_df = None
     self.geo_entry_df = None
 
-    self.use_utc = True  # Set this to True to use UTC
+    self.final_price_series = None
+    self.final_dom_series = None
+
+    self.diff_price_series = None
+    self.diff_dom_series = None
+
+    self.sold_listing_selects = [
+      'mls',
+      'lastTransition', 'transitions', 
+      'listingType', 'searchCategoryType', 
+      'listingStatus',
+      'beds', 'bedsInt', 'baths', 'bathsInt',        
+      'price','soldPrice',
+      'daysOnMarket',
+      'lat', 'lng',
+      'city','neighbourhood',
+      'provState',
+      'guid'
+    ]
+
 
   def extract(self, from_cache=False):
-    self.logger.info("Extract")
-    if from_cache:
-      self._load_from_cache()
-    else:
-      self._extract_from_datastore()
-  
+    super().extract(from_cache=from_cache)
   
   def _extract_from_datastore(self):
+    if self._was_success('extract'):
+      self.logger.info("Extract stage already completed. Loading from cache.")
+      self._load_from_cache()
+      return
+    
     last_run = self.cache.get(self.last_run_key)
     self.logger.info(f"Last run: {last_run}")
 
-    try: 
-      # first run
-      if last_run is None:
+    try:       
+      if last_run is None:       # first run
 
         end_time = self.get_current_datetime()
         start_time = datetime(end_time.year - 5, end_time.month, 1)
@@ -109,19 +116,8 @@ class SoldMedianMetricsProcessor:
         success, self.sold_listing_df = self.datastore.get_sold_listings(
           start_time = start_time,
           end_time = end_time,
-          selects=[
-              'mls',
-              'lastTransition', 'transitions', 
-              'listingType', 'searchCategoryType', 
-              'listingStatus',
-              'beds', 'bedsInt', 'baths', 'bathsInt',        
-              'price','soldPrice',
-              'daysOnMarket',
-              'lat', 'lng',
-              'city','neighbourhood',
-              'provState',
-              'guid'
-              ])
+          selects=self.sold_listing_selects
+        )
         if not success:
           self.logger.error(f"Failed to retrieve sold listings from {start_time} to {end_time}")
           raise ValueError("Failed to retrieve sold listings")
@@ -140,20 +136,8 @@ class SoldMedianMetricsProcessor:
         success, delta_sold_listing_df = self.datastore.get_sold_listings(
           start_time=start_time,
           end_time=end_time,
-          selects=[
-          'mls',
-          'lastTransition', 'transitions', 
-          'lastUpdate',
-          'listingType', 'searchCategoryType',
-          'listingStatus',       
-          'beds', 'bedsInt', 'baths', 'bathsInt',
-          'price','soldPrice',      
-          'daysOnMarket',
-          'lat', 'lng',
-          'city', 'neighbourhood',
-          'provState',
-          'guid'
-          ])
+          selects=self.sold_listing_selects
+        )
         if not success:
           self.logger.error(f"Failed to retrieve delta sold listings from {start_time} to {end_time}")
           raise ValueError("Failed to retrieve delta sold listings")
@@ -173,72 +157,102 @@ class SoldMedianMetricsProcessor:
         self.logger.info(f'removed {len_sold_listing_df_before_delete - len_sold_listing_df_after_delete} sold listings older than 5 years')
 
       # if all operations are successful, update the cache
-      if self.cache.cache_dir:
-        self._save_to_cache()
-        self.cache.set(key=self.last_run_key, value=end_time)
+      self._save_to_cache()
+      self.cache.set(key=self.last_run_key, value=end_time)
+      self._mark_success('extract')
 
     except Exception as e:
       self.logger.error(f"Error occurred during extract: {e}")
       raise
 
-
-    
+ 
   def _load_from_cache(self):
-    if not self.cache.cache_dir:
-      self.logger.error("Cache directory not set. Cannot load from cache.")
-      raise ValueError("Cache directory not set. Cannot load from cache.")
+    super()._load_from_cache() 
 
     self.sold_listing_df = self.cache.get('five_years_sold_listing')
     self.geo_entry_df = self.cache.get('all_geo_entry')
 
+    if self.sold_listing_df is None or self.geo_entry_df is None:
+      self.logger.error("Missing sold_listing_df or geo_entry_df.")
+      raise ValueError("Missing sold_listing_df or geo_entry_df.")
+
     self.logger.info(f"Loaded {len(self.sold_listing_df)} sold listings and {len(self.geo_entry_df)} geo entries from cache.")
 
   def _save_to_cache(self):
-    if not self.cache.cache_dir:
-      raise ValueError("Cache directory not set. Cannot save to cache.")
+    super()._save_to_cache()
 
     self.cache.set('five_years_sold_listing', self.sold_listing_df)
     self.logger.info(f"Saved {len(self.sold_listing_df)} sold listings to cache.")
 
 
   def transform(self):
-    self.logger.info("Transform")
-    # Add geog_ids to sold listings, this is needed only for legacy data
-    self.add_geog_ids_to_sold_listings()
-    self.compute_5_year_metrics()
 
-    # optimize such that we don't update on things that didnt change from last run
-    prev_price_series = self.cache.get('five_years_price_series')
-    prev_dom_series = self.cache.get('five_years_dom_series')
-    if prev_price_series is None or prev_dom_series is None:
-      self.logger.info("No previous times series found. Keeping entire currently computed time series.")
-      self.diff_price_series = self.final_price_series
-      self.diff_dom_series = self.final_dom_series
-    else:
-      self.logger.info("Previous times series found. Computing update delta.")
-      self.diff_price_series = self._get_delta_dataframe(self.final_price_series, prev_price_series)
-      self.diff_dom_series = self._get_delta_dataframe(self.final_dom_series, prev_dom_series)
+    if self._was_success('transform'):
+      self.logger.info("Transform already successful. Loading checkpoint from cache.")
+      self.diff_price_series = self.cache.get(f"{self.job_id}_diff_price_series")
+      self.diff_dom_series = self.cache.get(f"{self.job_id}_diff_dom_series")
+      return
 
-    self.logger.info(f'Prepared to update {len(self.diff_price_series)} price time series, and {len(self.diff_dom_series)} DOM time series.')
+    try:
+      # Add geog_ids to sold listings, this is needed only for legacy data
+      self.add_geog_ids_to_sold_listings()
+      self.compute_5_year_metrics()
 
-    # Cache the current data for the next run
-    self.cache.set('five_years_price_series', self.final_price_series)
-    self.cache.set('five_years_dom_series', self.final_dom_series)
+      # optimize such that we don't update on things that didnt change from last run
+      prev_price_series = self.cache.get('five_years_price_series')
+      prev_dom_series = self.cache.get('five_years_dom_series')
+      if prev_price_series is None or prev_dom_series is None:
+        self.logger.info("No previous times series found. Keeping entire currently computed time series.")
+        self.diff_price_series = self.final_price_series
+        self.diff_dom_series = self.final_dom_series
+      else:
+        self.logger.info("Previous times series found. Computing update delta.")
+        self.diff_price_series = self._get_delta_dataframe(self.final_price_series, prev_price_series)
+        self.diff_dom_series = self._get_delta_dataframe(self.final_dom_series, prev_dom_series)
+
+      self.logger.info(f'Prepared to update {len(self.diff_price_series)} price time series, and {len(self.diff_dom_series)} DOM time series.')
+
+      # Cache the current data for the next run
+      self.cache.set('five_years_price_series', self.final_price_series)
+      self.cache.set('five_years_dom_series', self.final_dom_series)
+
+      # checkpoint the diff_*_series
+      self.diff_price_series.reset_index(drop=True, inplace=True)
+      self.diff_dom_series.reset_index(drop=True, inplace=True)
+      self.cache.set(f"{self.job_id}_diff_price_series", self.diff_price_series)
+      self.cache.set(f"{self.job_id}_diff_dom_series", self.diff_dom_series)
+
+      self._mark_success('transform')
+
+    except Exception as e:
+      self.logger.error(f"Error occurred during transform: {e}")
+      raise
+
 
   def load(self):
-    self.logger.info("Load")
+    if self._was_success('load'):
+      self.logger.info("Load already successful.")
+      return 0, []
+    
     success, failed = self.update_mkt_trends_ts_index()
+    total_attempts = success + len(failed)
+
+    if total_attempts != 0 and success / total_attempts < 0.5:
+      self.logger.error(f"Less than 50% success rate. Only {success} out of {total_attempts} documents updated.")
+
+      self.datastore.summarize_update_failures(failed)
+    else:
+      self._mark_success('load')
+
     return success, failed
   
+
   def cleanup(self):
-    if not self.cache.cache_dir:
-      self.logger.error("Cache directory not set. Cannot cleanup cache.")      
-      raise ValueError("Cache directory not set. Cannot cleanup cache.")
+    super().cleanup()
     
     cache_keys = ['five_years_sold_listing',
                   'five_years_dom_series_df',
-                  'five_years_price_series_df',
-                  self.last_run_key
+                  'five_years_price_series_df'
                   ]
     
     for key in cache_keys:
@@ -253,17 +267,6 @@ class SoldMedianMetricsProcessor:
     # updated, failures = self.remove_metrics_from_mkt_trends_ts()
     # self.logger.info(f"Removed metrics from {updated} doc in mkt_trends_ts index with {len(failures)} failures.")
       
-
-  def reset(self):
-    self.cleanup()
-
-
-  def full_refresh(self):
-    self.cleanup()
-    self.extract(from_cache=False)
-    self.transform()
-    self.load()
-
 
   def compute_5_year_metrics(self):
     # Construct date range for the past 60 full months plus the current month to date.
@@ -462,6 +465,14 @@ class SoldMedianMetricsProcessor:
 
   
   def delete_all_mkt_trends_ts(self):
+    """
+    Deletes all documents from the market trends time series index 
+    This probably shouldnt be done often, since it also removes
+     - monthly median price
+     - monthly new listing
+     - absorption rate
+     - etc.
+    """
     query = {
       "query": {
         "match_all": {}
@@ -584,36 +595,37 @@ class SoldMedianMetricsProcessor:
     return delta_df
 
   
-  def get_current_datetime(self):
-    """
-    Returns the current datetime in UTC or local time based on the use_utc flag.
-    
-    1. can be adjusted for timezone based on self.use_utc flag.
-    2. This method can also be overridden for testing purposes.
-    """
-    # return datetime.now() - timedelta(days=290) # simulate test
-    if self.use_utc:
-      return datetime.now(pytz.utc).replace(tzinfo=None)
-    else:
-      return datetime.now()
+
+  def delete_checkpoints_data(self):
+    self.cache.delete(f"{self.job_id}_diff_price_series")
+    self.cache.delete(f"{self.job_id}_diff_dom_series")
 
 
-  def close(self):
-    self.datastore.close()
-
-    
 if __name__ == '__main__':
-  datastore = Datastore(host='localhost', port=9201)
+  job_id = 'hist_median_metrics_xxx'
+  uat_datastore = Datastore(host='localhost', port=9201)
+  prod_datastore = Datastore(host='localhost', port=9202)
 
-  processor = SoldMedianMetricsProcessor(datastore)
+  processor = SoldMedianMetricsProcessor(
+    job_id=job_id,
+    datastore=prod_datastore
+  )
 
-  processor.extract(from_cache=False)  # run on PROD to get real data
+  # during dev, we extract from PROD but update the UAT as a temporary workaround
+  processor.simulate_failure_at = 'transform'
+  try:
+    processor.run()
+  except Exception as e:
+    print(e)
 
-  processor.extract(from_cache=True)  # run on UAT during dev.
-  processor.transform()
-  success, failed = processor.load()    # load into UAT during dev
+  # during dev, continue with the UAT datastore
+  processor = SoldMedianMetricsProcessor(
+    job_id=job_id,
+    datastore=uat_datastore
+  )
+  processor.run()
 
-  # repeat the above steps every few days, this will allow a "running" current month calculation.
+  # repeat the above steps every few days or weekly, this will allow a partial current month calculation.
 
 
 """ Sample doc from the mkt_trends_ts index: 

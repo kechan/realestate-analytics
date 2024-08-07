@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import pytz, logging
 
+from .base_etl import BaseETLProcessor
 from ..data.caching import FileBasedCache
 from ..data.es import Datastore
 from ..data.archive import Archiver
@@ -13,59 +14,70 @@ from elasticsearch.helpers import scan, bulk
 import realestate_core.common.class_extensions
 from realestate_core.common.class_extensions import *
 
-class AbsorptionRateProcessor:
-  def __init__(self, datastore: Datastore, 
-               cache_dir: Union[str, Path] = None, 
-               archive_dir: Union[str, Path] = None):
-    self.logger = logging.getLogger(self.__class__.__name__)
-    
-    self.datastore = datastore
 
-    self.cache_dir = Path(cache_dir) if cache_dir else None
-    if self.cache_dir:
-      self.cache_dir.mkdir(parents=True, exist_ok=True)
-    
-    self.cache = FileBasedCache(cache_dir=self.cache_dir)
-    self.logger.info(f'Cache dir: {self.cache.cache_dir}')
-    
-    self.last_run_key = 'AbsorptionRateProcessor_last_run'
-    last_run = self.cache.get(self.last_run_key)
-    self.logger.info(f"Last run: {last_run}")
-    
+class AbsorptionRateProcessor(BaseETLProcessor):
+  def __init__(self, job_id: str, datastore: Datastore, 
+                cache_dir: Union[str, Path] = None, 
+                archive_dir: Union[str, Path] = None):
+    super().__init__(job_id=job_id, datastore=datastore, cache_dir=cache_dir, archive_dir=archive_dir)
+
+    self.logger.info("Last run is expectedly None since we don't do any extract from ES for this ETL job.")
     self.sold_listing_df = None
     self.listing_df = None
     self.absorption_rates = None
 
-    self.archiver = Archiver(archive_dir or self.cache.cache_dir / 'archives')
-
-    # Flag to determine whether to use UTC or local time
-    self.use_utc = True  # Set this to True to use UTC
-
   def extract(self, from_cache=True):
-    self.logger.info("Extract")
-    if from_cache:
-      self._load_from_cache()
-    else:
-      self.logger.error("Direct extraction from datastore not implemented. Use from_cache=True.")
-      self.logger.error("Cached data from NearbyComparableSoldsProcessor should be used.")
-      raise NotImplementedError("Direct extraction from datastore not implemented. Cached data from NearbyComparableSoldsProcessor should be used.")
-    
+    # ignore the from_cache flag, always load from cache
+    # this is to conform to the signature of extract(...) that the parent class expects
+
+    self._load_from_cache()
+    self._mark_success('extract')
+    # else:
+    #   self.logger.error("Direct extraction from datastore not implemented. Use from_cache=True.")
+    #   self.logger.error("Cached data from NearbyComparableSoldsProcessor should be used.")
+    #   raise NotImplementedError("Direct extraction from datastore not implemented. Cached data from NearbyComparableSoldsProcessor should be used.")
+     
+
   def transform(self):
-    self.logger.info("Transform")
-    self._calculate_absorption_rates()
+    if self._was_success('transform'):
+      self.logger.info("Transform already completed successfully. Loading from archive")
+      self.absorption_rates = self.archiver.retrieve('absorption_rates')
+      return
 
-    if hasattr(self, 'absorption_rates') and self.absorption_rates is not None:
-      if not self.archiver.archive(self.absorption_rates, 'absorption_rates'):
-        self.logger.error("Failed to archive absorption rates")
-        raise ValueError("Fatal error archiving absorption_rates. This must be successful to proceed.")
+    try:
+      self._calculate_absorption_rates()
+
+      if hasattr(self, 'absorption_rates') and self.absorption_rates is not None:
+        if not self.archiver.archive(self.absorption_rates, 'absorption_rates'):
+          self.logger.error("Failed to archive absorption rates")
+          raise ValueError("Fatal error archiving absorption_rates. This must be successful to proceed.")
+        else:
+          self.logger.info("Successfully archived absorption rates.")
+          self._mark_success('transform')
       else:
-        self.logger.info("Successfully archived absorption rates.")
-    else:
-      self.logger.error("absorption_rates not found or is None. Unable to archive.")
+        self.logger.error("absorption_rates not found or is None. Unable to archive.")
+        raise ValueError("absorption_rates not found or is None. Unable to archive.")
+      
+    except Exception as e:
+      self.logger.error(f"Unexpected error in transform: {e}")
+      raise
 
+   
   def load(self):
-    self.logger.info("Load")
+    if self._was_success('load'):
+      self.logger.info("Load already successful.")
+      return
+
     success, failed = self.update_mkt_trends_ts_index()
+    total_attempts = success + len(failed)
+
+    if total_attempts != 0 and success / total_attempts < 0.5:
+      self.logger.error(f"Less than 50% success rate. Only {success} out of {total_attempts} documents updated.")
+
+      self.datastore.summarize_update_failures(failed)
+    else:
+      self._mark_success('load')
+
     return success, failed
 
   
@@ -134,10 +146,7 @@ class AbsorptionRateProcessor:
 
 
   def _load_from_cache(self):
-    if not self.cache.cache_dir:
-      self.logger.error("Cache directory not set. Cannot load from cache.")
-      raise ValueError("Cache directory not set. Cannot load from cache.")
-    
+    super()._load_from_cache()
     self.sold_listing_df = self.cache.get('one_year_sold_listing')
     self.listing_df = self.cache.get('on_listing')
     
@@ -275,28 +284,22 @@ class AbsorptionRateProcessor:
     return success, failed
 
   
-  def get_current_datetime(self):
-    """
-    Returns the current datetime in UTC or local time based on the use_utc flag.
-    """
-    if self.use_utc:
-      return datetime.now(pytz.utc).replace(tzinfo=None)
-    else:
-      return datetime.now()
 
-  def close(self):
-    self.datastore.close()
+
+  def delete_checkpoints_data(self):
+    pass
 
 # for dev
 if __name__ == '__main__':
-  datastore = Datastore()
+  job_id = 'absorption_rate_xxx'
+  uat_datastore = Datastore(host='localhost', port=9201)
+  prod_datastore = Datastore(host='localhost', port=9202)
 
-  processor = AbsorptionRateProcessor(datastore=datastore)
-  processor.extract()
-
-  processor.transform()
-
-  success, failed = processor.load()
+  processor = AbsorptionRateProcessor(
+    job_id=job_id,
+    datastore=uat_datastore
+  )
+  processor.run()
 
   # datastore.search(index=datastore.mkt_trends_ts_index_name, _id='g30_dpz89rm7_DETACHED')[0]
 

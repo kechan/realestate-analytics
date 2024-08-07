@@ -463,7 +463,7 @@ class Datastore:
     - A DataFrame representing the current active listings.
     """
 
-    self.logger.info(f"Fetching current active listings for province: {prov_code}")
+    self.logger.info(f'Fetching current {"active" if active else "non active"} listings for province: {prov_code}')
     start_process_time = time.time()
 
     try:
@@ -547,7 +547,7 @@ class Datastore:
       page = self.es.search(index=self.listing_index_name, body=query_body, scroll='5m', size=500)
       scroll_id = page['_scroll_id']
       total_hits = page['hits']['total']['value']
-      self.logger.info(f"Total hits for current active listings: {total_hits}")
+      self.logger.info(f"Total hits for current {'active' if active else 'non active'} listings: {total_hits}")
       hits = page['hits']['hits']
 
       while hits:
@@ -560,7 +560,7 @@ class Datastore:
         scroll_id = page['_scroll_id']
         hits = page['hits']['hits']
 
-      self.logger.info(f"Fetched {len(sources)} current active listings")
+      self.logger.info(f"Fetched {len(sources)} current {'active' if active else 'non active'} listings")
 
     except ConnectionError as e:
       self.logger.error(f"Connection error while fetching current active listings: {str(e)}")
@@ -901,6 +901,9 @@ class Datastore:
       reason = error.get('type', 'unknown')
       reasons[reason] += 1
 
-    self.logger.info("Update failure reasons summary and counts")
+    self.logger.info("ES failures summary:")
+    self.logger.info("\tSummary,\t\tCount")
+    self.logger.info("\t-----------------")
     for reason, count in reasons.items():
       self.logger.info(f"\t\"{reason}\", {count}")
+    self.logger.info("\t-----------------")
