@@ -16,6 +16,7 @@ from realestate_core.common.class_extensions import *
 
 
 class AbsorptionRateProcessor(BaseETLProcessor):
+  # https://www.cgprealestateconsulting.com/post/calculating-absorption-rate-real-estate
   def __init__(self, job_id: str, datastore: Datastore, 
                 cache_dir: Union[str, Path] = None, 
                 archive_dir: Union[str, Path] = None):

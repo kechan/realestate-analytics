@@ -18,19 +18,21 @@ from realestate_core.common.class_extensions import *
 from realestate_core.common.utils import load_from_pickle, save_to_pickle, join_df
 
 # Function to compute metrics for a given geog level
-def compute_metrics(df, geo_level):
+def compute_metrics(df, date_mask, geo_level):
   # Group by geog_id, property type, and month, then calculate metrics
-  grouped = df.groupby([f'geog_id_{geo_level}', 'propertyType', pd.Grouper(key='lastTransition', freq='M')])
+  grouped = df[date_mask].groupby([f'geog_id_{geo_level}', 'propertyType', pd.Grouper(key='lastTransition', freq='M')])
   metrics = grouped.agg({
       'soldPrice': 'median',
-      'daysOnMarket': 'median'
+      'daysOnMarket': 'median',
+      'sold_over_ask': lambda x: (x.sum() / len(x)) * 100  # Percentage over ask
   }).reset_index()
 
   # Calculate metrics for all property types combined
-  grouped_all = df.groupby([f'geog_id_{geo_level}', pd.Grouper(key='lastTransition', freq='M')])
+  grouped_all = df[date_mask].groupby([f'geog_id_{geo_level}', pd.Grouper(key='lastTransition', freq='M')])
   metrics_all = grouped_all.agg({
     'soldPrice': 'median',
-    'daysOnMarket': 'median'
+    'daysOnMarket': 'median',
+    'sold_over_ask': lambda x: (x.sum() / len(x)) * 100  # Percentage over ask
   }).reset_index()
   # Add a 'propertyType' column with None value for the combined metrics
   metrics_all['propertyType'] = None
@@ -45,27 +47,43 @@ def compute_metrics(df, geo_level):
   dom_series = metrics_combined.pivot(index=[f'geog_id_{geo_level}', 'propertyType'], 
                               columns='lastTransition', 
                               values='daysOnMarket')
+  over_ask_series = metrics_combined.pivot(index=[f'geog_id_{geo_level}', 'propertyType'], 
+                                columns='lastTransition', 
+                                values='sold_over_ask')
   
   # Rename columns to YYYY-MM format
-  price_series.columns = price_series.columns.strftime('%Y-%m')
-  dom_series.columns = dom_series.columns.strftime('%Y-%m')
+  for series in [price_series, dom_series, over_ask_series]:
+    series.columns = series.columns.strftime('%Y-%m')
 
-  # Remove the 'lastTransition' label from the column index
-  price_series.columns.name = None
-  dom_series.columns.name = None
+    # Remove the 'lastTransition' label from the column index
+    series.columns.name = None
+
+    # Reset index to make geog_id and propertyType regular columns
+    # Rename the geog_id_<N> uniformly to geog_id
+    series.reset_index(inplace=True)
+    series.rename(columns={f'geog_id_{geo_level}': 'geog_id'}, inplace=True)
+
+    # Replace NaN with None in the propertyType 
+    series['propertyType'] = series['propertyType'].where(series['propertyType'].notna(), None)
+
+  # price_series.columns = price_series.columns.strftime('%Y-%m')
+  # dom_series.columns = dom_series.columns.strftime('%Y-%m')
+
+  # # Remove the 'lastTransition' label from the column index
+  # price_series.columns.name = None
+  # dom_series.columns.name = None
   
-  # Reset index to make geog_id and propertyType regular columns
-  # Rename the geog_id_<N> uniformly to geog_id
-  price_series = price_series.reset_index().rename(columns={f'geog_id_{geo_level}': 'geog_id'})
-  dom_series = dom_series.reset_index().rename(columns={f'geog_id_{geo_level}': 'geog_id'})
+  # # Reset index to make geog_id and propertyType regular columns
+  # # Rename the geog_id_<N> uniformly to geog_id
+  # price_series = price_series.reset_index().rename(columns={f'geog_id_{geo_level}': 'geog_id'})
+  # dom_series = dom_series.reset_index().rename(columns={f'geog_id_{geo_level}': 'geog_id'})
 
-  # Replace NaN with None in the propertyType 
-  # price_series['propertyType'] = price_series['propertyType'].fillna(None)
-  # dom_series['propertyType'] = dom_series['propertyType'].fillna(None)
-  price_series['propertyType'] = price_series['propertyType'].where(price_series['propertyType'].notna(), None)
-  dom_series['propertyType'] = dom_series['propertyType'].where(dom_series['propertyType'].notna(), None)
+  # # Replace NaN with None in the propertyType 
+  # price_series['propertyType'] = price_series['propertyType'].where(price_series['propertyType'].notna(), None)
+  # dom_series['propertyType'] = dom_series['propertyType'].where(dom_series['propertyType'].notna(), None)
 
-  return price_series, dom_series
+  return price_series, dom_series, over_ask_series
+
 
 class SoldMedianMetricsProcessor(BaseETLProcessor):
   def __init__(self, job_id: str, datastore: Datastore, cache_dir: Union[str, Path] = None):
@@ -76,9 +94,11 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
     self.final_price_series = None
     self.final_dom_series = None
+    self.final_over_ask_series = None
 
     self.diff_price_series = None
     self.diff_dom_series = None
+    self.diff_over_ask_series = None
 
     self.sold_listing_selects = [
       'mls',
@@ -181,7 +201,16 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
   def _save_to_cache(self):
     super()._save_to_cache()
 
-    self.cache.set('five_years_sold_listing', self.sold_listing_df)
+    # Remove 'sold_over_ask' column if it exists before saving to cache
+    # this col. is a pre-computed col. in 
+    if 'sold_over_ask' in self.sold_listing_df.columns:
+      cache_df = self.sold_listing_df.drop(columns=['sold_over_ask'])
+    else:
+      cache_df = self.sold_listing_df
+    
+    self.cache.set('five_years_sold_listing', cache_df)
+
+    # self.cache.set('five_years_sold_listing', self.sold_listing_df)
     self.logger.info(f"Saved {len(self.sold_listing_df)} sold listings to cache.")
 
 
@@ -191,6 +220,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       self.logger.info("Transform already successful. Loading checkpoint from cache.")
       self.diff_price_series = self.cache.get(f"{self.job_id}_diff_price_series")
       self.diff_dom_series = self.cache.get(f"{self.job_id}_diff_dom_series")
+      self.diff_over_ask_series = self.cache.get(f"{self.job_id}_diff_over_ask_series")
       return
 
     try:
@@ -201,26 +231,36 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       # optimize such that we don't update on things that didnt change from last run
       prev_price_series = self.cache.get('five_years_price_series')
       prev_dom_series = self.cache.get('five_years_dom_series')
-      if prev_price_series is None or prev_dom_series is None:
+      prev_over_ask_series = self.cache.get('five_years_over_ask_series')
+
+      if prev_price_series is None or prev_dom_series is None or prev_over_ask_series is None:
         self.logger.info("No previous times series found. Keeping entire currently computed time series.")
         self.diff_price_series = self.final_price_series
         self.diff_dom_series = self.final_dom_series
+        self.diff_over_ask_series = self.final_over_ask_series
       else:
         self.logger.info("Previous times series found. Computing update delta.")
         self.diff_price_series = self._get_delta_dataframe(self.final_price_series, prev_price_series)
         self.diff_dom_series = self._get_delta_dataframe(self.final_dom_series, prev_dom_series)
+        self.diff_over_ask_series = self._get_delta_dataframe(self.final_over_ask_series, prev_over_ask_series)
 
-      self.logger.info(f'Prepared to update {len(self.diff_price_series)} price time series, and {len(self.diff_dom_series)} DOM time series.')
+      self.logger.info(f'Prepared to update {len(self.diff_price_series)} price time series, '
+                         f'{len(self.diff_dom_series)} DOM time series, and '
+                         f'{len(self.diff_over_ask_series)} over-ask percentage time series.')
 
       # Cache the current data for the next run
       self.cache.set('five_years_price_series', self.final_price_series)
       self.cache.set('five_years_dom_series', self.final_dom_series)
+      self.cache.set('five_years_over_ask_series', self.final_over_ask_series)
 
       # checkpoint the diff_*_series
       self.diff_price_series.reset_index(drop=True, inplace=True)
       self.diff_dom_series.reset_index(drop=True, inplace=True)
+      self.diff_over_ask_series.reset_index(drop=True, inplace=True)
+
       self.cache.set(f"{self.job_id}_diff_price_series", self.diff_price_series)
       self.cache.set(f"{self.job_id}_diff_dom_series", self.diff_dom_series)
+      self.cache.set(f"{self.job_id}_diff_over_ask_series", self.diff_over_ask_series)
 
       self._mark_success('transform')
 
@@ -278,31 +318,50 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
     self.sold_listing_df.lastTransition = pd.to_datetime(self.sold_listing_df.lastTransition)
 
-    # filter sold listings for the required date range
-    df = self.sold_listing_df[
-      (self.sold_listing_df['lastTransition'].dt.date >= start_date) &
-      (self.sold_listing_df['lastTransition'].dt.date < current_date)
-    ]
+    # Add 'sold_over_ask' (a boolean column)
+    self.sold_listing_df['sold_over_ask'] = self.sold_listing_df['soldPrice'] > self.sold_listing_df['price']
 
-    if df.empty:
+    # Create a boolean mask for the date range filter
+    date_mask = (
+        (self.sold_listing_df['lastTransition'].dt.date >= start_date) &
+        (self.sold_listing_df['lastTransition'].dt.date < current_date)
+    )
+
+    if not date_mask.any():
       self.logger.error("No data available for the specified date range")
       raise ValueError("No data available for the specified date range")
+
+    # filter sold listings for the required date range
+    # df = self.sold_listing_df[
+    #   (self.sold_listing_df['lastTransition'].dt.date >= start_date) &
+    #   (self.sold_listing_df['lastTransition'].dt.date < current_date)
+    # ]
+
+    # if df.empty:
+    #   self.logger.error("No data available for the specified date range")
+    #   raise ValueError("No data available for the specified date range")
 
     # Compute metrics for each geographic level and concat into a single dataframe
     levels = [10, 20, 30, 40]
     all_price_series = []
     all_dom_series = []
+    all_over_ask_series = []
 
     for level in levels:
-      price_series, dom_series = compute_metrics(df, level)
+      price_series, dom_series, over_ask_series = compute_metrics(self.sold_listing_df, date_mask, level)
+
       price_series['geo_level'] = level
       dom_series['geo_level'] = level
+      over_ask_series['geo_level'] = level
+
       all_price_series.append(price_series)
       all_dom_series.append(dom_series)
+      all_over_ask_series.append(over_ask_series)
 
     # Combine results from all levels
     self.final_price_series = pd.concat(all_price_series, ignore_index=True)
     self.final_dom_series = pd.concat(all_dom_series, ignore_index=True)
+    self.final_over_ask_series = pd.concat(all_over_ask_series, ignore_index=True)
 
 
   def add_geog_ids_to_sold_listings(self):    
@@ -347,7 +406,8 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
   
   def update_mkt_trends_ts_index(self):
     """
-    Updates the market trends time series index in Elasticsearch with new median price and days on market (DOM) metrics.
+    Updates the market trends time series index in ES with new median price,
+    days on market (DOM), and over-ask percentage metrics.
 
     Returns:
         tuple: A tuple containing the number of successfully updated documents and a list of any failures.    
@@ -433,6 +493,57 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
               ctx._source.metrics = new HashMap();
             }
             ctx._source.metrics.median_dom = params.new_metrics.median_dom;
+            ctx._source.geog_id = params.geog_id;
+            ctx._source.propertyType = params.propertyType;
+            ctx._source.geo_level = params.geo_level;
+            ctx._source.last_updated = params.last_updated;
+            """,
+            "params": {
+              "new_metrics": new_metrics,
+              "geog_id": row['geog_id'],
+              "propertyType": property_type_id,
+              "geo_level": int(row['geo_level']),
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          },
+          "upsert": {
+            "geog_id": row['geog_id'],
+            "propertyType": property_type_id,
+            "geo_level": int(row['geo_level']),
+            "metrics": new_metrics,
+            "last_updated": self.get_current_datetime().isoformat()
+          }
+        }
+
+      # Process over-ask % series
+      for _, row in self.diff_over_ask_series.iterrows():
+        new_metrics = {
+          "over_ask_percentage": []
+        }
+
+        for col in self.diff_over_ask_series.columns:
+          if col.startswith('20'):
+            date = col
+            value = row[col]
+            if pd.notna(value):
+              new_metrics["over_ask_percentage"].append({
+                "date": date,
+                "value": round(float(value), 2)
+              })
+
+        property_type_id = "ALL" if row['propertyType'] is None else row['propertyType']
+        composite_id = f"{row['geog_id']}_{property_type_id}"
+
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_id": composite_id,
+          "script": {
+            "source": """
+            if (ctx._source.metrics == null) {
+              ctx._source.metrics = new HashMap();
+            }
+            ctx._source.metrics.over_ask_percentage = params.new_metrics.over_ask_percentage;
             ctx._source.geog_id = params.geog_id;
             ctx._source.propertyType = params.propertyType;
             ctx._source.geo_level = params.geo_level;
@@ -599,6 +710,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
   def delete_checkpoints_data(self):
     self.cache.delete(f"{self.job_id}_diff_price_series")
     self.cache.delete(f"{self.job_id}_diff_dom_series")
+    self.cache.delete(f"{self.job_id}_diff_over_ask_series")
 
 
 if __name__ == '__main__':
