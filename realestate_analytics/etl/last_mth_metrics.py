@@ -168,6 +168,9 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     if not success:
       self.logger.error(f"Failed to load listings from {start_time} to {end_time}")
       raise ValueError("Failed to load listings from datastore")
+
+    # Add is_deleted column, for tracking soft-deleted listings
+    self.listing_df['is_deleted'] = False
     
     self.logger.info(f"Initially extracted {len(self.listing_df)} listings.")
     
@@ -206,6 +209,8 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     self.logger.info(f'Loaded {len(self.delta_listing_df)} listings from {start_time} to {end_time}')
 
     listing_df = self.cache.get('on_current_listing')
+    self.delta_listing_df['is_deleted'] = False  # New delta listings are not deleted
+
     self.listing_df = pd.concat([listing_df, self.delta_listing_df], ignore_index=True)
 
     # if all operations are successful, update the cache
@@ -325,11 +330,16 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     # Deduplicate listings based on _id, keeping the last (most current) entry
     self.listing_df = self.listing_df.sort_values('lastUpdate').drop_duplicates('_id', keep='last')
 
+    # Filter out soft-deleted listings
+    active_listings = self.listing_df[~self.listing_df['is_deleted']]
+    self.logger.info(f'# of listing before filtering out soft-deleted: {len(self.listing_df)}')
+    self.logger.info(f'# of listing after filtering out soft-deleted: {len(active_listings)}')
+
     # Convert 'addedOn' to datetime if it's not already
-    self.listing_df.addedOn = pd.to_datetime(self.listing_df.addedOn)
+    active_listings.addedOn = pd.to_datetime(active_listings.addedOn)
 
     # Expand guid column
-    expanded_df = self.listing_df.assign(geog_id=self.listing_df['guid'].str.split(',')).explode('geog_id')
+    expanded_df = active_listings.assign(geog_id=self.listing_df['guid'].str.split(',')).explode('geog_id')
 
     # Function to calculate metrics for both specific property types and 'ALL'
     def calculate_metrics(group):
@@ -372,7 +382,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     last_month_start = last_month_start.date()
     last_month_end = last_month_end.date()
 
-    len_before = len(self.listing_df)
+    # len_before = len(self.listing_df)
     self.logger.info(f'Remove deleted listings from {last_month_start} to {last_month_end}')
     deleted_listings_df = self.bq_datastore.get_deleted_listings(start_time=last_month_start, end_time=last_month_end)
     self.logger.info(f'Found {len(deleted_listings_df)} deleted listings')
@@ -380,14 +390,19 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     if len(deleted_listings_df) == 0:  # no deleted listings
       return
 
-    # (1) Remove from self.listing_df
-    deleted_listing_ids = deleted_listings_df['listingId'].tolist()
-    idxs_to_remove = self.listing_df.q("_id.isin(@deleted_listing_ids)").index
-    self.listing_df.drop(index=idxs_to_remove, inplace=True)
-    self.listing_df.reset_index(drop=True, inplace=True)
-    len_after = len(self.listing_df)
+    # (1) Soft delete from self.listing_df
+    deleted_listing_ids = set(deleted_listings_df['listingId'].tolist())
+    existing_listing_ids = set(self.listing_df['_id'])
+    soft_deleted_ids = deleted_listing_ids.intersection(existing_listing_ids)
+    # idxs_to_remove = self.listing_df.q("_id.isin(@deleted_listing_ids)").index
+    # self.listing_df.drop(index=idxs_to_remove, inplace=True)
+    # self.listing_df.reset_index(drop=True, inplace=True)
 
-    self.logger.info(f'Removed {len_before - len_after} deleted listings from current listings')
+    # len_after = len(self.listing_df)
+    # self.logger.info(f'Removed {len_before - len_after} deleted listings from current listings')
+
+    self.listing_df.loc[self.listing_df['_id'].isin(soft_deleted_ids), 'is_deleted'] = True
+    self.logger.info(f'Soft deleted {len(soft_deleted_ids)} listings in self.listing_df')
 
     # (2) Remove from Elasticsearch tracking index
     def generate_actions():
@@ -482,7 +497,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
   def remove_last_mth_metrics(self):
     """
     Remove 'last_mth_median_asking_price' and 'last_mth_new_listings' from all items
-    in the mkt_trends_ts index on Elasticsearch.
+    in the mkt_trends_ts index on ES.
     """
     def generate_actions():
       query = {
