@@ -26,8 +26,7 @@ class TestAbsorptionRate(unittest.TestCase):
     cls.datastore = Datastore(host=es_host, port=es_port)
 
     cls.processor = AbsorptionRateProcessor(
-      datastore=cls.datastore,
-      cache_dir=cache_dir
+      datastore=cls.datastore
     )
 
     # Load cached data

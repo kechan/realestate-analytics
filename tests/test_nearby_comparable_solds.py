@@ -28,12 +28,6 @@ class TestComparableSolds(unittest.TestCase):
 
       cls.cache = FileBasedCache(cache_dir=cache_dir)
       cls.datastore = Datastore(host=es_host, port=es_port)
-      # cls.bq_datastore = BigQueryDatastore()
-      # cls.processor = NearbyComparableSoldsProcessor(
-      #     datastore = cls.datastore, 
-      #     bq_datastore = cls.bq_datastore,
-      #     cache_dir=cache_dir
-      # )
       
       # Load cached data
       cls.listing_df = cls.cache.get('on_listing')

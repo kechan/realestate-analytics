@@ -20,12 +20,8 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 class LastMthMetricsProcessor(BaseETLProcessor):
-  def __init__(self, job_id:str, datastore: Datastore, 
-               bq_datastore: BigQueryDatastore = None,
-               cache_dir: Union[str, Path] = None,
-               archive_dir: Union[str, Path] = None):
-    super().__init__(job_id=job_id, datastore=datastore, bq_datastore=bq_datastore, 
-                         cache_dir=cache_dir, archive_dir=archive_dir)
+  def __init__(self, job_id: str, datastore: Datastore, bq_datastore: BigQueryDatastore = None):
+    super().__init__(job_id=job_id, datastore=datastore, bq_datastore=bq_datastore)
     
     self.listing_df = None
     self.delta_listing_df = None

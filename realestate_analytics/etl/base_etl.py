@@ -2,8 +2,8 @@ from typing import Dict, List, Union
 from abc import ABC, abstractmethod
 from pathlib import Path
 from datetime import datetime, timedelta
-import pytz
-
+import time, pytz, os
+from dotenv import load_dotenv, find_dotenv
 
 from ..data.caching import FileBasedCache
 from ..data.es import Datastore
@@ -15,9 +15,8 @@ import logging
 class BaseETLProcessor(ABC):
   def __init__(self, job_id: str, 
                datastore: Datastore,                
-               bq_datastore: BigQueryDatastore = None,
-               cache_dir: Union[str, Path] = None,
-               archive_dir: Union[str, Path] = None):
+               bq_datastore: BigQueryDatastore = None
+               ):
     self.logger = logging.getLogger(self.__class__.__name__)
 
     self.job_id = job_id
@@ -26,28 +25,60 @@ class BaseETLProcessor(ABC):
     if not self.check_dependencies():
       raise Exception("Failed to establish connection to required datastores")
 
-    self.cache_dir = Path(cache_dir) if cache_dir else None
-    if self.cache_dir:
-      self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-    self.cache = FileBasedCache(cache_dir=self.cache_dir)
-    self.logger.info(f'cache dir: {self.cache.cache_dir}')
-
     self.last_run_key = f"{self.__class__.__name__}_last_run"
-    last_run = self.cache.get(self.last_run_key)
-    self.logger.info(f"Last run: {last_run}")
-    
-    self.archiver = Archiver(archive_dir or self.cache.cache_dir / 'archives')
 
+    self.cache_dir = None
+    self.archive_dir = None
+    self.cache = None
+    self.archiver = None
+    
     self.stages = ['extract', 'transform', 'load']
     self.extra_stages = []
     self.extra_cleanup_stages = []
     
     self.use_utc = True
 
-  def load_config(self, config_path: Union[str, Path]):
-    # Implement configuration loading logic
-    pass
+    # run load_config to get self.cache_dir and self.archive_dir
+    self.load_config()
+
+    if self.cache_dir:
+      self.cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    if self.archive_dir:
+      self.archive_dir.mkdir(parents=True, exist_ok=True)
+
+    self.cache = FileBasedCache(cache_dir=self.cache_dir)
+    self.logger.info(f'cache dir: {self.cache.cache_dir}')
+
+    self.archiver = Archiver(self.archive_dir or self.cache.cache_dir / 'archives')
+
+    last_run = self.cache.get(self.last_run_key)
+    self.logger.info(f"Last run: {last_run}")
+
+
+  def load_config(self):
+    """
+    Loads the configuration from env variables in .env file.
+
+    This method initializes the cache and archive dirs based on the env variables 'ANALYTICS_CACHE_DIR'
+    and 'ANALYTICS_ARCHIVE_DIR', respectively. If these environment variables are set, their values are converted to
+    Path objects and assigned to the instance variables `self.cache_dir` and `self.archive_dir`. If the environment
+    variables are not set, the instance variables are set to None.
+
+    Env vars:
+        ANALYTICS_CACHE_DIR (str): The path to the cache directory. If not set, `self.cache_dir` will be None.
+        ANALYTICS_ARCHIVE_DIR (str): The path to the archive directory. If not set, `self.archive_dir` will be None.
+    """
+    _ = load_dotenv(find_dotenv())
+
+    self.cache_dir = os.getenv('ANALYTICS_CACHE_DIR', None)
+    if self.cache_dir:
+      self.cache_dir = Path(self.cache_dir)
+
+    self.archive_dir = os.getenv('ANALYTICS_ARCHIVE_DIR', None)
+    if self.archive_dir:
+      self.archive_dir = Path(self.archive_dir)
+
 
   def run(self):
     if self._was_success('all'):
@@ -65,16 +96,33 @@ class BaseETLProcessor(ABC):
     def add_extra_cleanup_stage(stage_name: str):
       self.extra_cleanup_stages.append(stage_name)
 
+    def _execute_stage(stage, is_standard):
+      self.logger.info(f"[MONITOR] Starting {stage.capitalize()} stage")
+      start_time = time.time()
+      
+      if is_standard:
+        method = getattr(self, f'_{stage}')
+      else:
+        method = getattr(self, stage)
+      
+      method()
+      
+      end_time = time.time()
+      duration = end_time - start_time
+      self.logger.info(f"[MONITOR] {stage.capitalize()} stage completed in {duration:.2f} seconds")
+      self.logger.info(f"[MONITOR] Completed {stage.capitalize()} stage")
+
+
     # Allow subclasses to define extra stages before execution
     self.setup_extra_stages(add_extra_stage, add_extra_cleanup_stage)
 
+    # run standard extract, transform, and load
     for stage in self.stages:
-      method = getattr(self, f'_{stage}')
-      method()
+      _execute_stage(stage, is_standard=True)
 
+    # run any extra stages, usually this activates only upon certain condition, e.g. 1st day of the month
     for stage in self.extra_stages:
-      method = getattr(self, stage)
-      method()
+      _execute_stage(stage, is_standard=False)
 
     all_stages = self.stages + self.extra_stages
     if all(self._was_success(stage) for stage in all_stages):
@@ -99,7 +147,7 @@ class BaseETLProcessor(ABC):
     #   self.logger.info(f"Job {self.job_id} completed successfully.")
 
   def setup_extra_stages(self, add_extra_stage, add_extra_cleanup_stage):
-    # This method can be overridden by subclasses to add extra stages
+    # This method should be overridden by subclasses to add extra stages
     # e.g. as done in LastMthMetricsProcessor
     # add_extra_stage('end_of_mth_run')
     # add_extra_cleanup_stage('compute_last_month_metrics')
@@ -119,7 +167,7 @@ class BaseETLProcessor(ABC):
     self.logger.info("Full refresh completed.")
 
   def _extract(self, from_cache=False):
-    self.logger.info("Extract")
+    # self.logger.info("Extract")
     self.pre_extract()
     try:
       self.extract(from_cache=from_cache)  # Implementation to be provided by subclasses      
@@ -127,7 +175,7 @@ class BaseETLProcessor(ABC):
       self.post_extract()
       
   def _transform(self):
-    self.logger.info("Transform")
+    # self.logger.info("Transform")
     self.pre_transform()
     try:
       self.transform()  # Implementation to be provided by subclasses
@@ -135,7 +183,7 @@ class BaseETLProcessor(ABC):
       self.post_transform()
 
   def _load(self):
-    self.logger.info("Load")
+    # self.logger.info("Load")
     self.pre_load()
     try:
       success, failed = self.load()    # Implementation to be provided by subclasses

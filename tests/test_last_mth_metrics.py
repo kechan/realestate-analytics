@@ -32,8 +32,7 @@ class TestLastMthMetrics(unittest.TestCase):
 
     cls.last_mth_metrics_processor = LastMthMetricsProcessor(
       datastore=cls.datastore,
-      bq_datastore=cls.bq_datastore,
-      cache_dir=cache_dir
+      bq_datastore=cls.bq_datastore
     )
 
     cls.last_mth_metrics_processor.extract(from_cache=True)

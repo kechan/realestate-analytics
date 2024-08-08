@@ -86,8 +86,8 @@ def compute_metrics(df, date_mask, geo_level):
 
 
 class SoldMedianMetricsProcessor(BaseETLProcessor):
-  def __init__(self, job_id: str, datastore: Datastore, cache_dir: Union[str, Path] = None):
-    super().__init__(job_id=job_id, datastore=datastore, cache_dir=cache_dir)
+  def __init__(self, job_id: str, datastore: Datastore):
+    super().__init__(job_id=job_id, datastore=datastore)
 
     self.sold_listing_df = None
     self.geo_entry_df = None

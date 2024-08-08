@@ -17,10 +17,8 @@ from realestate_core.common.class_extensions import *
 
 class AbsorptionRateProcessor(BaseETLProcessor):
   # https://www.cgprealestateconsulting.com/post/calculating-absorption-rate-real-estate
-  def __init__(self, job_id: str, datastore: Datastore, 
-                cache_dir: Union[str, Path] = None, 
-                archive_dir: Union[str, Path] = None):
-    super().__init__(job_id=job_id, datastore=datastore, cache_dir=cache_dir, archive_dir=archive_dir)
+  def __init__(self, job_id: str, datastore: Datastore):
+    super().__init__(job_id=job_id, datastore=datastore)
 
     self.logger.info("Last run is expectedly None since we don't do any extract from ES for this ETL job.")
     self.sold_listing_df = None

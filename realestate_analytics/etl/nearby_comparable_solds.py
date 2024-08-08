@@ -94,10 +94,8 @@ def compare_comparable_results(prev_result: Dict[str, Dict[str, List]],
   return diff_result
 
 class NearbyComparableSoldsProcessor(BaseETLProcessor):
-  def __init__(self, job_id: str, datastore: Datastore, 
-               bq_datastore: BigQueryDatastore = None,
-               cache_dir: Union[str, Path] = None):
-    super().__init__(job_id=job_id, datastore=datastore, bq_datastore=bq_datastore, cache_dir=cache_dir)
+  def __init__(self, job_id: str, datastore: Datastore, bq_datastore: BigQueryDatastore = None):
+    super().__init__(job_id=job_id, datastore=datastore, bq_datastore=bq_datastore)
 
     self.sold_listing_df = None
     self.listing_df = None
