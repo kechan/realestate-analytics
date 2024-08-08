@@ -24,11 +24,15 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
 
     cls.cache = FileBasedCache(cache_dir=cache_dir)
     cls.datastore = Datastore(host=es_host, port=es_port)
+    if not cls.datastore.ping():
+      raise AssertionError(f"Unable to connect to Elasticsearch at {es_host}:{es_port}. All tests will fail.")      
+        
     
     # Load the sold listings data and results from cache
     cls.sold_listings_df = cls.cache.get('five_years_sold_listing')
     cls.price_series_df = cls.cache.get('five_years_price_series')
     cls.dom_series_df = cls.cache.get('five_years_dom_series')
+    cls.over_ask_series_df = cls.cache.get('five_years_over_ask_series')
     
     # Ensure lastTransition is datetime
     cls.sold_listings_df['lastTransition'] = pd.to_datetime(cls.sold_listings_df['lastTransition'])
@@ -60,7 +64,7 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
       return (only_col, only_col)
     
 
-  def test_median_price_and_dom_calculation(self):
+  def test_all_metrics_calculation(self):
     # 1. Pick a random geog_id/property_type where property_type is not null       
     valid_rows = self.price_series_df[self.price_series_df['propertyType'].notna()]
     random_row = valid_rows.sample(n=1).iloc[0]
@@ -91,6 +95,7 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
 
       independent_median_price = filtered_df['soldPrice'].median()
       independent_median_dom = filtered_df['daysOnMarket'].median()
+      independent_over_ask_percentage = (filtered_df['soldPrice'] > filtered_df['price']).mean() * 100
 
       precomputed_median_price = self.price_series_df[
         (self.price_series_df['geog_id'] == geog_id) &
@@ -102,8 +107,15 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
         (self.dom_series_df['propertyType'] == property_type)
       ][random_month].iloc[0]
 
+      precomputed_over_ask_percentage = self.over_ask_series_df[
+            (self.over_ask_series_df['geog_id'] == geog_id) &
+            (self.over_ask_series_df['propertyType'] == property_type)
+        ][random_month].iloc[0]
+
       print(f"Independent median price: {independent_median_price}, Precomputed median price: {precomputed_median_price}")
       print(f"Independent median DOM: {independent_median_dom}, Precomputed median DOM: {precomputed_median_dom}")
+      print(f"Independent over ask %: {independent_over_ask_percentage}, Precomputed over ask %: {precomputed_over_ask_percentage}")
+
 
       # Check if both are NaN or if they're almost equal
       if pd.isna(independent_median_price) and pd.isna(precomputed_median_price):
@@ -117,6 +129,13 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
       else:
         self.assertAlmostEqual(independent_median_dom, precomputed_median_dom, places=2,
                               msg=f"Median DOM mismatch for {geog_id}, {property_type}, {random_month}")
+        
+      if pd.isna(independent_over_ask_percentage) and pd.isna(precomputed_over_ask_percentage):
+        self.assertTrue(True, "Both independent and precomputed over ask percentages are NaN")
+      else:
+        self.assertAlmostEqual(independent_over_ask_percentage, precomputed_over_ask_percentage, places=2,
+                                msg=f"Over ask % mismatch for {geog_id}, {property_type}, {random_month}")
+
 
 
   def test_ALL_property_type_calculation(self):
@@ -148,6 +167,8 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
 
       independent_median_price = filtered_df['soldPrice'].median()
       independent_median_dom = filtered_df['daysOnMarket'].median()
+      independent_over_ask_percentage = (filtered_df['soldPrice'] > filtered_df['price']).mean() * 100
+
 
       precomputed_median_price = self.price_series_df[
         (self.price_series_df['geog_id'] == geog_id) &
@@ -159,8 +180,14 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
         (self.dom_series_df['propertyType'].isna())
       ][random_month].iloc[0]
 
+      precomputed_over_ask_percentage = self.over_ask_series_df[
+          (self.over_ask_series_df['geog_id'] == geog_id) &
+          (self.over_ask_series_df['propertyType'].isna())
+      ][random_month].iloc[0]
+
       print(f"Independent median price: {independent_median_price}, Precomputed median price: {precomputed_median_price}")
       print(f"Independent median DOM: {independent_median_dom}, Precomputed median DOM: {precomputed_median_dom}")
+      print(f"Independent over ask %: {independent_over_ask_percentage}, Precomputed over ask %: {precomputed_over_ask_percentage}")
 
       # Check if both are NaN or if they're almost equal
       if pd.isna(independent_median_price) and pd.isna(precomputed_median_price):
@@ -173,7 +200,14 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
         self.assertTrue(True, "Both independent and precomputed ALL median DOMs are NaN")
       else:
         self.assertAlmostEqual(independent_median_dom, precomputed_median_dom, places=2,
-                              msg=f"ALL median DOM mismatch for {geog_id}, month: {random_month}")      
+                              msg=f"ALL median DOM mismatch for {geog_id}, month: {random_month}")    
+
+      if pd.isna(independent_over_ask_percentage) and pd.isna(precomputed_over_ask_percentage):
+        self.assertTrue(True, "Both independent and precomputed ALL over ask percentages are NaN")
+      else:
+        self.assertAlmostEqual(independent_over_ask_percentage, precomputed_over_ask_percentage, places=2,
+                                msg=f"ALL over ask % mismatch for {geog_id}, month: {random_month}")
+  
 
       if len(filtered_df) > 0:
         # Additional check: Verify that ALL indeed includes multiple property types
@@ -197,16 +231,19 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
         print("No data available for this month.")
         print(f"Precomputed median price: {precomputed_median_price}")
         print(f"Precomputed median DOM: {precomputed_median_dom}")
+        print(f"Precomputed over ask %: {precomputed_over_ask_percentage}")
 
         self.assertTrue(pd.isna(precomputed_median_price), 
                         f"Expected NaN for precomputed median price, but got {precomputed_median_price}")
         self.assertTrue(pd.isna(precomputed_median_dom), 
                         f"Expected NaN for precomputed median DOM, but got {precomputed_median_dom}")
+        self.assertTrue(pd.isna(precomputed_over_ask_percentage), 
+                        f"Expected NaN for precomputed over ask %, but got {precomputed_over_ask_percentage}")
 
      
-  def test_multiple_median_price_and_dom_calculation(self):
+  def test_multiple_all_metrics_calculation(self):
     for _ in range(5):
-      self.test_median_price_and_dom_calculation()
+      self.test_all_metrics_calculation()
 
 
   def test_multiple_ALL_property_type_calculation(self):
@@ -239,6 +276,7 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
         self.assertIn('metrics', es_data)
         self.assertIn('median_price', es_data['metrics'])
         self.assertIn('median_dom', es_data['metrics'])
+        self.assertIn('over_ask_percentage', es_data['metrics'])
         
         # Check a few random months
         date_columns = [col for col in self.price_series_df.columns if col.startswith('20')]
@@ -247,14 +285,19 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
         for month in random_months:
           es_price = next((item['value'] for item in es_data['metrics']['median_price'] if item['date'] == month), None)
           es_dom = next((item['value'] for item in es_data['metrics']['median_dom'] if item['date'] == month), None)
+          es_over_ask = next((item['value'] for item in es_data['metrics']['over_ask_percentage'] if item['date'] == month), None)
           
           df_price = row[month]
           if property_type == 'ALL':
             df_dom = self.dom_series_df[(self.dom_series_df['geog_id'] == geog_id) & 
                                         (self.dom_series_df['propertyType'].isnull())][month].iloc[0]
+            df_over_ask = self.over_ask_series_df[(self.over_ask_series_df['geog_id'] == geog_id) &
+                                                  (self.over_ask_series_df['propertyType'].isnull())][month].iloc[0]
           else:  
             df_dom = self.dom_series_df[(self.dom_series_df['geog_id'] == geog_id) & 
                                         (self.dom_series_df['propertyType'] == property_type)][month].iloc[0]
+            df_over_ask = self.over_ask_series_df[(self.over_ask_series_df['geog_id'] == geog_id) &
+                                                  (self.over_ask_series_df['propertyType'] == property_type)][month].iloc[0]
           
           # Compare values, considering NaN as equal
           if pd.isna(df_price) and es_price is None:
@@ -268,6 +311,12 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
           elif pd.notna(df_dom) and es_dom is not None:
             self.assertAlmostEqual(float(df_dom), float(es_dom), places=2,
                                     msg=f"DOM mismatch for {doc_id}, {month}")
+          
+          if pd.isna(df_over_ask) and es_over_ask is None:
+            self.assertTrue(True, f"Both ES and DF over ask % are NaN/None for {doc_id}, {month}")
+          elif pd.notna(df_over_ask) and es_over_ask is not None:
+            self.assertAlmostEqual(float(df_over_ask), float(es_over_ask), places=2,
+                                    msg=f"Over ask % mismatch for {doc_id}, {month}")
       
         print(f"Successfully verified data for {doc_id}")
       except Exception as e:
