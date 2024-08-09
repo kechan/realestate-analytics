@@ -190,7 +190,9 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     super()._load_from_cache() 
 
     self.sold_listing_df = self.cache.get('five_years_sold_listing')
+
     self.geo_entry_df = self.cache.get('all_geo_entry')
+    self.geo_entry_df.drop_duplicates(subset=['MLS', 'CITY', 'PROV_STATE'], keep='last', inplace=True)
 
     if self.sold_listing_df is None or self.geo_entry_df is None:
       self.logger.error("Missing sold_listing_df or geo_entry_df.")
@@ -380,8 +382,8 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
           parsed[f'geog_id_{level}'] = geog_id
       return parsed
     
+    # TODO: we need to remove legacy path before deployment, this shouldnt be here.
     if legacy_data_path:
-      # legacy data path
       # Merge the geo_entry_df with the sold_listing_df
       self.sold_listing_df = join_df(self.sold_listing_df, 
                                     self.geo_entry_df[['MLS', 'CITY', 'PROV_STATE', 'GEOGRAPHIES']], 

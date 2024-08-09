@@ -1,8 +1,10 @@
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Union
 
-import json, time, traceback
+import os, json, time, traceback
 from datetime import datetime, timedelta
 from collections import Counter
+from dotenv import load_dotenv, find_dotenv
+from pathlib import Path
 import pandas as pd
 
 from .caching import FileBasedCache
@@ -10,6 +12,8 @@ from .caching import FileBasedCache
 from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import NotFoundError, ConnectionError, RequestError, TransportError
 from elasticsearch.helpers import scan, bulk
+
+from realestate_core.common.utils import load_from_pickle, save_to_pickle, join_df
 
 import logging
 
@@ -83,7 +87,15 @@ class Datastore:
     except ConnectionError as e:
       self.logger.error(f"Error connecting to ES at {host}:{port} mappings not retrieved.")
 
-    self.cache = FileBasedCache()
+    # Config and instantiate cache
+    self.cache = None
+    _ = load_dotenv(find_dotenv())
+    self.cache_dir = os.getenv('ANALYTICS_CACHE_DIR', None)
+    if self.cache_dir:
+      self.cache_dir = Path(self.cache_dir)
+      self.cache = FileBasedCache(cache_dir=self.cache_dir)
+    else:
+      self.logger.warning('ANALYTICS_CACHE_DIR not set in .env file, not instantiating cache, may cause unexpected errors.')    
     
     # map from property type to the listingType and searchCategoryType encoding.
     # for used in ES querying.
@@ -781,6 +793,62 @@ class Datastore:
     """
     return self.cache.get('all_geo_entry')
 
+
+  # dev workaround, need to periodically manually update the guid in sold listings cache
+  def update_geo_entry_df(self, data_dir: Union[str, Path]):
+    """
+    Updated geo_entry table dump is read from a tab delimited text file
+    This is part of the solution until guid is properly stamped to new future sold listings
+    """
+    data_dir = Path(data_dir)
+    all_geo_entry_df = pd.read_csv(data_dir/'all_geo_entry.txt', sep='\t')
+    self.cache.set(key='all_geo_entry', value=all_geo_entry_df)
+
+  def fix_guid_in_sold_listing_cache(self):
+    """
+    This is a temporary fix to update guid in sold listing cache
+    """
+    # Function to parse geog_ids
+    def parse_geog_ids(geog_string):
+      if pd.isna(geog_string):
+        return {}
+      geog_ids = geog_string.split(',')
+      parsed = {}
+      for geog_id in geog_ids:
+        match = re.match(r'g(\d+)_\w+', geog_id)
+        if match:
+          level = match.group(1)
+          parsed[f'geog_id_{level}'] = geog_id
+      return parsed
+    
+    sold_listing_cache_keys = ['five_years_sold_listing', 'one_year_sold_listing']
+
+    for sold_listing_cache_key in sold_listing_cache_keys:
+
+      sold_listing_df = self.cache.get(sold_listing_cache_key)
+      geo_entry_df = self.cache.get('all_geo_entry')
+
+      if sold_listing_df is None or geo_entry_df is None:
+        self.logger.error("Sold listings or geo entry df not found in cache.")
+        return
+      
+      len_b4_sold_listing = len(sold_listing_df)
+      geo_entry_df.drop_duplicates(subset=['MLS', 'CITY', 'PROV_STATE'], keep='last', inplace=True)
+
+      # Merge the geo_entry_df with the sold_listing_df
+      sold_listing_df = join_df(sold_listing_df, 
+                                geo_entry_df[['MLS', 'CITY', 'PROV_STATE', 'GEOGRAPHIES']], 
+                                left_on=['mls', 'city', 'provState'], 
+                                right_on=['MLS', 'CITY', 'PROV_STATE'], 
+                                how='left')
+
+      sold_listing_df['guid'] = sold_listing_df['GEOGRAPHIES']
+      sold_listing_df.drop(columns=['MLS', 'CITY', 'PROV_STATE', 'GEOGRAPHIES'], inplace=True)
+      len_after_sold_listing = len(sold_listing_df)
+
+      assert len_b4_sold_listing == len_after_sold_listing, "Length of sold listing df changed after fixing guid"
+
+      self.cache.set(key=sold_listing_cache_key, value=sold_listing_df)
 
 
 
