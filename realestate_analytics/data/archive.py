@@ -43,6 +43,16 @@ class Archiver:
       except Exception as e:
         self.logger.error(f"Failed to archive {name}: {str(e)}")
         return False
+    elif isinstance(data, str):
+      filename = f"{name}_{timestamp}.txt"
+      filepath = self.archive_dir / filename
+      try:
+        filepath.write_text(data)
+        self.logger.info(f"Successfully archived {name} to {filepath}")
+        return True
+      except Exception as e:
+        self.logger.error(f"Failed to archive {name}: {str(e)}")
+        return False
     else:
       self.logger.error(f"Unsupported data type for archiving: {type(data)}")
       return False
@@ -59,17 +69,22 @@ class Archiver:
     if timestamp:
       json_filepath = self.archive_dir / f"{name}_{timestamp}.json"
       df_filepath = self.archive_dir / f"{name}_{timestamp}_df"
+      txt_filepath = self.archive_dir / f"{name}_{timestamp}.txt"
     else:
       # Get the most recent archive if no timestamp is specified
       json_files = list(self.archive_dir.glob(f"{name}_*.json"))
       df_files = list(self.archive_dir.glob(f"{name}_*_df"))
-      if not json_files and not df_files:
+      txt_files = list(self.archive_dir.glob(f"{name}_*.txt"))
+
+      if not json_files and not df_files and not txt_files:
         self.logger.warning(f"No archives found for {name}")
         return None
+      
       json_filepath = max(json_files, key=lambda p: p.stat().st_mtime) if json_files else None
       df_filepath = max(df_files, key=lambda p: p.stat().st_mtime) if df_files else None
+      txt_filepath = max(txt_files, key=lambda p: p.stat().st_mtime) if txt_files else None
 
-    if df_filepath and (not json_filepath or df_filepath.stat().st_mtime > json_filepath.stat().st_mtime):
+    if df_filepath and df_filepath.exists():
       try:
         df = pd.read_feather(df_filepath)
         self.logger.info(f"Successfully retrieved DataFrame archive {df_filepath.name}")
@@ -77,13 +92,21 @@ class Archiver:
       except Exception as e:
         self.logger.error(f"Failed to retrieve DataFrame archive {df_filepath.name}: {str(e)}")
         return None
-    elif json_filepath:
+    elif json_filepath and json_filepath.exists():
       try:
         data = json.loads(json_filepath.read_text())
         self.logger.info(f"Successfully retrieved archive {json_filepath.name}")
         return data
       except Exception as e:
         self.logger.error(f"Failed to retrieve archive {json_filepath.name}: {str(e)}")
+        return None
+    elif txt_filepath and txt_filepath.exists():
+      try:
+        data = txt_filepath.read_text()
+        self.logger.info(f"Successfully retrieved archive {txt_filepath.name}")
+        return data
+      except Exception as e:
+        self.logger.error(f"Failed to retrieve archive {txt_filepath.name}: {str(e)}")
         return None
     else:
       self.logger.warning(f"No archives found for {name}")

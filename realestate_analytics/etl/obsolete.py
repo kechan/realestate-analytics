@@ -331,7 +331,7 @@ def update_mkt_trends_ts_index(self):
 
             yield {
               "_op_type": "update",
-              "_index": self.datastore.mkt_trends_ts_index_name,
+              "_index": self.datastore.mkt_trends_index_name,
               "_id": composite_id,
               "doc": doc,
               "doc_as_upsert": True

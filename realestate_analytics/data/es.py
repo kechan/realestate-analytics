@@ -61,7 +61,7 @@ class Datastore:
     # for market trends time series data
     # currently, 5yr montly median sold price and days on market by geog_id and property type
     # used in SoldMedianMetricsProcessor
-    self.mkt_trends_ts_index_name = "rlp_mkt_trends_ts_current"
+    self.mkt_trends_index_name = "rlp_mkt_trends_current"
 
     if not self.ping():
       self.logger.error(f"Unable to connect to ES at {host}:{port}")
@@ -80,9 +80,9 @@ class Datastore:
         self.logger.warning(f"Index '{self.listing_tracking_index_name}' not found.")
 
       try:
-        self.mkt_trends_ts_index_mapping = self.get_mapping(index=self.mkt_trends_ts_index_name)
+        self.mkt_trends_index_mapping = self.get_mapping(index=self.mkt_trends_index_name)
       except NotFoundError:
-        self.logger.warning(f"Index '{self.mkt_trends_ts_index_name}' not found.")
+        self.logger.warning(f"Index '{self.mkt_trends_index_name}' not found.")
 
     except ConnectionError as e:
       self.logger.error(f"Error connecting to ES at {host}:{port} mappings not retrieved.")
@@ -191,39 +191,67 @@ class Datastore:
     else:
       self.logger.info(f"Alias '{alias_name}' already exists.")
 
-  def create_mkt_trends_ts_index(self):
-    index_name = "rlp_mkt_trends_ts_1"
-    alias_name = self.mkt_trends_ts_index_name
+  def create_mkt_trends_index(self):
+    index_name = "rlp_mkt_trends_1"
+    alias_name = self.mkt_trends_index_name
 
     index_schema = {
       "mappings": {
         "properties": {
-            "geog_id": {"type": "keyword"},
-            "propertyType": {"type": "keyword"},
-            "geo_level": {"type": "integer"},
-            "metrics": {
+          "geog_id": {"type": "keyword"},
+          "propertyType": {"type": "keyword"},
+          "geo_level": {"type": "integer"},
+          "metrics": {
+            "properties": {
+              "median_price": {
+                "type": "nested",
                 "properties": {
-                    "median_price": {
-                        "type": "nested",
-                        "properties": {
-                            "date": {"type": "date", "format": "yyyy-MM"},
-                            "value": {"type": "float"}
-                        }
-                    },
-                    "median_dom": {
-                        "type": "nested",
-                        "properties": {
-                            "date": {"type": "date", "format": "yyyy-MM"},
-                            "value": {"type": "float"}
-                        }
-                    }
+                  "month": {"type": "date", "format": "yyyy-MM"},
+                  "value": {"type": "float"}
                 }
-            },
-            "last_updated": {"type": "date"}
+              },
+              "median_dom": {
+                "type": "nested",
+                "properties": {
+                  "month": {"type": "date", "format": "yyyy-MM"},
+                  "value": {"type": "float"}
+                }
+              },
+              "absorption_rate": {
+                "type": "nested",
+                "properties": {
+                  "month": {"type": "date", "format": "yyyy-MM"},
+                  "value": {"type": "float"}
+                }
+              },
+              "last_mth_median_asking_price": {
+                "type": "nested",
+                "properties": {
+                  "month": {"type": "date", "format": "yyyy-MM"},
+                  "value": {"type": "float"}
+                }
+              },
+              "last_mth_new_listings": {
+                "type": "nested",
+                "properties": {
+                  "month": {"type": "date", "format": "yyyy-MM"},
+                  "value": {"type": "long"}
+                }
+              },
+              "over_ask_percentage": {
+                "type": "nested",
+                "properties": {
+                  "month": {"type": "date", "format": "yyyy-MM"},
+                  "value": {"type": "float"}
+                }
+              }
+            }
+          },
+          "last_updated": {"type": "date"}
         }
       }
     }
-
+    
     # Create the index if it doesn't already exist
     if not self.es.indices.exists(index=index_name):
       self.es.indices.create(index=index_name, body=index_schema)
@@ -290,7 +318,7 @@ class Datastore:
       # date_format = '%Y/%m/%d'
       date_format = '%Y-%m-%dT%H:%M:%S.%f'
       pertinent_time_field = 'addedOn'
-    elif index == self.mkt_trends_ts_index_name:
+    elif index == self.mkt_trends_index_name:
       # 2024-07-12T00:00:00Z
       date_format = '%Y-%m-%dT%H:%M:%S.%f'
       pertinent_time_field = 'last_updated'

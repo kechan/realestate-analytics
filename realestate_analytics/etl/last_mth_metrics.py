@@ -89,6 +89,11 @@ class LastMthMetricsProcessor(BaseETLProcessor):
         else:
           self._delta_extract_from_datastore(last_run=last_run)
 
+        # is_deleted is updated during end of month run, we shouldnt consider
+        # is_deleted = True during all stages. 
+        self.listing_df = self.listing_df[~self.listing_df['is_deleted']]
+        self.listing_df.reset_index(drop=True, inplace=True)
+
         self._mark_success('extract')
 
     except (ConnectionError, RequestError, TransportError) as e:
@@ -326,16 +331,17 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     # Deduplicate listings based on _id, keeping the last (most current) entry
     self.listing_df = self.listing_df.sort_values('lastUpdate').drop_duplicates('_id', keep='last')
 
+    # This is now done during extract
     # Filter out soft-deleted listings
-    active_listings = self.listing_df[~self.listing_df['is_deleted']]
-    self.logger.info(f'# of listing before filtering out soft-deleted: {len(self.listing_df)}')
-    self.logger.info(f'# of listing after filtering out soft-deleted: {len(active_listings)}')
+    # active_listings = self.listing_df[~self.listing_df['is_deleted']]
+    # self.logger.info(f'# of listing before filtering out soft-deleted: {len(self.listing_df)}')
+    # self.logger.info(f'# of listing after filtering out soft-deleted: {len(active_listings)}')
 
     # Convert 'addedOn' to datetime if it's not already
-    active_listings.addedOn = pd.to_datetime(active_listings.addedOn)
+    self.listing_df.addedOn = pd.to_datetime(self.listing_df.addedOn)
 
     # Expand guid column
-    expanded_df = active_listings.assign(geog_id=self.listing_df['guid'].str.split(',')).explode('geog_id')
+    expanded_df = self.listing_df.assign(geog_id=self.listing_df['guid'].str.split(',')).explode('geog_id')
 
     # Function to calculate metrics for both specific property types and 'ALL'
     def calculate_metrics(group):
@@ -428,35 +434,54 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     last_month = (self.get_current_datetime().replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
     # Modified last_month to simulate a diff month
     # last_month = (datetime.now().replace(day=1) + timedelta(days=1)).strftime('%Y-%m')
-    
+
     def generate_actions():
       for _, row in self.last_mth_metrics_results.iterrows():
         doc_id = f"{row['geog_id']}_{row['propertyType']}"
         yield {
           "_op_type": "update",
-          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_index": self.datastore.mkt_trends_index_name,
           "_id": doc_id,
           "script": {
             "source": """
-              if (ctx._source.metrics == null) {
-                ctx._source.metrics = new HashMap();
+            if (ctx._source.metrics == null) {
+              ctx._source.metrics = new HashMap();
+            }
+            
+            // Function to update or append metric
+            void updateMetric(String metricName, Map newEntry) {
+              if (ctx._source.metrics[metricName] == null) {
+                ctx._source.metrics[metricName] = [];
               }
-              
-              // Update last_mth_median_asking_price
-              ctx._source.metrics.last_mth_median_asking_price = params.median_price;
-              
-              // Update last_mth_new_listings
-              ctx._source.metrics.last_mth_new_listings = params.new_listings_count;
-              
-              ctx._source.last_updated = params.last_updated;
+              int existingIndex = -1;
+              for (int i = 0; i < ctx._source.metrics[metricName].size(); i++) {
+                if (ctx._source.metrics[metricName][i].month == newEntry.month) {
+                  existingIndex = i;
+                  break;
+                }
+              }
+              if (existingIndex >= 0) {
+                ctx._source.metrics[metricName][existingIndex] = newEntry;
+              } else {
+                ctx._source.metrics[metricName].add(newEntry);
+              }
+            }
+            
+            // Update last_mth_median_asking_price
+            updateMetric('last_mth_median_asking_price', params.median_price);
+            
+            // Update last_mth_new_listings
+            updateMetric('last_mth_new_listings', params.new_listings_count);
+            
+            ctx._source.last_updated = params.last_updated;
             """,
             "params": {
               "median_price": {
-                "date": last_month,
+                "month": last_month,
                 "value": row['median_price']
               },
               "new_listings_count": {
-                "date": last_month,
+                "month": last_month,
                 "value": int(row['new_listings_count'])
               },
               "last_updated": self.get_current_datetime().isoformat()
@@ -467,19 +492,19 @@ class LastMthMetricsProcessor(BaseETLProcessor):
             "propertyType": row['propertyType'],
             "geo_level": int(row['geog_id'].split('_')[0][1:]),
             "metrics": {
-              "last_mth_median_asking_price": {
-                "date": last_month,
+              "last_mth_median_asking_price": [{
+                "month": last_month,
                 "value": row['median_price']
-              },
-              "last_mth_new_listings": {
-                "date": last_month,
+              }],
+              "last_mth_new_listings": [{
+                "month": last_month,
                 "value": int(row['new_listings_count'])
-              }
+              }]
             },
             "last_updated": self.get_current_datetime().isoformat()
           }
         }
-
+ 
     # Perform bulk update with error handling
     success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
     
@@ -502,11 +527,11 @@ class LastMthMetricsProcessor(BaseETLProcessor):
         }
       }
       for hit in scan(self.datastore.es, 
-                      index=self.datastore.mkt_trends_ts_index_name, 
+                      index=self.datastore.mkt_trends_index_name, 
                       query=query):
         yield {
           "_op_type": "update",
-          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_index": self.datastore.mkt_trends_index_name,
           "_id": hit["_id"],
           "script": {
             "source": """
@@ -617,7 +642,7 @@ if __name__ == "__main__":
 +--------------+----------------+---------------+-------------------+
 """
 
-""" Sample json in rlp_mkt_trends_ts_current
+""" Sample json in rlp_mkt_trends_current
   {'geog_id': 'g30_dpz89rm7',
   'propertyType': 'SEMI-DETACHED',
   'geo_level': 30,
@@ -644,3 +669,56 @@ if __name__ == "__main__":
   'last_updated': '2024-07-24T21:33:28.443159'}
 
 """
+
+''' 
+    def generate_actions():
+      for _, row in self.last_mth_metrics_results.iterrows():
+        doc_id = f"{row['geog_id']}_{row['propertyType']}"
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_index_name,
+          "_id": doc_id,
+          "script": {
+            "source": """
+              if (ctx._source.metrics == null) {
+                ctx._source.metrics = new HashMap();
+              }
+              
+              // Update last_mth_median_asking_price
+              ctx._source.metrics.last_mth_median_asking_price = params.median_price;
+              
+              // Update last_mth_new_listings
+              ctx._source.metrics.last_mth_new_listings = params.new_listings_count;
+              
+              ctx._source.last_updated = params.last_updated;
+            """,
+            "params": {
+              "median_price": {
+                "month": last_month,
+                "value": row['median_price']
+              },
+              "new_listings_count": {
+                "month": last_month,
+                "value": int(row['new_listings_count'])
+              },
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          },
+          "upsert": {
+            "geog_id": row['geog_id'],
+            "propertyType": row['propertyType'],
+            "geo_level": int(row['geog_id'].split('_')[0][1:]),
+            "metrics": {
+              "last_mth_median_asking_price": {
+                "month": last_month,
+                "value": row['median_price']
+              },
+              "last_mth_new_listings": {
+                "month": last_month,
+                "value": int(row['new_listings_count'])
+              }
+            },
+            "last_updated": self.get_current_datetime().isoformat()
+          }
+        }
+'''

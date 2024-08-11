@@ -62,18 +62,19 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
       # Edge case: only one column available
       only_col = non_nan_cols[0] if non_nan_cols else nan_cols[0]
       return (only_col, only_col)
-    
 
-  def test_all_metrics_calculation(self):
-    # 1. Pick a random geog_id/property_type where property_type is not null       
-    valid_rows = self.price_series_df[self.price_series_df['propertyType'].notna()]
-    random_row = valid_rows.sample(n=1).iloc[0]
 
-    geog_id = random_row['geog_id']
-    property_type = random_row['propertyType']
-    geo_level = int(random_row['geo_level'])
+  
+  def metrics_calculation(self, row):
 
-    random_months = self.select_random_month(random_row)
+    geog_id = row['geog_id']
+    property_type = row['propertyType']
+    if property_type is None:  # means 'ALL' property type
+      property_types = ['CONDO', 'TOWNHOUSE', 'DETACHED', 'SEMI-DETACHED']
+    else:
+      property_types = [property_type]
+
+    random_months = self.select_random_month(row)
 
     if 'guid' not in self.sold_listings_df.columns:
       self.fail("'guid' column not found in sold_listings_df")
@@ -86,7 +87,7 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
 
       filtered_df = self.sold_listings_df[
         (self.sold_listings_df['guid'].apply(lambda x: geog_id in str(x).split(','))) &
-        (self.sold_listings_df['propertyType'] == property_type) &
+        (self.sold_listings_df['propertyType'].isin(property_types)) &
         (self.sold_listings_df['lastTransition'] >= month_start) &
         (self.sold_listings_df['lastTransition'] < month_end)
       ]
@@ -99,17 +100,20 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
 
       precomputed_median_price = self.price_series_df[
         (self.price_series_df['geog_id'] == geog_id) &
-        (self.price_series_df['propertyType'] == property_type)
+        # (self.price_series_df['propertyType'] == property_type)
+        (self.price_series_df['propertyType'].isna() if property_type is None else self.price_series_df['propertyType'] == property_type)
       ][random_month].iloc[0]
 
       precomputed_median_dom = self.dom_series_df[
         (self.dom_series_df['geog_id'] == geog_id) &
-        (self.dom_series_df['propertyType'] == property_type)
+        # (self.dom_series_df['propertyType'] == property_type)
+        (self.dom_series_df['propertyType'].isna() if property_type is None else self.dom_series_df['propertyType'] == property_type)
       ][random_month].iloc[0]
 
       precomputed_over_ask_percentage = self.over_ask_series_df[
             (self.over_ask_series_df['geog_id'] == geog_id) &
-            (self.over_ask_series_df['propertyType'] == property_type)
+            # (self.over_ask_series_df['propertyType'] == property_type)
+            (self.over_ask_series_df['propertyType'].isna() if property_type is None else self.over_ask_series_df['propertyType'] == property_type)
         ][random_month].iloc[0]
 
       print(f"Independent median price: {independent_median_price}, Precomputed median price: {precomputed_median_price}")
@@ -136,6 +140,32 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
         self.assertAlmostEqual(independent_over_ask_percentage, precomputed_over_ask_percentage, places=2,
                                 msg=f"Over ask % mismatch for {geog_id}, {property_type}, {random_month}")
 
+
+
+  def test_random_geog_id_property_type(self):
+    # Pick a random geog_id/property_type where property_type is not null 
+    valid_rows = self.price_series_df[self.price_series_df['propertyType'].notna()]
+    random_row = valid_rows.sample(n=1).iloc[0]
+
+    self.metrics_calculation(random_row)
+
+  
+  def test_toronto(self):
+    geog_id = 'g30_dpz89rm7'  # City of Toronto
+    property_types = ['CONDO', 'TOWNHOUSE', 'DETACHED', 'SEMI-DETACHED']
+
+    for property_type in property_types:
+      row = self.price_series_df[(
+        self.price_series_df['geog_id'] == geog_id) & (self.price_series_df['propertyType'] == property_type
+      )].iloc[0]
+      # Assuming select_random_month and other necessary methods are defined within the same class
+      self.metrics_calculation(row)
+
+    # test for all property types
+    row = self.price_series_df[(
+      self.price_series_df['geog_id'] == geog_id) & (self.price_series_df['propertyType'].isna()
+    )].iloc[0]
+    self.metrics_calculation(row)
 
 
   def test_ALL_property_type_calculation(self):
@@ -265,10 +295,10 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
       
       try:
         # Fetch the document from Elasticsearch      
-        es_doc = self.datastore.es.get(index=self.datastore.mkt_trends_ts_index_name, id=doc_id)
+        es_doc = self.datastore.es.get(index=self.datastore.mkt_trends_index_name, id=doc_id)
         # Check if the document was found
         if not es_doc:
-          self.fail(f"{doc_id} not found in Elasticsearch index '{self.datastore.mkt_trends_ts_index_name}'")
+          self.fail(f"{doc_id} not found in Elasticsearch index '{self.datastore.mkt_trends_index_name}'")
 
         es_data = es_doc['_source']
         
@@ -283,9 +313,9 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
         random_months = random.sample(date_columns, min(3, len(date_columns)))
         
         for month in random_months:
-          es_price = next((item['value'] for item in es_data['metrics']['median_price'] if item['date'] == month), None)
-          es_dom = next((item['value'] for item in es_data['metrics']['median_dom'] if item['date'] == month), None)
-          es_over_ask = next((item['value'] for item in es_data['metrics']['over_ask_percentage'] if item['date'] == month), None)
+          es_price = next((item['value'] for item in es_data['metrics']['median_price'] if item['month'] == month), None)
+          es_dom = next((item['value'] for item in es_data['metrics']['median_dom'] if item['month'] == month), None)
+          es_over_ask = next((item['value'] for item in es_data['metrics']['over_ask_percentage'] if item['month'] == month), None)
           
           df_price = row[month]
           if property_type == 'ALL':

@@ -189,7 +189,7 @@ class BaseETLProcessor(ABC):
       success, failed = self.load()    # Implementation to be provided by subclasses
       total_attempts = success + len(failed)
       if total_attempts == 0:
-        self.logger.info("No documents were attempted to be updated.")       
+        self.logger.warning("No documents were attempted to be updated.")       
       return success, failed
     except Exception as e:
       self.logger.error(f"Error in load: {e}", exc_info=True)

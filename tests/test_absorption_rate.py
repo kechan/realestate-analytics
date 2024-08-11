@@ -26,6 +26,7 @@ class TestAbsorptionRate(unittest.TestCase):
     cls.datastore = Datastore(host=es_host, port=es_port)
 
     cls.processor = AbsorptionRateProcessor(
+      job_id='unittest_absorption_rate',
       datastore=cls.datastore
     )
 
@@ -161,7 +162,7 @@ class TestAbsorptionRate(unittest.TestCase):
       doc_id = f"{geog_id}_{property_type}"
       
       try:
-        es_doc = self.datastore.search(index=self.datastore.mkt_trends_ts_index_name, _id=doc_id)[0]
+        es_doc = self.datastore.search(index=self.datastore.mkt_trends_index_name, _id=doc_id)[0]
         
         # Check if the document has the expected structure
         self.assertIn('metrics', es_doc)
@@ -173,6 +174,10 @@ class TestAbsorptionRate(unittest.TestCase):
           self.fail(f"No absorption rate data found in ES for {doc_id}")
         
         latest_es_rate = es_absorption_rates[-1]
+
+        self.assertIn('month', latest_es_rate, f"'month' field missing in absorption rate data for {doc_id}")
+        self.assertRegex(latest_es_rate['month'], r'^\d{4}-\d{2}$', f"Invalid month format for {doc_id}")
+        print(f"ES month: {latest_es_rate['month']}")
         
         # Compare with the rate in our computed results
         computed_rate = row['absorption_rate']

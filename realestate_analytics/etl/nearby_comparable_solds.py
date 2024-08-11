@@ -137,6 +137,19 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
     # Flag to determine whether to use UTC or local time
     self.use_utc = True  # Set this to True to use UTC
 
+    # The number of days to look back for sold and current listings in the delta load
+    # this creates a margin of safety for not missing anything.
+    self.DELTA_SOLD_LISTINGS_LOOKBACK_DAYS = 21
+    self.DELTA_CURRENT_LISTINGS_LOOKBACK_DAYS = 3
+
+    # Constants for get_sold_listings method
+    self.MAX_DISTANCE = 1.0  # km, max distance to consider 
+    self.MAX_COMPS = 12      # incl. this maximum number of comparables to return for each current listing
+
+    self.LOAD_SUCCESS_THRESHOLD = 0.5  # minimum success rate for upsert to ES to be considered successful
+    self.DISTANCE_ROUNDING_DECIMALS = 1
+
+
   def extract(self, from_cache=False):
     super().extract(from_cache=from_cache)
 
@@ -188,7 +201,7 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
           raise ValueError("Cache is inconsistent. Missing prior sold_listing_df or listing_df.")
 
         # get the sold listings from last run till now
-        start_time = last_run - timedelta(days=21)   # load from 21 days before last run to have bigger margin of safety.
+        start_time = last_run - timedelta(days=self.DELTA_SOLD_LISTINGS_LOOKBACK_DAYS)   # load from 21 days before last run to have bigger margin of safety.
         end_time = self.get_current_datetime()
         
         success, delta_sold_listing_df = self.datastore.get_sold_listings(
@@ -202,7 +215,7 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
         self.logger.info(f'Loaded {len(delta_sold_listing_df)} sold listings from {start_time} to {end_time}')
         
         # Get the current ACTIVE listings from last run till now
-        start_time = last_run - timedelta(days=3)   # load from 3 days before last run to have some margin of safety.
+        start_time = last_run - timedelta(days=self.DELTA_CURRENT_LISTINGS_LOOKBACK_DAYS)   # load from 3 days before last run to have some margin of safety.
         # end time is same as above
         success, delta_listing_df = self.datastore.get_current_active_listings(
           use_script_for_last_update=True,      # TODO: remove after dev
@@ -360,9 +373,10 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
       return 0, []  # nothing to do 
 
     success, failed = self.update_datastore(self.diff_result)
+    total_attempts = success + len(failed)
 
-    if success / (success + len(failed)) < 0.5:
-      self.logger.error(f"Less than 50% success rate. Only {success} out of {success + len(failed)} documents updated.")
+    if total_attempts != 0 and (success / total_attempts) < self.LOAD_SUCCESS_THRESHOLD:
+      self.logger.error(f"Less than {self.LOAD_SUCCESS_THRESHOLD*100}% success rate. Only {success} out of {total_attempts} documents updated.")
 
       self.datastore.summarize_update_failures(failed)
     else:
@@ -462,7 +476,7 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
     # self.datastore.es 
     def generate_actions():
       for current_listing_id, comparables in active_listing_2_sold_listings.items():
-        rounded_distances = [round(d, 1) for d in comparables['distance_km']]    # round to 1 decimal place
+        rounded_distances = [round(d, self.DISTANCE_ROUNDING_DECIMALS) for d in comparables['distance_km']]    # round to 1 decimal place
         yield {
             '_op_type': 'update',
             '_index': self.datastore.listing_index_name,
@@ -505,7 +519,7 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
     return df.loc[mask, ['lat', 'lng', '_id']]
   
 
-  def _compute_nearest_sold_properties(self, current_coords: np.ndarray, sold_coords: np.ndarray, max_distance=1.0, max_comps=12):
+  def _compute_nearest_sold_properties(self, current_coords: np.ndarray, sold_coords: np.ndarray):
     """
       Calculate distance matrix between current and sold listings' coords, and keep only maximum of 12 comparables sold within 1 km 
       of each current listing. (i.e. results should be same length as current_coords)
@@ -522,9 +536,9 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
       - filtered_indices: Indices of the closest comparables. Non-comparable entries are np.nan.
     """
     D = calculate_distance(current_coords, sold_coords)
-    sorted_indices = np.argsort(D, axis=1)[:, :max_comps]
-    sorted_distances = np.sort(D, axis=1)[:, :max_comps]
-    mask = sorted_distances < max_distance
+    sorted_indices = np.argsort(D, axis=1)[:, :self.MAX_COMPS]
+    sorted_distances = np.sort(D, axis=1)[:, :self.MAX_COMPS]
+    mask = sorted_distances < self.MAX_DISTANCE
     return np.where(mask, sorted_distances, np.nan), np.where(mask, sorted_indices, np.nan)
   
 

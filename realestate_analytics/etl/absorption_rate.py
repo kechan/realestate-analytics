@@ -46,6 +46,7 @@ class AbsorptionRateProcessor(BaseETLProcessor):
     try:
       self._calculate_absorption_rates()
 
+      # archive the absorption rates, and it wants to be successful before transform is marked as successful
       if hasattr(self, 'absorption_rates') and self.absorption_rates is not None:
         if not self.archiver.archive(self.absorption_rates, 'absorption_rates'):
           self.logger.error("Failed to archive absorption rates")
@@ -175,7 +176,7 @@ class AbsorptionRateProcessor(BaseETLProcessor):
 
         yield {
           "_op_type": "update",
-          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_index": self.datastore.mkt_trends_index_name,
           "_id": composite_id,
           "script": {
             "source": """
@@ -188,7 +189,7 @@ class AbsorptionRateProcessor(BaseETLProcessor):
             // Check if an entry for this month already exists
             int existingIndex = -1;
             for (int i = 0; i < ctx._source.metrics.absorption_rate.size(); i++) {
-              if (ctx._source.metrics.absorption_rate[i].date == params.new_metric.date) {
+              if (ctx._source.metrics.absorption_rate[i].month == params.new_metric.month) {
                 existingIndex = i;
                 break;
               }
@@ -213,7 +214,7 @@ class AbsorptionRateProcessor(BaseETLProcessor):
             """,
             "params": {
               "new_metric": {
-                "date": last_month_str,
+                "month": last_month_str,
                 "value": absorption_rate
               },
               "geog_id": row['geog_id'],
@@ -228,7 +229,7 @@ class AbsorptionRateProcessor(BaseETLProcessor):
             "geo_level": int(row['geog_id'].split('_')[0][1:]),
             "metrics": {
               "absorption_rate": [] if absorption_rate is None else [{
-                "date": last_month_str,
+                "month": last_month_str,
                 "value": absorption_rate
               }]
             },
@@ -259,10 +260,10 @@ class AbsorptionRateProcessor(BaseETLProcessor):
           }
         }
       }
-      for hit in scan(self.datastore.es, index=self.datastore.mkt_trends_ts_index_name, query=query):
+      for hit in scan(self.datastore.es, index=self.datastore.mkt_trends_index_name, query=query):
         yield {
           "_op_type": "update",
-          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_index": self.datastore.mkt_trends_index_name,
           "_id": hit["_id"],
           "script": {
             "source": """
@@ -300,7 +301,7 @@ if __name__ == '__main__':
   )
   processor.run()
 
-  # datastore.search(index=datastore.mkt_trends_ts_index_name, _id='g30_dpz89rm7_DETACHED')[0]
+  # datastore.search(index=datastore.mkt_trends_index_name, _id='g30_dpz89rm7_DETACHED')[0]
 
 
 """ Sample absorption_rates dataframe:

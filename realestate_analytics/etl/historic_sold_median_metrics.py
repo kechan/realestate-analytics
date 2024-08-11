@@ -423,11 +423,11 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
         for col in self.diff_price_series.columns:
           if col.startswith('20'):
-            date = col
+            month = col
             value = row[col]
             if pd.notna(value):
               new_metrics["median_price"].append({
-                "date": date,
+                "month": month,
                 "value": float(value)
               })
 
@@ -436,7 +436,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
         yield {
           "_op_type": "update",
-          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_index": self.datastore.mkt_trends_index_name,
           "_id": composite_id,
           "script": {
             "source": """
@@ -474,11 +474,11 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
         for col in self.diff_dom_series.columns:
           if col.startswith('20'):
-            date = col
+            month = col
             value = row[col]
             if pd.notna(value):
               new_metrics["median_dom"].append({
-                "date": date,
+                "month": month,
                 "value": float(value)
               })
 
@@ -487,7 +487,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
         yield {
           "_op_type": "update",
-          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_index": self.datastore.mkt_trends_index_name,
           "_id": composite_id,
           "script": {
             "source": """
@@ -525,11 +525,11 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
         for col in self.diff_over_ask_series.columns:
           if col.startswith('20'):
-            date = col
+            month = col
             value = row[col]
             if pd.notna(value):
               new_metrics["over_ask_percentage"].append({
-                "date": date,
+                "month": month,
                 "value": round(float(value), 2)
               })
 
@@ -538,7 +538,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
         yield {
           "_op_type": "update",
-          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_index": self.datastore.mkt_trends_index_name,
           "_id": composite_id,
           "script": {
             "source": """
@@ -591,20 +591,23 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
         "match_all": {}
       }
     }
-    response = self.datastore.es.delete_by_query(index=self.datastore.mkt_trends_ts_index_name, body=query)
+    response = self.datastore.es.delete_by_query(index=self.datastore.mkt_trends_index_name, body=query)
     deleted_count = response["deleted"]
-    self.logger.info(f"Deleted {deleted_count} documents from {self.datastore.mkt_trends_ts_index_name}")
+    self.logger.info(f"Deleted {deleted_count} documents from {self.datastore.mkt_trends_index_name}")
 
 
   def remove_metrics_from_mkt_trends_ts(self):
+    '''
+    This remove the entire metrics node from the mkt_trends_ts index.
+    '''
     def generate_actions():
       # Use scan to efficiently retrieve all documents that have a 'metrics' field
       for hit in scan(self.datastore.es, 
-                      index=self.datastore.mkt_trends_ts_index_name, 
+                      index=self.datastore.mkt_trends_index_name, 
                       query={"query": {"exists": {"field": "metrics"}}}):
         yield {
           "_op_type": "update",
-          "_index": self.datastore.mkt_trends_ts_index_name,
+          "_index": self.datastore.mkt_trends_index_name,
           "_id": hit["_id"],
           "script": {
             "source": "ctx._source.remove('metrics')",
@@ -762,8 +765,8 @@ if __name__ == '__main__':
    {'date': '2024-05', 'value': 9.0},
    {'date': '2024-06', 'value': 9.0},
    {'date': '2024-07', 'value': 14.5}],
-  'last_mth_median_asking_price': {'date': '2024-07', 'value': 1500000.0},
-  'last_mth_new_listings': {'date': '2024-07', 'value': 887},
+  'last_mth_median_asking_price': [{'date': '2024-07', 'value': 1500000.0}],
+  'last_mth_new_listings': [{'date': '2024-07', 'value': 887}],
   'absorption_rate': [{'date': '2024-07', 'value': 0.0399}],
   'over_ask_percentage': [{'date': '2023-01', 'value': 66.67},
    {'date': '2023-02', 'value': 53.85},

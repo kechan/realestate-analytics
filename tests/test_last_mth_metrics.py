@@ -23,6 +23,8 @@ class TestLastMthMetrics(unittest.TestCase):
     cls.cache = FileBasedCache(cache_dir=cache_dir)
 
     cls.listing_df = cls.cache.get('on_current_listing')
+    cls.listing_df = cls.listing_df[~cls.listing_df['is_deleted']]    # account for soft deletions
+    cls.listing_df.reset_index(drop=True, inplace=True)
     print(f'# of current listings: {cls.listing_df.shape[0]}')
 
     es_host = os.getenv('ES_HOST')
@@ -117,7 +119,7 @@ class TestLastMthMetrics(unittest.TestCase):
     for _, row in sampled_results.iterrows():
       doc_id = f"{row['geog_id']}_{row['propertyType']}"
       es_doc = self.datastore.search(
-        index=self.datastore.mkt_trends_ts_index_name,
+        index=self.datastore.mkt_trends_index_name,
         _id=doc_id
       )
       self.assertIsNotNone(es_doc, f"Document not found in Elasticsearch for ID: {doc_id}")
@@ -125,10 +127,16 @@ class TestLastMthMetrics(unittest.TestCase):
       if es_doc:
         es_median_price = es_doc[0]['metrics']['last_mth_median_asking_price']['value']
         es_new_listings = es_doc[0]['metrics']['last_mth_new_listings']['value']
+        es_month = es_doc[0]['metrics']['last_mth_median_asking_price']['month']
+
 
         print(f"\nComparing {doc_id}:")
+        print(f"Month - Elasticsearch: {es_month}")
         print(f"Median Price - Archived: {row['median_price']}, Elasticsearch: {es_median_price}")
         print(f"New Listings - Archived: {row['new_listings_count']}, Elasticsearch: {es_new_listings}")
+
+        # Check that the month is in the correct format (YYYY-MM)
+        self.assertRegex(es_month, r'\d{4}-\d{2}', f"Invalid month format for {doc_id}")
 
         # Check median price (allowing for small floating-point differences)
         self.assertAlmostEqual(row['median_price'], es_median_price, delta=1.0,
