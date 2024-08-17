@@ -25,6 +25,9 @@ class AbsorptionRateProcessor(BaseETLProcessor):
     self.listing_df = None
     self.absorption_rates = None
 
+    self.LOAD_SUCCESS_THRESHOLD = 0.5
+    self.ABSORPTION_RATE_ROUND_DIGITS = 4
+
   def extract(self, from_cache=True):
     # ignore the from_cache flag, always load from cache
     # this is to conform to the signature of extract(...) that the parent class expects
@@ -71,7 +74,7 @@ class AbsorptionRateProcessor(BaseETLProcessor):
     success, failed = self.update_mkt_trends_ts_index()
     total_attempts = success + len(failed)
 
-    if total_attempts != 0 and success / total_attempts < 0.5:
+    if total_attempts != 0 and success / total_attempts < self.LOAD_SUCCESS_THRESHOLD:
       self.logger.error(f"Less than 50% success rate. Only {success} out of {total_attempts} documents updated.")
 
       self.datastore.summarize_update_failures(failed)
@@ -172,7 +175,7 @@ class AbsorptionRateProcessor(BaseETLProcessor):
         if pd.isna(absorption_rate):
           absorption_rate = None
         else:
-          absorption_rate = round(float(absorption_rate), 4)
+          absorption_rate = round(float(absorption_rate), self.ABSORPTION_RATE_ROUND_DIGITS)
 
         yield {
           "_op_type": "update",
@@ -316,35 +319,35 @@ if __name__ == '__main__':
 +-------------+---------------+---------------+--------------+----------------+
 """
 
-""" Sample doc from the mkt_trends_ts index: 
+""" Sample doc from the mkt_trends_current index: 
 {'geog_id': 'g30_dpz89rm7',
  'propertyType': 'DETACHED',
  'geo_level': 30,
- 'metrics': {'median_price': [{'date': '2023-01', 'value': 1789000.0},
-   {'date': '2023-02', 'value': 1320000.0},
-   {'date': '2023-03', 'value': 1352500.0},
-   {'date': '2023-04', 'value': 1550000.0},
-   {'date': '2023-05', 'value': 1900000.0},
-   {'date': '2023-06', 'value': 1915000.0},
+ 'metrics': {'median_price': [{'month': '2023-01', 'value': 1789000.0},
+   {'month': '2023-02', 'value': 1320000.0},
+   {'month': '2023-03', 'value': 1352500.0},
+   {'month': '2023-04', 'value': 1550000.0},
+   {'month': '2023-05', 'value': 1900000.0},
+   {'month': '2023-06', 'value': 1915000.0},
       etc
-   {'date': '2024-06', 'value': 1350000.0},
-   {'date': '2024-07', 'value': 1261750.0}],
+   {'month': '2024-06', 'value': 1350000.0},
+   {'month': '2024-07', 'value': 1261750.0}],
 
-  'median_dom': [{'date': '2023-01', 'value': 2.0},
-   {'date': '2023-02', 'value': 7.0},
-   {'date': '2023-03', 'value': 7.0},
-   {'date': '2023-04', 'value': 8.0},
-   {'date': '2023-05', 'value': 11.5},
-   {'date': '2023-06', 'value': 9.0},
-   {'date': '2023-07', 'value': 11.0},
+  'median_dom': [{'month': '2023-01', 'value': 2.0},
+   {'month': '2023-02', 'value': 7.0},
+   {'month': '2023-03', 'value': 7.0},
+   {'month': '2023-04', 'value': 8.0},
+   {'month': '2023-05', 'value': 11.5},
+   {'month': '2023-06', 'value': 9.0},
+   {'month': '2023-07', 'value': 11.0},
       etc.
-   {'date': '2024-06', 'value': 9.0},
-   {'date': '2024-07', 'value': 14.5}],
+   {'month': '2024-06', 'value': 9.0},
+   {'month': '2024-07', 'value': 14.5}],
 
-  'last_mth_median_asking_price': {'date': '2024-07', 'value': 1500000.0},
-  'last_mth_new_listings': {'date': '2024-07', 'value': 887},
+  'last_mth_median_asking_price': [{'month': '2024-07', 'value': 1500000.0}],
+  'last_mth_new_listings': [{'month': '2024-07', 'value': 887}],
 
-  'absorption_rate': [{'date': '2024-07', 'value': 0.0374}]},
+  'absorption_rate': [{'month': '2024-07', 'value': 0.0374}]},
 
  'last_updated': '2024-08-02T04:51:04.199475'}
 """  

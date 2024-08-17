@@ -325,6 +325,9 @@ class Datastore:
     elif index == self.listing_tracking_index_name:
       date_format = '%Y-%m-%dT%H:%M:%S.%f'
       pertinent_time_field = 'addedOn'
+    elif index == self.geo_index_name or index == self.geo_details_en_index_name:
+      date_format = None       # TODO: decide later on date range filtering
+      pertinent_time_field = None
     elif start_time is not None or end_time is not None:
       raise NotImplementedError(f"start_time or end_time provided but {index} need date format and pertinent_time_field.")
     
@@ -870,7 +873,11 @@ class Datastore:
                                 right_on=['MLS', 'CITY', 'PROV_STATE'], 
                                 how='left')
 
-      sold_listing_df['guid'] = sold_listing_df['GEOGRAPHIES']
+      # sold_listing_df['guid'] = sold_listing_df['GEOGRAPHIES']
+      for index, row in sold_listing_df.iterrows():
+        if pd.isna(row['guid']) or row['guid'] == '':
+          sold_listing_df.at[index, 'guid'] = row['GEOGRAPHIES']
+
       sold_listing_df.drop(columns=['MLS', 'CITY', 'PROV_STATE', 'GEOGRAPHIES'], inplace=True)
       len_after_sold_listing = len(sold_listing_df)
 
@@ -878,6 +885,38 @@ class Datastore:
 
       self.cache.set(key=sold_listing_cache_key, value=sold_listing_df)
 
+ 
+  def _update_es_sold_listings_with_guid(self):
+    '''
+    Fix legacy sold listings with guid (aka geog_id).
+    Run this only after carefully preparing one_year_sold_listing
+    '''
+    sold_listing_df = self.cache.get('one_year_sold_listing')
+    def generate_updates():
+      for _, row in sold_listing_df.iterrows():
+        if pd.notna(row['guid']):
+          yield {
+            '_op_type': 'update',
+            '_index': self.datastore.sold_listing_index_name,
+            '_id': row['_id'],
+            'doc': {
+              'guid': row['guid'] if pd.notna(row['guid']) else None
+            }
+          }
+
+    # Perform bulk update
+    bulk(self.datastore.es, generate_updates())
+
+
+  def _delete_computed_guid(self, index_name: str):
+    sold_listing_cache_keys = ['five_years_sold_listing', 'one_year_sold_listing']
+
+    for sold_listing_cache_key in sold_listing_cache_keys:
+      sold_listing_df = self.cache.get(sold_listing_cache_key)
+
+      sold_listing_df.loc[sold_listing_df['computed_guid'].notnull(), ['guid', 'computed_guid']] = None
+
+      self.cache.set(sold_listing_cache_key, sold_listing_df)
 
 
   def get_geos(self, selects: List[str]=None, return_df=True):

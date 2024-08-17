@@ -24,10 +24,19 @@ class Archiver:
     timestamp = datetime.now().strftime("%Y%m%d")
     
     if isinstance(data, pd.DataFrame):
-      filename = f"{name}_{timestamp}_df"
+      filename = f"{name}_{timestamp}_df.txt"
+      dtype_filename = f"{name}_{timestamp}_dtypes.json"
       filepath = self.archive_dir / filename
+      dtype_filepath = self.archive_dir / dtype_filename
       try:
-        data.to_feather(filepath)
+        # Save dataframe to csv with tab delimiter
+        # data.to_feather(filepath)
+        data.to_csv(filepath, sep='\t', index=False)
+
+        # Save the data types
+        dtypes = data.dtypes.apply(lambda x: str(x)).to_dict()
+        dtype_filepath.write_text(json.dumps(dtypes, indent=2))
+        
         self.logger.info(f"Successfully archived DataFrame {name} to {filepath}")
         return True
       except Exception as e:
@@ -68,12 +77,13 @@ class Archiver:
     """
     if timestamp:
       json_filepath = self.archive_dir / f"{name}_{timestamp}.json"
-      df_filepath = self.archive_dir / f"{name}_{timestamp}_df"
+      df_filepath = self.archive_dir / f"{name}_{timestamp}_df.txt"
+      dtype_filepath = self.archive_dir / f"{name}_{timestamp}_dtypes.json"
       txt_filepath = self.archive_dir / f"{name}_{timestamp}.txt"
     else:
       # Get the most recent archive if no timestamp is specified
       json_files = list(self.archive_dir.glob(f"{name}_*.json"))
-      df_files = list(self.archive_dir.glob(f"{name}_*_df"))
+      df_files = list(self.archive_dir.glob(f"{name}_*_df.txt"))
       txt_files = list(self.archive_dir.glob(f"{name}_*.txt"))
 
       if not json_files and not df_files and not txt_files:
@@ -82,11 +92,19 @@ class Archiver:
       
       json_filepath = max(json_files, key=lambda p: p.stat().st_mtime) if json_files else None
       df_filepath = max(df_files, key=lambda p: p.stat().st_mtime) if df_files else None
+      dtype_filepath = self.archive_dir / f"{df_filepath.stem.split('_df')[0]}_dtypes.json" if df_filepath else None
       txt_filepath = max(txt_files, key=lambda p: p.stat().st_mtime) if txt_files else None
 
     if df_filepath and df_filepath.exists():
       try:
-        df = pd.read_feather(df_filepath)
+        # Load dtypes
+        if dtype_filepath and dtype_filepath.exists():
+          dtypes = json.loads(dtype_filepath.read_text())
+        else:
+          dtypes = None
+
+        # df = pd.read_feather(df_filepath)
+        df = pd.read_csv(df_filepath, sep='\t', dtype=dtypes)
         self.logger.info(f"Successfully retrieved DataFrame archive {df_filepath.name}")
         return df
       except Exception as e:
@@ -122,9 +140,11 @@ class Archiver:
     """
     if name:
       json_files = self.archive_dir.glob(f"{name}_*.json")
-      df_files = self.archive_dir.glob(f"{name}_*_df")
+      df_files = self.archive_dir.glob(f"{name}_*_df.txt")
+      txt_files = [f for f in self.archive_dir.glob(f"{name}_*.txt") if not f.name.endswith('_df.txt')]
     else:
       json_files = self.archive_dir.glob("*.json")
-      df_files = self.archive_dir.glob("*_df")
+      df_files = self.archive_dir.glob("*_df.txt")
+      txt_files = [f for f in self.archive_dir.glob("*.txt") if not f.name.endswith('_df.txt')]
     
-    return sorted([f.name for f in json_files] + [f.name for f in df_files])
+    return sorted([f.name for f in json_files] + [f.name for f in df_files] + [f.name for f in txt_files])

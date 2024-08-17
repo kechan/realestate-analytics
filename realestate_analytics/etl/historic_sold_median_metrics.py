@@ -24,7 +24,8 @@ def compute_metrics(df, date_mask, geo_level):
   metrics = grouped.agg({
       'soldPrice': 'median',
       'daysOnMarket': 'median',
-      'sold_over_ask': lambda x: (x.sum() / len(x)) * 100  # Percentage over ask
+      'sold_over_ask': lambda x: (x.sum() / len(x)) * 100,  # Percentage over ask
+      'sold_below_ask': lambda x: (x.sum() / len(x)) * 100  # Percentage below ask
   }).reset_index()
 
   # Calculate metrics for all property types combined
@@ -32,7 +33,8 @@ def compute_metrics(df, date_mask, geo_level):
   metrics_all = grouped_all.agg({
     'soldPrice': 'median',
     'daysOnMarket': 'median',
-    'sold_over_ask': lambda x: (x.sum() / len(x)) * 100  # Percentage over ask
+    'sold_over_ask': lambda x: (x.sum() / len(x)) * 100,  # Percentage over ask
+    'sold_below_ask': lambda x: (x.sum() / len(x)) * 100  # Percentage below ask
   }).reset_index()
   # Add a 'propertyType' column with None value for the combined metrics
   metrics_all['propertyType'] = None
@@ -50,9 +52,12 @@ def compute_metrics(df, date_mask, geo_level):
   over_ask_series = metrics_combined.pivot(index=[f'geog_id_{geo_level}', 'propertyType'], 
                                 columns='lastTransition', 
                                 values='sold_over_ask')
+  below_ask_series = metrics_combined.pivot(index=[f'geog_id_{geo_level}', 'propertyType'],
+                                columns='lastTransition',
+                                values='sold_below_ask')
   
   # Rename columns to YYYY-MM format
-  for series in [price_series, dom_series, over_ask_series]:
+  for series in [price_series, dom_series, over_ask_series, below_ask_series]:
     series.columns = series.columns.strftime('%Y-%m')
 
     # Remove the 'lastTransition' label from the column index
@@ -82,7 +87,7 @@ def compute_metrics(df, date_mask, geo_level):
   # price_series['propertyType'] = price_series['propertyType'].where(price_series['propertyType'].notna(), None)
   # dom_series['propertyType'] = dom_series['propertyType'].where(dom_series['propertyType'].notna(), None)
 
-  return price_series, dom_series, over_ask_series
+  return price_series, dom_series, over_ask_series, below_ask_series
 
 
 class SoldMedianMetricsProcessor(BaseETLProcessor):
@@ -95,10 +100,12 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     self.final_price_series = None
     self.final_dom_series = None
     self.final_over_ask_series = None
+    self.final_below_ask_series = None
 
     self.diff_price_series = None
     self.diff_dom_series = None
     self.diff_over_ask_series = None
+    self.diff_below_ask_series = None
 
     self.sold_listing_selects = [
       'mls',
@@ -114,6 +121,16 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       'guid'
     ]
 
+    # The number of days to look back for sold and current listings in the delta load
+    # this creates a margin of safety for not missing anything.
+    self.DELTA_SOLD_LISTINGS_LOOKBACK_DAYS = 21
+
+    self.geo_levels = [10, 20, 30, 40]
+
+    self.OVER_ASK_PERC_ROUND_DIGITS = 2
+    self.BELOW_ASK_PERC_ROUND_DIGITS = 2
+
+    self.LOAD_SUCCESS_THRESHOLD = 0.5
 
   def extract(self, from_cache=False):
     super().extract(from_cache=from_cache)
@@ -150,7 +167,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
           raise ValueError("Cache is inconsistent. Missing prior sold_listing_df.")
         
         # get the sold listings from last run till now
-        start_time = last_run - timedelta(days=21)    # load from 21 days before last run to have bigger margin of safety.
+        start_time = last_run - timedelta(days=self.DELTA_SOLD_LISTINGS_LOOKBACK_DAYS)    # load from 21 days before last run to have bigger margin of safety.
         end_time = self.get_current_datetime()
 
         success, delta_sold_listing_df = self.datastore.get_sold_listings(
@@ -165,7 +182,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
         # merge delta with whole
         self.sold_listing_df = pd.concat([self.sold_listing_df, delta_sold_listing_df], axis=0, ignore_index=True)
-        self.sold_listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='last')
+        self.sold_listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='first')   # TODO: keep first to preserve hacked guid, undo this later
 
         # get rid of stuff older than 5 years (but incl. the full 1st month)
         len_sold_listing_df_before_delete = len(self.sold_listing_df)
@@ -223,6 +240,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       self.diff_price_series = self.cache.get(f"{self.job_id}_diff_price_series")
       self.diff_dom_series = self.cache.get(f"{self.job_id}_diff_dom_series")
       self.diff_over_ask_series = self.cache.get(f"{self.job_id}_diff_over_ask_series")
+      self.diff_below_ask_series = self.cache.get(f"{self.job_id}_diff_below_ask_series")
       return
 
     try:
@@ -234,35 +252,43 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       prev_price_series = self.cache.get('five_years_price_series')
       prev_dom_series = self.cache.get('five_years_dom_series')
       prev_over_ask_series = self.cache.get('five_years_over_ask_series')
+      prev_below_ask_series = self.cache.get('five_years_below_ask_series')
 
-      if prev_price_series is None or prev_dom_series is None or prev_over_ask_series is None:
+      if (prev_price_series is None or prev_dom_series is None or 
+          prev_over_ask_series is None or prev_below_ask_series is None):
         self.logger.info("No previous times series found. Keeping entire currently computed time series.")
         self.diff_price_series = self.final_price_series
         self.diff_dom_series = self.final_dom_series
         self.diff_over_ask_series = self.final_over_ask_series
+        self.diff_below_ask_series = self.final_below_ask_series
       else:
         self.logger.info("Previous times series found. Computing update delta.")
         self.diff_price_series = self._get_delta_dataframe(self.final_price_series, prev_price_series)
         self.diff_dom_series = self._get_delta_dataframe(self.final_dom_series, prev_dom_series)
         self.diff_over_ask_series = self._get_delta_dataframe(self.final_over_ask_series, prev_over_ask_series)
+        self.diff_below_ask_series = self._get_delta_dataframe(self.final_below_ask_series, prev_below_ask_series)
 
       self.logger.info(f'Prepared to update {len(self.diff_price_series)} price time series, '
                          f'{len(self.diff_dom_series)} DOM time series, and '
-                         f'{len(self.diff_over_ask_series)} over-ask percentage time series.')
+                         f'{len(self.diff_over_ask_series)} over-ask percentage time series.'
+                         f'{len(self.diff_below_ask_series)} below-ask percentage time series.')
 
       # Cache the current data for the next run
       self.cache.set('five_years_price_series', self.final_price_series)
       self.cache.set('five_years_dom_series', self.final_dom_series)
       self.cache.set('five_years_over_ask_series', self.final_over_ask_series)
+      self.cache.set('five_years_below_ask_series', self.final_below_ask_series)
 
       # checkpoint the diff_*_series
       self.diff_price_series.reset_index(drop=True, inplace=True)
       self.diff_dom_series.reset_index(drop=True, inplace=True)
       self.diff_over_ask_series.reset_index(drop=True, inplace=True)
+      self.diff_below_ask_series.reset_index(drop=True, inplace=True)
 
       self.cache.set(f"{self.job_id}_diff_price_series", self.diff_price_series)
       self.cache.set(f"{self.job_id}_diff_dom_series", self.diff_dom_series)
       self.cache.set(f"{self.job_id}_diff_over_ask_series", self.diff_over_ask_series)
+      self.cache.set(f"{self.job_id}_diff_below_ask_series", self.diff_below_ask_series)
 
       self._mark_success('transform')
 
@@ -279,7 +305,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     success, failed = self.update_mkt_trends_ts_index()
     total_attempts = success + len(failed)
 
-    if total_attempts != 0 and success / total_attempts < 0.5:
+    if total_attempts != 0 and success / total_attempts < self.LOAD_SUCCESS_THRESHOLD:
       self.logger.error(f"Less than 50% success rate. Only {success} out of {total_attempts} documents updated.")
 
       self.datastore.summarize_update_failures(failed)
@@ -293,8 +319,10 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     super().cleanup()
     
     cache_keys = ['five_years_sold_listing',
-                  'five_years_dom_series_df',
-                  'five_years_price_series_df'
+                  'five_years_dom_series',
+                  'five_years_price_series',
+                  'five_years_over_ask_series',
+                  'five_years_below_ask_series'
                   ]
     
     for key in cache_keys:
@@ -304,6 +332,21 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
         self.logger.error(f"Error deleting cache key {key}: {e}")
 
     self.logger.info("Cache cleanup complete.")
+
+    # Reset instance variables
+    self.sold_listing_df = None
+
+    self.final_price_series = None
+    self.final_dom_series = None
+    self.final_over_ask_series = None
+    self.final_below_ask_series = None
+
+    self.diff_price_series = None
+    self.diff_dom_series = None
+    self.diff_over_ask_series = None
+    self.diff_below_ask_series = None
+
+    self.logger.info("Instance variables reset.")
 
     # remove metrics from mkt_trends_ts index
     # updated, failures = self.remove_metrics_from_mkt_trends_ts()
@@ -320,8 +363,9 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
     self.sold_listing_df.lastTransition = pd.to_datetime(self.sold_listing_df.lastTransition)
 
-    # Add 'sold_over_ask' (a boolean column)
+    # Add 'sold_over_ask' and 'sold_below_ask' (a boolean column)
     self.sold_listing_df['sold_over_ask'] = self.sold_listing_df['soldPrice'] > self.sold_listing_df['price']
+    self.sold_listing_df['sold_below_ask'] = self.sold_listing_df['soldPrice'] < self.sold_listing_df['price']
 
     # Create a boolean mask for the date range filter
     date_mask = (
@@ -344,26 +388,29 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     #   raise ValueError("No data available for the specified date range")
 
     # Compute metrics for each geographic level and concat into a single dataframe
-    levels = [10, 20, 30, 40]
     all_price_series = []
     all_dom_series = []
     all_over_ask_series = []
+    all_below_ask_series = []
 
-    for level in levels:
-      price_series, dom_series, over_ask_series = compute_metrics(self.sold_listing_df, date_mask, level)
+    for level in self.geo_levels:
+      price_series, dom_series, over_ask_series, below_ask_series = compute_metrics(self.sold_listing_df, date_mask, level)
 
       price_series['geo_level'] = level
       dom_series['geo_level'] = level
       over_ask_series['geo_level'] = level
+      below_ask_series['geo_level'] = level
 
       all_price_series.append(price_series)
       all_dom_series.append(dom_series)
       all_over_ask_series.append(over_ask_series)
+      all_below_ask_series.append(below_ask_series)
 
     # Combine results from all levels
     self.final_price_series = pd.concat(all_price_series, ignore_index=True)
     self.final_dom_series = pd.concat(all_dom_series, ignore_index=True)
     self.final_over_ask_series = pd.concat(all_over_ask_series, ignore_index=True)
+    self.final_below_ask_series = pd.concat(all_below_ask_series, ignore_index=True)
 
 
   def add_geog_ids_to_sold_listings(self):    
@@ -398,7 +445,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     else:
       if 'guid' in self.sold_listing_df.columns:
         geo_data = self.sold_listing_df.guid.apply(parse_geog_ids)
-        for level in ['10', '20', '30', '40']:
+        for level in self.geo_levels:
           self.sold_listing_df[f'geog_id_{level}'] = geo_data.apply(lambda x: x.get(f'geog_id_{level}'))
       else:
         self.logger.error("No GUID column found in sold_listing_df. Cannot proceed with geog_id mapping.")
@@ -530,7 +577,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
             if pd.notna(value):
               new_metrics["over_ask_percentage"].append({
                 "month": month,
-                "value": round(float(value), 2)
+                "value": round(float(value), self.OVER_ASK_PERC_ROUND_DIGITS)
               })
 
         property_type_id = "ALL" if row['propertyType'] is None else row['propertyType']
@@ -546,6 +593,57 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
               ctx._source.metrics = new HashMap();
             }
             ctx._source.metrics.over_ask_percentage = params.new_metrics.over_ask_percentage;
+            ctx._source.geog_id = params.geog_id;
+            ctx._source.propertyType = params.propertyType;
+            ctx._source.geo_level = params.geo_level;
+            ctx._source.last_updated = params.last_updated;
+            """,
+            "params": {
+              "new_metrics": new_metrics,
+              "geog_id": row['geog_id'],
+              "propertyType": property_type_id,
+              "geo_level": int(row['geo_level']),
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          },
+          "upsert": {
+            "geog_id": row['geog_id'],
+            "propertyType": property_type_id,
+            "geo_level": int(row['geo_level']),
+            "metrics": new_metrics,
+            "last_updated": self.get_current_datetime().isoformat()
+          }
+        }
+
+      # Process below-ask % series
+      for _, row in self.diff_below_ask_series.iterrows():
+        new_metrics = {
+          "below_ask_percentage": []
+        }
+
+        for col in self.diff_below_ask_series.columns:
+          if col.startswith('20'):
+            month = col
+            value = row[col]
+            if pd.notna(value):
+              new_metrics["below_ask_percentage"].append({
+                "month": month,
+                "value": round(float(value), self.BELOW_ASK_PERC_ROUND_DIGITS)
+              })
+
+        property_type_id = "ALL" if row['propertyType'] is None else row['propertyType']
+        composite_id = f"{row['geog_id']}_{property_type_id}"
+
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_index_name,
+          "_id": composite_id,
+          "script": {
+            "source": """
+            if (ctx._source.metrics == null) {
+              ctx._source.metrics = new HashMap();
+            }
+            ctx._source.metrics.below_ask_percentage = params.new_metrics.below_ask_percentage;
             ctx._source.geog_id = params.geog_id;
             ctx._source.propertyType = params.propertyType;
             ctx._source.geo_level = params.geo_level;
@@ -623,7 +721,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
     return success, failed
 
-
+  """
   def _update_es_sold_listings_with_guid(self) -> None:
     '''
     Fix legacy sold listings with guid (aka geog_id).
@@ -642,7 +740,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
     # Perform bulk update
     bulk(self.datastore.es, generate_updates())
-
+  """
 
   def _get_delta_dataframe(self, current_df, prev_df) -> pd.DataFrame:
     """
@@ -716,6 +814,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     self.cache.delete(f"{self.job_id}_diff_price_series")
     self.cache.delete(f"{self.job_id}_diff_dom_series")
     self.cache.delete(f"{self.job_id}_diff_over_ask_series")
+    self.cache.delete(f"{self.job_id}_diff_below_ask_series")
 
 
 if __name__ == '__main__':
@@ -745,37 +844,53 @@ if __name__ == '__main__':
   # repeat the above steps every few days or weekly, this will allow a partial current month calculation.
 
 
-""" Sample doc from the mkt_trends_ts index: 
+""" Sample doc from the mkt_trends_current index: 
 {'geog_id': 'g30_dpz89rm7',
  'propertyType': 'DETACHED',
  'geo_level': 30,
- 'metrics': {'median_price': [{'date': '2023-01', 'value': 1789000.0},
-   {'date': '2023-02', 'value': 1320000.0},
-   {'date': '2023-03', 'value': 1352500.0},
-   {'date': '2023-04', 'value': 1550000.0},
+ 'metrics': {
+ 
+  'median_price': [{'month': '2023-01', 'value': 1789000.0},
+   {'month': '2023-02', 'value': 1320000.0},
+   {'month': '2023-03', 'value': 1352500.0},
+   {'month': '2023-04', 'value': 1550000.0},
    etc. etc. 
-   {'date': '2024-05', 'value': 1435000.0},
-   {'date': '2024-06', 'value': 1350000.0},
-   {'date': '2024-07', 'value': 1261750.0}],
-  'median_dom': [{'date': '2023-01', 'value': 2.0},
-   {'date': '2023-02', 'value': 7.0},
-   {'date': '2023-03', 'value': 7.0},
-   {'date': '2023-04', 'value': 8.0},
+   {'month': '2024-05', 'value': 1435000.0},
+   {'month': '2024-06', 'value': 1350000.0},
+   {'month': '2024-07', 'value': 1261750.0}],
+
+  'median_dom': [{'month': '2023-01', 'value': 2.0},
+   {'month': '2023-02', 'value': 7.0},
+   {'month': '2023-03', 'value': 7.0},
+   {'month': '2023-04', 'value': 8.0},
    etc. etc.
-   {'date': '2024-05', 'value': 9.0},
-   {'date': '2024-06', 'value': 9.0},
-   {'date': '2024-07', 'value': 14.5}],
-  'last_mth_median_asking_price': [{'date': '2024-07', 'value': 1500000.0}],
-  'last_mth_new_listings': [{'date': '2024-07', 'value': 887}],
-  'absorption_rate': [{'date': '2024-07', 'value': 0.0399}],
-  'over_ask_percentage': [{'date': '2023-01', 'value': 66.67},
-   {'date': '2023-02', 'value': 53.85},
-   {'date': '2023-03', 'value': 45.74},
-   {'date': '2023-04', 'value': 40.0},
+   {'month': '2024-05', 'value': 9.0},
+   {'month': '2024-06', 'value': 9.0},
+   {'month': '2024-07', 'value': 14.5}],
+
+  'last_mth_median_asking_price': [{'month': '2024-07', 'value': 1500000.0}],
+  'last_mth_new_listings': [{'month': '2024-07', 'value': 887}],
+  'absorption_rate': [{'month': '2024-07', 'value': 0.0399}],
+
+  'over_ask_percentage': [{'month': '2023-01', 'value': 66.67},
+   {'month': '2023-02', 'value': 53.85},
+   {'month': '2023-03', 'value': 45.74},
+   {'month': '2023-04', 'value': 40.0},
    etc. etc.
-   {'date': '2024-05', 'value': 50.8},
-   {'date': '2024-06', 'value': 50.41},
-   {'date': '2024-07', 'value': 36.67}]},
+   {'month': '2024-05', 'value': 50.8},
+   {'month': '2024-06', 'value': 50.41},
+   {'month': '2024-07', 'value': 36.67}],
+
+   'below_ask_percentage': [{'date': '2023-02', 'value': 25.0},
+    {'month': '2023-03', 'value': 20.0},
+    {'month': '2023-04', 'value': 27.27},
+    {'month': '2023-05', 'value': 52.38},
+    etc. etc.
+    {'month': '2024-06', 'value': 44.44},
+    {'month': '2024-07', 'value': 50.0},
+    {'month': '2024-08', 'value': 50.0}]
+   },
+
  'last_updated': '2024-08-08T03:59:24.281335'}
 """
 

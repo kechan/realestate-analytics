@@ -145,7 +145,7 @@ class TestComparableSolds(unittest.TestCase):
 
     def test_es_comparable_solds(self):
       sample_listing_id = random.choice(list(self.computed_results.keys()))
-      # sample_listing_id = '17220308'
+      sample_listing_id = '17220308'  # TODO: remove this for deployment
       
       # Get the pre-computed result for this listing
       pre_computed_result = self.computed_results[sample_listing_id]

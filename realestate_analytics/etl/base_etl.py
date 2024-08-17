@@ -190,10 +190,14 @@ class BaseETLProcessor(ABC):
       total_attempts = success + len(failed)
       if total_attempts == 0:
         self.logger.warning("No documents were attempted to be updated.")       
+      elif total_attempts != 0 and (success/total_attempts) < 0.5:
+        self.logger.error(f"Less than 50% of documents were successfully updated. Success rate: {success/total_attempts:.2f}")
+        raise Exception("Less than 50% of documents were successfully updated.")
+
       return success, failed
     except Exception as e:
       self.logger.error(f"Error in load: {e}", exc_info=True)
-      return 0, []
+      raise
     finally:
       self.post_load()
 

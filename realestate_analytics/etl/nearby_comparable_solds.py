@@ -154,8 +154,45 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
     super().extract(from_cache=from_cache)
 
 
-  def _extract_from_datastore(self):
+  def _extract_from_datastore(self, force_full_load_current=False):
+    """
+    Extract sold and current listings data from the datastore.
+
+    This method performs either a full load or an incremental load of data,
+    depending on whether it's the first run or a subsequent run. It handles
+    both sold listings and current active listings.
+
+    For sold listings:
+    - Always performs an incremental load if not the first run.
+    - Retrieves data for the past year.
+
+    For current listings:
+    - Performs a full load on first run or when force_full_load_current is True.
+    - Otherwise, performs an incremental load.
+
+    The method also handles inactive listings and removes known deletions.
+
+    Args:
+        force_full_load_current (bool, optional): If True, forces a full load
+            of current listings even if it's not the first run. Defaults to False.
+
+    Raises:
+        ValueError: If there's an error retrieving data from the datastore
+            or if the cache is inconsistent.
+
+    Side Effects:
+        - Updates self.sold_listing_df and self.listing_df with new data.
+        - Updates the cache with the latest data.
+        - Sets the last_run timestamp in the cache.
+        - Marks the 'extract' stage as successful upon completion.
+
+    Note:
+        This method uses a lookback period (DELTA_SOLD_LISTINGS_LOOKBACK_DAYS and
+        DELTA_CURRENT_LISTINGS_LOOKBACK_DAYS) to ensure no data is missed in
+        incremental loads.
+    """
     if self._was_success('extract'):  # load the cache and skip instead
+      self.logger.info("Extract stage already completed. Loading from cache.")
       self._load_from_cache()
       return
 
@@ -185,7 +222,8 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
           addedOn_end_time=end_time,
           updated_end_time=end_time,
           selects=self.current_listing_selects,
-          prov_code='ON'
+          prov_code='ON',
+          active=True
         )
         if not success:
           self.logger.error(f"failed to get current listings from {start_time} to {end_time}")
@@ -214,8 +252,11 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
           raise ValueError("Failed to retrieve delta sold listings")
         self.logger.info(f'Loaded {len(delta_sold_listing_df)} sold listings from {start_time} to {end_time}')
         
-        # Get the current ACTIVE listings from last run till now
-        start_time = last_run - timedelta(days=self.DELTA_CURRENT_LISTINGS_LOOKBACK_DAYS)   # load from 3 days before last run to have some margin of safety.
+        # Get the current ACTIVE listings
+        if force_full_load_current:
+          start_time = datetime(1970, 1, 1)     # distant past for full load
+        else:
+          start_time = last_run - timedelta(days=self.DELTA_CURRENT_LISTINGS_LOOKBACK_DAYS)   # load from 3 days before last run to have some margin of safety.
         # end time is same as above
         success, delta_listing_df = self.datastore.get_current_active_listings(
           use_script_for_last_update=True,      # TODO: remove after dev
@@ -224,7 +265,8 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
           updated_start_time=start_time,
           updated_end_time=end_time,
           selects=self.current_listing_selects,
-          prov_code='ON'
+          prov_code='ON',
+          active=True
           )
         if not success:
           self.logger.error(f"Failed to retrieve delta current active listings from {start_time} to {end_time}")
@@ -251,7 +293,7 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
 
         # Merging for sold listings
         self.sold_listing_df = pd.concat([self.sold_listing_df, delta_sold_listing_df], axis=0, ignore_index=True)
-        self.sold_listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='last')
+        self.sold_listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='first')   # TODO: keep first to preserve hacked guid, undo this later
         # get rid of stuff thats older than a year
         len_sold_listing_df_before_delete = len(self.sold_listing_df)
         one_year_ago_from_now = end_time - timedelta(days=365)
@@ -262,8 +304,12 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
         self.logger.info(f'removed {len_sold_listing_df_before_delete - len_sold_listing_df_after_delete} sold listings older than a year')
 
         # Merging for active listings
-        self.listing_df = pd.concat([self.listing_df, delta_listing_df], axis=0)   # delta is active at time of this query
-        self.listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='last')
+        if force_full_load_current:
+          self.listing_df = delta_listing_df
+        else:
+          self.listing_df = pd.concat([self.listing_df, delta_listing_df], axis=0)   # delta is active at time of this query
+          self.listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='last')
+
         # For managing non active listings
         self.listing_df = pd.concat([self.listing_df, delta_inactive_listing_df], axis=0)   # delta is non active at time of this query
         self.listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='last')
@@ -392,6 +438,8 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
     self.cache.delete('one_year_sold_listing')
     self.cache.delete('on_listing')
     self.cache.delete('comparable_sold_listings_result')
+
+    self.delete_checkpoints_data()
 
     # Reset instance variables
     self.sold_listing_df = None

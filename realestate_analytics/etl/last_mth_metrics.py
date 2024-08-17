@@ -37,6 +37,8 @@ class LastMthMetricsProcessor(BaseETLProcessor):
                 'lastUpdate'
                 ]
 
+    self.LOAD_SUCCESS_THRESHOLD = 0.5
+
   def setup_extra_stages(self, 
                          add_extra_stage: Callable[[str], None], 
                          add_extra_cleanup_stage: Callable[[str], None]) -> None:
@@ -127,7 +129,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
       success, failed = self.update_es_tracking_index()
       total_attempts = success + len(failed)
 
-      if total_attempts != 0 and success / total_attempts < 0.5:
+      if total_attempts != 0 and success / total_attempts < self.LOAD_SUCCESS_THRESHOLD:
         self.logger.error(f"Less than 50% success rate. Only {success} out of {total_attempts} documents updated.")
         self.datastore.summarize_update_failures(failed)
       else:
@@ -247,7 +249,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
       if not self._was_success('remove_deleted_listings'):
         success, failed = self.remove_deleted_listings()
         total_attempts = success + len(failed)
-        if total_attempts != 0 and success / total_attempts < 0.5:
+        if total_attempts != 0 and success / total_attempts < self.LOAD_SUCCESS_THRESHOLD:
           self.logger.error(f"Less than 50% success rate. Only {success} out of {total_attempts} documents deleted.")
           raise ValueError("Failed to remove deleted listings. This must be successful to proceed.")      
         else:
@@ -646,26 +648,26 @@ if __name__ == "__main__":
   {'geog_id': 'g30_dpz89rm7',
   'propertyType': 'SEMI-DETACHED',
   'geo_level': 30,
-  'metrics': {'median_price': [{'date': '2023-01', 'value': 1035000.0},
-    {'date': '2023-10', 'value': 1192000.0},
-    {'date': '2023-11', 'value': 1037500.0},
-    {'date': '2023-12', 'value': 976000.0},
-    {'date': '2024-01', 'value': 1075000.0},
-    {'date': '2024-02', 'value': 1201054.0},
-    {'date': '2024-03', 'value': 1175333.0},
-    {'date': '2024-04', 'value': 1159444.0},
-    {'date': '2024-06', 'value': 915000.0}],
-   'median_dom': [{'date': '2023-01', 'value': 3},
-    {'date': '2023-10', 'value': 9},
-    {'date': '2023-11', 'value': 15},
-    {'date': '2023-12', 'value': 33},
-    {'date': '2024-01', 'value': 9},
-    {'date': '2024-02', 'value': 8},
-    {'date': '2024-03', 'value': 8},
-    {'date': '2024-04', 'value': 8},
-    {'date': '2024-06', 'value': 49}],
-   'last_mth_median_asking_price': {'date': '2024-06', 'value': 1150000.0},
-   'last_mth_new_listings': {'date': '2024-06', 'value': 48}},
+  'metrics': {'median_price': [{'month': '2023-01', 'value': 1035000.0},
+    {'month': '2023-10', 'value': 1192000.0},
+    {'month': '2023-11', 'value': 1037500.0},
+    {'month': '2023-12', 'value': 976000.0},
+    {'month': '2024-01', 'value': 1075000.0},
+    {'month': '2024-02', 'value': 1201054.0},
+    {'month': '2024-03', 'value': 1175333.0},
+    {'month': '2024-04', 'value': 1159444.0},
+    {'month': '2024-06', 'value': 915000.0}],
+   'median_dom': [{'month': '2023-01', 'value': 3},
+    {'month': '2023-10', 'value': 9},
+    {'month': '2023-11', 'value': 15},
+    {'month': '2023-12', 'value': 33},
+    {'month': '2024-01', 'value': 9},
+    {'month': '2024-02', 'value': 8},
+    {'month': '2024-03', 'value': 8},
+    {'month': '2024-04', 'value': 8},
+    {'month': '2024-06', 'value': 49}],
+   'last_mth_median_asking_price': {'month': '2024-06', 'value': 1150000.0},
+   'last_mth_new_listings': {'month': '2024-06', 'value': 48}},
   'last_updated': '2024-07-24T21:33:28.443159'}
 
 """
