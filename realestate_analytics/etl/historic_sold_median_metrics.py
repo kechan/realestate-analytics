@@ -2,7 +2,7 @@ from typing import Dict, List, Union
 import pandas as pd
 import numpy as np
 
-import logging
+import logging, gc
 
 from datetime import datetime, date, timedelta
 import pytz
@@ -16,78 +16,6 @@ from elasticsearch.helpers import scan, bulk
 import realestate_core.common.class_extensions
 from realestate_core.common.class_extensions import *
 from realestate_core.common.utils import load_from_pickle, save_to_pickle, join_df
-
-# Function to compute metrics for a given geog level
-def compute_metrics(df, date_mask, geo_level):
-  # Group by geog_id, property type, and month, then calculate metrics
-  grouped = df[date_mask].groupby([f'geog_id_{geo_level}', 'propertyType', pd.Grouper(key='lastTransition', freq='M')])
-  metrics = grouped.agg({
-      'soldPrice': 'median',
-      'daysOnMarket': 'median',
-      'sold_over_ask': lambda x: (x.sum() / len(x)) * 100,  # Percentage over ask
-      'sold_below_ask': lambda x: (x.sum() / len(x)) * 100  # Percentage below ask
-  }).reset_index()
-
-  # Calculate metrics for all property types combined
-  grouped_all = df[date_mask].groupby([f'geog_id_{geo_level}', pd.Grouper(key='lastTransition', freq='M')])
-  metrics_all = grouped_all.agg({
-    'soldPrice': 'median',
-    'daysOnMarket': 'median',
-    'sold_over_ask': lambda x: (x.sum() / len(x)) * 100,  # Percentage over ask
-    'sold_below_ask': lambda x: (x.sum() / len(x)) * 100  # Percentage below ask
-  }).reset_index()
-  # Add a 'propertyType' column with None value for the combined metrics
-  metrics_all['propertyType'] = None
-
-  # Concatenate the property-specific and combined metrics
-  metrics_combined = pd.concat([metrics, metrics_all], ignore_index=True)
-  
-  # Pivot the data to create time series
-  price_series = metrics_combined.pivot(index=[f'geog_id_{geo_level}', 'propertyType'], 
-                                columns='lastTransition', 
-                                values='soldPrice')
-  dom_series = metrics_combined.pivot(index=[f'geog_id_{geo_level}', 'propertyType'], 
-                              columns='lastTransition', 
-                              values='daysOnMarket')
-  over_ask_series = metrics_combined.pivot(index=[f'geog_id_{geo_level}', 'propertyType'], 
-                                columns='lastTransition', 
-                                values='sold_over_ask')
-  below_ask_series = metrics_combined.pivot(index=[f'geog_id_{geo_level}', 'propertyType'],
-                                columns='lastTransition',
-                                values='sold_below_ask')
-  
-  # Rename columns to YYYY-MM format
-  for series in [price_series, dom_series, over_ask_series, below_ask_series]:
-    series.columns = series.columns.strftime('%Y-%m')
-
-    # Remove the 'lastTransition' label from the column index
-    series.columns.name = None
-
-    # Reset index to make geog_id and propertyType regular columns
-    # Rename the geog_id_<N> uniformly to geog_id
-    series.reset_index(inplace=True)
-    series.rename(columns={f'geog_id_{geo_level}': 'geog_id'}, inplace=True)
-
-    # Replace NaN with None in the propertyType 
-    series['propertyType'] = series['propertyType'].where(series['propertyType'].notna(), None)
-
-  # price_series.columns = price_series.columns.strftime('%Y-%m')
-  # dom_series.columns = dom_series.columns.strftime('%Y-%m')
-
-  # # Remove the 'lastTransition' label from the column index
-  # price_series.columns.name = None
-  # dom_series.columns.name = None
-  
-  # # Reset index to make geog_id and propertyType regular columns
-  # # Rename the geog_id_<N> uniformly to geog_id
-  # price_series = price_series.reset_index().rename(columns={f'geog_id_{geo_level}': 'geog_id'})
-  # dom_series = dom_series.reset_index().rename(columns={f'geog_id_{geo_level}': 'geog_id'})
-
-  # # Replace NaN with None in the propertyType 
-  # price_series['propertyType'] = price_series['propertyType'].where(price_series['propertyType'].notna(), None)
-  # dom_series['propertyType'] = dom_series['propertyType'].where(dom_series['propertyType'].notna(), None)
-
-  return price_series, dom_series, over_ask_series, below_ask_series
 
 
 class SoldMedianMetricsProcessor(BaseETLProcessor):
@@ -131,6 +59,8 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     self.BELOW_ASK_PERC_ROUND_DIGITS = 2
 
     self.LOAD_SUCCESS_THRESHOLD = 0.5
+
+    self.BATCH_SIZE_MONTHS = 12   # this is the batch size (in # of months) for the time series computation
 
   def extract(self, from_cache=False):
     super().extract(from_cache=from_cache)
@@ -234,7 +164,6 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
 
   def transform(self):
-
     if self._was_success('transform'):
       self.logger.info("Transform already successful. Loading checkpoint from cache.")
       self.diff_price_series = self.cache.get(f"{self.job_id}_diff_price_series")
@@ -244,9 +173,11 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       return
 
     try:
+      self.compute_5_year_metrics()  # compute and place results onto self.final_*_series
+
       # Add geog_ids to sold listings, this is needed only for legacy data
-      self.add_geog_ids_to_sold_listings()
-      self.compute_5_year_metrics()
+      # self.add_geog_ids_to_sold_listings()  # this could be obsolete
+      # self.compute_5_year_metrics_old()
 
       # optimize such that we don't update on things that didnt change from last run
       prev_price_series = self.cache.get('five_years_price_series')
@@ -296,6 +227,100 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       self.logger.error(f"Error occurred during transform: {e}")
       raise
 
+  def _get_batch(self, start_date, end_date):
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
+    mask = (
+      (self.sold_listing_df['lastTransition'] >= start_ts) &
+      (self.sold_listing_df['lastTransition'] < end_ts)
+    )
+    return self.sold_listing_df[mask]
+
+  def _expand_batch(self, batch_df):
+    # Step 1: Select only the relevant columns early to reduce memory usage
+    batch_df = batch_df[['_id', 'propertyType', 'soldPrice', 'daysOnMarket', 
+                         'lastTransition', 'price', 'guid']].copy()
+
+    # Step 2: Split the 'guid' column into lists
+    batch_df['geog_id'] = batch_df['guid'].str.split(',')
+
+    # Step 3: Explode the 'geog_id' list into separate rows
+    expanded_df = batch_df.explode('geog_id')
+
+    # Step 4: Calculate 'sold_over_ask' and 'sold_below_ask' in a vectorized way
+    expanded_df['sold_over_ask'] = expanded_df['soldPrice'] > expanded_df['price']
+    expanded_df['sold_below_ask'] = expanded_df['soldPrice'] < expanded_df['price']
+
+    # Step 5: Drop the now unnecessary 'guid' column
+    expanded_df = expanded_df.drop(columns=['guid'])
+
+    del batch_df
+    gc.collect()
+    
+    return expanded_df
+
+  def compute_metrics(self, df):
+    grouped = df.groupby(['geog_id', 'propertyType', pd.Grouper(key='lastTransition', freq='M')])
+    metrics = grouped.agg({
+      'soldPrice': 'median',
+      'daysOnMarket': 'median',
+      'sold_over_ask': lambda x: (x.sum() / len(x)) * 100,
+      'sold_below_ask': lambda x: (x.sum() / len(x)) * 100
+    }).reset_index()
+
+    # Calculate metrics for all property types combined
+    grouped_all = df.groupby(['geog_id', pd.Grouper(key='lastTransition', freq='M')])
+    metrics_all = grouped_all.agg({
+      'soldPrice': 'median',
+      'daysOnMarket': 'median',
+      'sold_over_ask': lambda x: (x.sum() / len(x)) * 100,
+      'sold_below_ask': lambda x: (x.sum() / len(x)) * 100
+    }).reset_index()
+    metrics_all['propertyType'] = None
+
+    metrics_combined = pd.concat([metrics, metrics_all], ignore_index=True)
+    
+    # Pivot the data to create time series
+    price_series = metrics_combined.pivot(index=['geog_id', 'propertyType'], 
+                                          columns='lastTransition', 
+                                          values='soldPrice')
+    dom_series = metrics_combined.pivot(index=['geog_id', 'propertyType'], 
+                                        columns='lastTransition', 
+                                        values='daysOnMarket')
+    over_ask_series = metrics_combined.pivot(index=['geog_id', 'propertyType'], 
+                                              columns='lastTransition', 
+                                              values='sold_over_ask')
+    below_ask_series = metrics_combined.pivot(index=['geog_id', 'propertyType'],
+                                              columns='lastTransition',
+                                              values='sold_below_ask')
+
+    # Rename columns to YYYY-MM format
+    for series in [price_series, dom_series, over_ask_series, below_ask_series]:
+      series.columns = series.columns.strftime('%Y-%m')
+
+      # Remove the 'lastTransition' label from the column index
+      series.columns.name = None
+
+      # Reset index to make geog_id and propertyType regular columns
+      # Rename the geog_id_<N> uniformly to geog_id
+      series.reset_index(inplace=True)
+
+      # Replace NaN with None in the propertyType 
+      series['propertyType'] = series['propertyType'].where(series['propertyType'].notna(), None)                                              
+
+    return price_series, dom_series, over_ask_series, below_ask_series
+
+  def _merge_series(self, series_list):
+    if not series_list:
+      return pd.DataFrame()
+
+    merged_df = series_list[0]
+    for series in series_list[1:]:
+      merged_df = pd.merge(merged_df, series, on=['geog_id', 'propertyType'], how='outer', suffixes=('', '_dup'))
+      # Drop duplicate columns if any
+      merged_df = merged_df.loc[:, ~merged_df.columns.str.endswith('_dup')]
+
+    return merged_df
 
   def load(self):
     if self._was_success('load'):
@@ -353,7 +378,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     # self.logger.info(f"Removed metrics from {updated} doc in mkt_trends_ts index with {len(failures)} failures.")
       
 
-  def compute_5_year_metrics(self):
+  def compute_5_year_metrics_old(self):
     # Construct date range for the past 60 full months plus the current month to date.
 
     current_date = self.get_current_datetime().date()
@@ -413,7 +438,62 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     self.final_below_ask_series = pd.concat(all_below_ask_series, ignore_index=True)
 
 
+  def compute_5_year_metrics(self):
+    current_date = self.get_current_datetime().date()
+    current_month_start = date(current_date.year, current_date.month, 1)
+    start_date = (current_month_start.replace(day=1) - pd.DateOffset(months=60)) #.date()
+    self.logger.info(f'Computing 5 yr metrics for start_date: {start_date} to current_date: {current_date}')
+
+    all_price_series = []
+    all_dom_series = []
+    all_over_ask_series = []
+    all_below_ask_series = []
+
+    # Convert current_date to a pandas.Timestamp
+    current_date_ts = pd.Timestamp(current_date)
+
+    self.sold_listing_df['guid'].replace("None", np.nan, inplace=True)
+    self.sold_listing_df.dropna(subset=['guid'], inplace=True)    # guid is None implies geog_id is unknown, and it can't contribute to any time series.
+
+    while start_date < current_date_ts:
+      # end_date = min(start_date + pd.DateOffset(months=self.BATCH_SIZE_MONTHS), current_date)
+      end_date = min(start_date + pd.DateOffset(months=self.BATCH_SIZE_MONTHS), current_date_ts)
+
+      batch_df = self._get_batch(start_date, end_date)
+      expanded_batch_df = self._expand_batch(batch_df)
+
+      price_series, dom_series, over_ask_series, below_ask_series = self.compute_metrics(expanded_batch_df)
+
+      all_price_series.append(price_series)
+      all_dom_series.append(dom_series)
+      all_over_ask_series.append(over_ask_series)
+      all_below_ask_series.append(below_ask_series)
+
+      start_date = end_date
+
+    # Merge results from all batches on 'geog_id' and 'propertyType'
+    self.final_price_series = self._merge_series(all_price_series)
+    self.final_dom_series = self._merge_series(all_dom_series)
+    self.final_over_ask_series = self._merge_series(all_over_ask_series)
+    self.final_below_ask_series = self._merge_series(all_below_ask_series)
+
+    # Add 'geo_level' column to each final series
+    def _extract_geo_level(geog_id):
+      match = re.match(r'g(\d+)_', geog_id)
+      if match:
+          return int(match.group(1))
+      return None  # or handle unexpected patterns as needed
+    
+    self.final_price_series['geo_level'] = self.final_price_series['geog_id'].apply(_extract_geo_level)
+    self.final_dom_series['geo_level'] = self.final_dom_series['geog_id'].apply(_extract_geo_level)
+    self.final_over_ask_series['geo_level'] = self.final_over_ask_series['geog_id'].apply(_extract_geo_level)
+    self.final_below_ask_series['geo_level'] = self.final_below_ask_series['geog_id'].apply(_extract_geo_level)
+
+
   def add_geog_ids_to_sold_listings(self):    
+    """
+    Warning: this method likely obsolete
+    """
     legacy_data_path = False   # TODO: remove this when guid bug is fixed on the ES.
 
     # Function to parse geog_ids

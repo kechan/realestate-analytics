@@ -345,6 +345,78 @@ def update_mkt_trends_ts_index(self):
 
     return success, failed
 
+# Function to compute metrics for a given geog level
+def compute_metrics(df, date_mask, geo_level):
+  # Group by geog_id, property type, and month, then calculate metrics
+  grouped = df[date_mask].groupby([f'geog_id_{geo_level}', 'propertyType', pd.Grouper(key='lastTransition', freq='M')])
+  metrics = grouped.agg({
+      'soldPrice': 'median',
+      'daysOnMarket': 'median',
+      'sold_over_ask': lambda x: (x.sum() / len(x)) * 100,  # Percentage over ask
+      'sold_below_ask': lambda x: (x.sum() / len(x)) * 100  # Percentage below ask
+  }).reset_index()
+
+  # Calculate metrics for all property types combined
+  grouped_all = df[date_mask].groupby([f'geog_id_{geo_level}', pd.Grouper(key='lastTransition', freq='M')])
+  metrics_all = grouped_all.agg({
+    'soldPrice': 'median',
+    'daysOnMarket': 'median',
+    'sold_over_ask': lambda x: (x.sum() / len(x)) * 100,  # Percentage over ask
+    'sold_below_ask': lambda x: (x.sum() / len(x)) * 100  # Percentage below ask
+  }).reset_index()
+  # Add a 'propertyType' column with None value for the combined metrics
+  metrics_all['propertyType'] = None
+
+  # Concatenate the property-specific and combined metrics
+  metrics_combined = pd.concat([metrics, metrics_all], ignore_index=True)
+  
+  # Pivot the data to create time series
+  price_series = metrics_combined.pivot(index=[f'geog_id_{geo_level}', 'propertyType'], 
+                                columns='lastTransition', 
+                                values='soldPrice')
+  dom_series = metrics_combined.pivot(index=[f'geog_id_{geo_level}', 'propertyType'], 
+                              columns='lastTransition', 
+                              values='daysOnMarket')
+  over_ask_series = metrics_combined.pivot(index=[f'geog_id_{geo_level}', 'propertyType'], 
+                                columns='lastTransition', 
+                                values='sold_over_ask')
+  below_ask_series = metrics_combined.pivot(index=[f'geog_id_{geo_level}', 'propertyType'],
+                                columns='lastTransition',
+                                values='sold_below_ask')
+  
+  # Rename columns to YYYY-MM format
+  for series in [price_series, dom_series, over_ask_series, below_ask_series]:
+    series.columns = series.columns.strftime('%Y-%m')
+
+    # Remove the 'lastTransition' label from the column index
+    series.columns.name = None
+
+    # Reset index to make geog_id and propertyType regular columns
+    # Rename the geog_id_<N> uniformly to geog_id
+    series.reset_index(inplace=True)
+    series.rename(columns={f'geog_id_{geo_level}': 'geog_id'}, inplace=True)
+
+    # Replace NaN with None in the propertyType 
+    series['propertyType'] = series['propertyType'].where(series['propertyType'].notna(), None)
+
+  # price_series.columns = price_series.columns.strftime('%Y-%m')
+  # dom_series.columns = dom_series.columns.strftime('%Y-%m')
+
+  # # Remove the 'lastTransition' label from the column index
+  # price_series.columns.name = None
+  # dom_series.columns.name = None
+  
+  # # Reset index to make geog_id and propertyType regular columns
+  # # Rename the geog_id_<N> uniformly to geog_id
+  # price_series = price_series.reset_index().rename(columns={f'geog_id_{geo_level}': 'geog_id'})
+  # dom_series = dom_series.reset_index().rename(columns={f'geog_id_{geo_level}': 'geog_id'})
+
+  # # Replace NaN with None in the propertyType 
+  # price_series['propertyType'] = price_series['propertyType'].where(price_series['propertyType'].notna(), None)
+  # dom_series['propertyType'] = dom_series['propertyType'].where(dom_series['propertyType'].notna(), None)
+
+  return price_series, dom_series, over_ask_series, below_ask_series
+
 
 
 '''
