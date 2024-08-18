@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Any, List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple, Callable
 from collections import defaultdict
 
 from dataclasses import dataclass, field
@@ -8,9 +8,12 @@ from shapely.geometry import Point, Polygon, MultiPolygon
 from shapely.validation import explain_validity
 import warnings
 
-import random
+import logging, random
 from pathlib import Path
 import pickle, dill
+from tqdm.auto import tqdm
+
+import pandas as pd
 
 import matplotlib.pyplot as plt
 import geopandas as gpd
@@ -63,7 +66,10 @@ class Geo:
   manage_manually: bool = False
   name_suggest: Optional[Dict[str, Any]] = None
 
+  logger: logging.Logger = field(init=False)
+
   def __post_init__(self):
+    self.logger = logging.getLogger(self.__class__.__name__)
     if self.geometry:
       polygons = [Polygon((lng, lat) for lat, lng in polygon_coords) 
                   for polygon_coords in self.geometry]
@@ -74,6 +80,7 @@ class Geo:
   def __setstate__(self, state):
     # Restore the object's state from the state dictionary
     self.__dict__.update(state)
+    self.logger = logging.getLogger(self.__class__.__name__)
     # Ensure overlaps field is initialized
     # if 'overlaps' not in state:
     #   self.overlaps = []    
@@ -284,7 +291,11 @@ class Geo:
 
 
 class GeoCollection:
+  logger = logging.getLogger(__name__)
+
   def __init__(self):
+    self.logger = logging.getLogger(self.__class__.__name__)
+
     self._geos: List[Geo] = []
     self._index_by_id: Dict[str, Geo] = {}
     self._index_by_level: Dict[int, List[Geo]] = defaultdict(list)
@@ -348,6 +359,34 @@ class GeoCollection:
     for geo in geo_list:
       collection.add(geo)
     return collection
+  
+  @classmethod
+  def from_datastore(cls, datastore: Datastore) -> 'GeoCollection':
+
+    geo_list = []
+    fail_list = []
+    for geo_base in datastore.search(index=datastore.geo_index_name, selects=['localLogicId', 'longId', 'path'], size=None):
+      geog_id = geo_base['localLogicId']
+
+      try:
+        geo = Geo.from_geog_id(geog_id=geog_id, datastore=datastore)
+        geo_list.append(geo)
+      except Exception as e:
+        cls.logger.warning(f"Error creating Geo object for {geog_id}: {e}")
+        fail_list.append(geog_id)
+
+    cls.logger.warning(f"Failed to create Geo objects for {len(fail_list)} geos")
+
+    # try again 2nd time for failed geos
+    for geog_id in fail_list:
+      try:
+        geo = Geo.from_geog_id(geog_id=geog_id, datastore=datastore)
+        geo_list.append(geo)
+      except Exception as e:
+        cls.logger.error(f"Error creating Geo object for {geog_id}: {e}")
+      
+    return cls.from_list(geo_list)
+
 
   def save(self, file_path: str, use_dill: bool = False) -> None:
     Geo.save_objects(self._geos, file_path, use_dill)
@@ -360,6 +399,69 @@ class GeoCollection:
     collection.restore_all_overlaps()  # overlaps geos are serialized as List[str] using the geog_id
 
     return collection
+
+
+  def assign_guids_to_listing_df(self, df: pd.DataFrame, filter: Callable = None, cutoff_timestamp: pd.Timestamp = None):
+    """
+    Compute, construct and assign guid to df. 
+
+    
+    """
+    assert 'lat' in df.columns and 'lng' in df.columns, "Latitude and longitude columns are required in the DataFrame"
+    
+    self.logger.info(f'# of geos in collection: {len(self)}')
+
+    def construct_guid(lat: float, lng: float) -> str:
+      levels = [40, 35, 30, 20, 10]
+      found_geos = []
+      searched_levels = set()
+
+      def search_geo(level, parent_geo=None):
+        """Search for the geo at the current level."""
+        if level in searched_levels:
+          return None
+        geos = parent_geo.children if parent_geo else self.get_by_level(level)
+        searched_levels.add(level)
+        for geo in geos:
+          if geo.contains_point(lat, lng):
+            return geo
+        return None
+
+      # Start from the coarsest level (40) and work down to the finest (10)
+      parent_geo = None
+      for level in levels:
+        geo = search_geo(level, parent_geo)
+        if geo:
+          if geo not in found_geos:
+            found_geos.append(geo)
+            # Check for overlaps at this level
+            for overlap_geo in geo.overlaps:
+              if overlap_geo.contains_point(lat, lng) and overlap_geo not in found_geos:
+                found_geos.append(overlap_geo)
+          parent_geo = geo
+        else:
+          parent_geo = None
+
+      # Construct the GUID string
+      guid = ','.join([geo.geog_id for geo in reversed(found_geos)])
+      return guid if guid else None
+    
+    if 'guid' not in df.columns:
+      df['guid'] = None
+
+    # Apply the filter to the DataFrame only if filter is not None
+    df_filtered = df[filter(df)] if filter is not None else df
+
+    total_rows = len(df_filtered)
+    for i, row in tqdm(df_filtered.iterrows(), total=total_rows):
+      if row['guid'] is None and (cutoff_timestamp is None or row['lastTransition'] < cutoff_timestamp):
+        lat, lng = row['lat'], row['lng']
+
+        # old_guid = row['guid']  # Fetch the old GUID for comparison    
+        guid = construct_guid(lat, lng)
+        
+        df.loc[i, 'computed_guid'] = None if guid == '' else guid
+        df.loc[i, 'guid'] = None if guid == '' else guid
 
   def restore_all_overlaps(self):
     """Restore overlaps for all geos after deserialization."""

@@ -178,10 +178,10 @@ def assign_guids_to_listing_df_top_down_nonrecursive(df: pd.DataFrame, geo_colle
     assert 'lat' in df.columns and 'lng' in df.columns, "Latitude and longitude columns are required in the DataFrame"
     
     if isinstance(geo_collection, (str, Path)):
-        geo_collection_path = Path(geo_collection_path)
+        geo_collection_path = Path(geo_collection)
         geo_collection = GeoCollection.load(geo_collection_path, use_dill=True)
 
-    print(f'# of geos in collection: {len(geo_collection.geos)}')
+    print(f'# of geos in collection: {len(geo_collection)}')
 
     def construct_guid(lat: float, lng: float, geo_collection: GeoCollection) -> str:
         levels = [40, 35, 30, 20, 10]
@@ -203,10 +203,13 @@ def assign_guids_to_listing_df_top_down_nonrecursive(df: pd.DataFrame, geo_colle
         parent_geo = None
         for level in levels:
             geo = search_geo(level, parent_geo)
-            
             if geo:
-                if not found_geos or found_geos[-1] != geo:
+                if geo not in found_geos:
                     found_geos.append(geo)
+                    # Check for overlaps at this level
+                    for overlap_geo in geo.overlaps:
+                        if overlap_geo.contains_point(lat, lng) and overlap_geo not in found_geos:
+                            found_geos.append(overlap_geo)
                 parent_geo = geo
             else:
                 parent_geo = None
@@ -214,7 +217,6 @@ def assign_guids_to_listing_df_top_down_nonrecursive(df: pd.DataFrame, geo_colle
         # Construct the GUID string
         guid = ','.join([geo.geog_id for geo in reversed(found_geos)])
         return guid if guid else None
-
     if 'guid' not in df.columns:
         df['guid'] = None
 
