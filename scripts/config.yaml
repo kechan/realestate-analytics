@@ -1,0 +1,19 @@
+# Elasticsearch Configuration
+es_host: "localhost"
+es_port: 9202
+
+# Logging Configuration
+log_level: "INFO"
+
+
+# ETL-specific configurations (if needed)
+# extraction:
+#   lookback_days: 30
+# 
+# transformation:
+#   batch_size: 1000
+# 
+# loading:
+#   bulk_size: 500
+
+# Any other configuration parameters specific to your ETL process can be added here

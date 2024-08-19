@@ -114,7 +114,7 @@ class BaseETLProcessor(ABC):
 
 
     # Allow subclasses to define extra stages before execution
-    self.setup_extra_stages(add_extra_stage, add_extra_cleanup_stage)
+    self.setup_extra_stages(add_extra_stage, add_extra_cleanup_stage)  # TODO: could this be moved to __init__?
 
     # run standard extract, transform, and load
     for stage in self.stages:

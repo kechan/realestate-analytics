@@ -90,6 +90,11 @@ class AbsorptionRateProcessor(BaseETLProcessor):
       raise ValueError("Missing sold_listing_df or listing_df. Cannot calculate absorption rates.")
     
     try:
+      # drop geog_id of "None" or None
+      self.sold_listing_df.drop(self.sold_listing_df[self.sold_listing_df['guid'].isin(["None", None])].index, inplace=True)
+      self.listing_df.drop(self.listing_df[self.listing_df['guid'].isin(["None", None])].index, inplace=True)
+
+        
       # Ensure datetime columns are in datetime format
       self.sold_listing_df['lastTransition'] = pd.to_datetime(self.sold_listing_df['lastTransition'])
       self.listing_df['addedOn'] = pd.to_datetime(self.listing_df['addedOn'])
@@ -110,14 +115,29 @@ class AbsorptionRateProcessor(BaseETLProcessor):
 
       def expand_guid(df):
         return df.assign(geog_id=df['guid'].str.split(',')).explode('geog_id')
-      
+
+      is_month_boundary = (current_date.day == 1)
+
       # Expand guid for both sold and current listings
       expanded_sold = expand_guid(prev_month_sold)
-      expanded_current = expand_guid(self.listing_df)
+
+      if is_month_boundary:
+        expanded_current = expand_guid(self.listing_df)
+        current_counts = expanded_current.groupby(['geog_id', 'propertyType']).size().reset_index(name='current_count')
+        self.archiver.archive(current_counts, f'current_listing_counts_{last_month_yearmonth}')
+        self.logger.info(f"Archived current listing counts for {last_month_yearmonth}.")
+      else:
+        current_counts = self.archiver.retrieve(f'current_listing_counts_{last_month_yearmonth}')   # load from archive
+        if current_counts is None:
+          # TODO: during dev, the snapshot for last mth may indeed be missing, we just use the current listing_df.
+          # This should be removed after a few successful end of mth runs after deployment
+          expanded_current = expand_guid(self.listing_df)
+          current_counts = expanded_current.groupby(['geog_id', 'propertyType']).size().reset_index(name='current_count')
+          self.logger.warning(f"Current listing counts for {last_month_yearmonth} not found in archive. Using current listing_df.")
 
       # Group by geog_id and propertyType
       sold_counts = expanded_sold.groupby(['geog_id', 'propertyType']).size().reset_index(name='sold_count')
-      current_counts = expanded_current.groupby(['geog_id', 'propertyType']).size().reset_index(name='current_count')
+      # current_counts = expanded_current.groupby(['geog_id', 'propertyType']).size().reset_index(name='current_count')
 
       # Merge the counts
       merged_counts = pd.merge(sold_counts, current_counts, on=['geog_id', 'propertyType'], how='outer').fillna(0)
@@ -151,7 +171,7 @@ class AbsorptionRateProcessor(BaseETLProcessor):
   def _load_from_cache(self):
     super()._load_from_cache()
     self.sold_listing_df = self.cache.get('one_year_sold_listing')
-    self.listing_df = self.cache.get('on_listing')
+    self.listing_df = self.cache.get('on_listing')   # from NearbyComparableSoldsProcessor
     
     if self.sold_listing_df is None or self.listing_df is None:
       self.logger.error("Missing sold_listing_df or listing_df.")

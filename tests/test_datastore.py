@@ -9,8 +9,8 @@ from realestate_analytics.data.es import Datastore
 class TestDatastore(unittest.TestCase):
   def setUp(self):
     _ = load_dotenv(find_dotenv())
-    self.es_host = os.getenv('ES_HOST')
-    self.es_port = int(os.getenv('ES_PORT'))
+    self.es_host = os.getenv('UAT_ES_HOST')
+    self.es_port = int(os.getenv('UAT_ES_PORT'))
     try:
       self.datastore = Datastore(host=self.es_host, port=self.es_port)
     except ValueError as e:

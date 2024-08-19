@@ -680,8 +680,11 @@ if __name__ == '__main__':
   )
 
   # during dev, we extract from PROD but update the UAT as a temporary workaround
-  processor.simulate_failure_at = 'transform'  
-  processor.run()
+  processor.simulate_failure_at = 'transform'
+  try:
+    processor.run()
+  except Exception as e:
+    print(f"Exception occurred: {e}")
 
   # during dev, continue to run against UAT
   processor = NearbyComparableSoldsProcessor(

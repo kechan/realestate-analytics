@@ -21,8 +21,8 @@ class TestAbsorptionRate(unittest.TestCase):
     cache_dir = Path(os.getenv('ANALYTICS_CACHE_DIR'))
     cls.cache = FileBasedCache(cache_dir=cache_dir)
 
-    es_host = os.getenv('ES_HOST')
-    es_port = int(os.getenv('ES_PORT'))
+    es_host = os.getenv('UAT_ES_HOST')
+    es_port = int(os.getenv('UAT_ES_PORT'))
     cls.datastore = Datastore(host=es_host, port=es_port)
 
     cls.processor = AbsorptionRateProcessor(

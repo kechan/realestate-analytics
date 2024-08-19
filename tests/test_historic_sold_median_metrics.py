@@ -19,8 +19,8 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
     # Set up the cache and load data
     _ = load_dotenv(find_dotenv())
     cache_dir = Path(os.getenv('ANALYTICS_CACHE_DIR'))
-    es_host = os.getenv('ES_HOST')
-    es_port = int(os.getenv('ES_PORT'))
+    es_host = os.getenv('UAT_ES_HOST')
+    es_port = int(os.getenv('UAT_ES_PORT'))
 
     cls.cache = FileBasedCache(cache_dir=cache_dir)
     cls.datastore = Datastore(host=es_host, port=es_port)

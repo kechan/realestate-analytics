@@ -27,8 +27,8 @@ class TestLastMthMetrics(unittest.TestCase):
     cls.listing_df.reset_index(drop=True, inplace=True)
     print(f'# of current listings: {cls.listing_df.shape[0]}')
 
-    es_host = os.getenv('ES_HOST')
-    es_port = int(os.getenv('ES_PORT'))
+    es_host = os.getenv('UAT_ES_HOST')
+    es_port = int(os.getenv('UAT_ES_PORT'))
     cls.datastore = Datastore(host=es_host, port=es_port)
     cls.bq_datastore = BigQueryDatastore()
 

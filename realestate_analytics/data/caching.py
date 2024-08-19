@@ -9,7 +9,9 @@ from realestate_core.common.class_extensions import *
 
 class FileBasedCache:
   def __init__(self, cache_dir: Union[str, Path] = None):
-    self.cache_dir = Path(cache_dir) if cache_dir else Path.home()/'tmp'/'listing_analytics_data'   # TODO: change this before deployment
+    self.cache_dir = Path(cache_dir) if cache_dir else None
+    if not cache_dir:
+      raise ValueError("cache_dir must be set")
     self.cache_dir.mkdir(parents=True, exist_ok=True)
 
   def list_keys(self) -> List[str]:
