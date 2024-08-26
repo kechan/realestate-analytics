@@ -161,9 +161,7 @@ class BaseETLProcessor(ABC):
     """
     self.logger.info("Starting full refresh...")
     self.cleanup()
-    self._extract()
-    self._transform()
-    self._load()
+    self.run()
     self.logger.info("Full refresh completed.")
 
   def _extract(self, from_cache=False):

@@ -1,5 +1,5 @@
 from pathlib import Path
-import json
+import json, re
 from datetime import datetime
 
 import pandas as pd
@@ -130,6 +130,29 @@ class Archiver:
       self.logger.warning(f"No archives found for {name}")
       return None
 
+
+  def get_latest_timestamp_in_YYYYMM(self, name: str) -> str:
+    """
+    Retrieves the latest timestamp for a given archive name in the format YYYYMM.
+    
+    :param name: The name of the archive to retrieve the latest timestamp for.
+    :return: The latest timestamp as a string in the format YYYYMM, or None if no archive found.
+    """
+    archives = self.list_archives(name)
+    timestamps = []
+
+    for archive_name in archives:
+      # Extract timestamp from filenames that match the expected pattern
+      match = re.search(rf"{name}_(\d{{6}})", archive_name)
+      if match:
+        timestamps.append(match.group(1))
+
+    if timestamps:
+      # Return the latest timestamp
+      return max(timestamps)
+    else:
+      self.logger.warning(f"No archives found for {name}")
+      return None
 
   def list_archives(self, name: str = None) -> list:
     """

@@ -1,9 +1,9 @@
 from __future__ import annotations
-from typing import Any, List, Dict, Optional, Tuple, Callable
+from typing import Any, List, Dict, Optional, Tuple, Callable, Union, TypeVar
 from collections import defaultdict
+from collections.abc import Sequence
 
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple
 from shapely.geometry import Point, Polygon, MultiPolygon
 from shapely.validation import explain_validity
 import warnings
@@ -13,6 +13,7 @@ from pathlib import Path
 import pickle, dill
 from tqdm.auto import tqdm
 
+import numpy as np
 import pandas as pd
 
 import matplotlib.pyplot as plt
@@ -20,6 +21,81 @@ import geopandas as gpd
 import contextily as ctx
 
 from ..data.es import Datastore
+
+
+def plot_geometries(geometries, names, geog_ids, figsize=(15, 15), point_of_interest=None):
+  """
+  Plot one or more geometries on a single map.
+
+  Args:
+    geometries (list): List of shapely geometries to plot.
+    names (list): List of names corresponding to each geometry.
+    geog_ids (list): List of geog_ids corresponding to each geometry.
+    figsize (tuple): Figure size for the plot. Default is (15, 15).
+    point_of_interest (tuple): Optional (lat, lng) to mark on the map.
+
+  Returns:
+    None. Displays the plot.
+  """
+  fig, ax = plt.subplots(figsize=figsize)
+
+  gdf_list = []
+  for geom, name, geog_id in zip(geometries, names, geog_ids):
+    if geom is not None:
+      gdf = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326")
+      gdf['name'] = name
+      gdf['geog_id'] = geog_id
+      gdf_list.append(gdf)
+
+  if not gdf_list:
+    print("No valid geometries found")
+    return
+
+  gdf_all = gpd.GeoDataFrame(pd.concat(gdf_list, ignore_index=True), crs="EPSG:4326")
+  gdf_projected = gdf_all.to_crs(epsg=3857)
+
+  # Plot the geometries with different colors
+  colors = plt.cm.Set3(np.linspace(0, 1, len(gdf_projected)))
+  gdf_projected.plot(ax=ax, color=colors, alpha=0.5, edgecolor='black', linewidth=2)
+
+  # Add point of interest if provided (now after main geometries but before labels and legends)
+  if point_of_interest:
+    lat, lng = point_of_interest
+    point = gpd.GeoDataFrame(geometry=[Point(lng, lat)], crs="EPSG:4326")
+    point_projected = point.to_crs(epsg=3857)
+    point_projected.plot(ax=ax, color='red', markersize=100, marker='o', label='Point of Interest')
+
+  # Add labels
+  for idx, row in gdf_projected.iterrows():
+    centroid = row.geometry.centroid
+    ax.annotate(text=row['name'], xy=(centroid.x, centroid.y), ha='center', va='center',
+                bbox=dict(facecolor='white', edgecolor='none', alpha=0.7, pad=1))
+
+  # Set plot bounds
+  ax.set_xlim(gdf_projected.total_bounds[[0, 2]])
+  ax.set_ylim(gdf_projected.total_bounds[[1, 3]])
+
+  # Add basemap
+  ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik, zoom='auto')
+
+  # Set title or legend based on number of geometries
+  if len(gdf_projected) == 1:
+    ax.set_title(f"{names[0]} ({geog_ids[0]})")
+  else:
+    legend_elements = [plt.Rectangle((0, 0), 1, 1, fc=color, alpha=0.5, ec='black') 
+                       for color in colors[:len(gdf_projected)]]
+    legend_labels = [f"{row['name']} ({row['geog_id']})" for _, row in gdf_projected.iterrows()]
+    if point_of_interest:
+      legend_elements.append(plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='red', 
+                                        markersize=10, label='Point of Interest'))
+      legend_labels.append('Point of Interest')
+    ax.legend(legend_elements, legend_labels, loc='upper left', bbox_to_anchor=(1, 1), 
+              title="Geos", fontsize='small')
+
+  ax.set_axis_off()
+
+  plt.tight_layout()
+  plt.show()
 
 @dataclass
 class Geo:
@@ -90,11 +166,67 @@ class Geo:
     state = self.__dict__.copy()
     # Convert overlaps from List[Geo] to List[str] for serialization
     state['overlaps'] = [geo.geog_id for geo in self.overlaps]
+
     return state
 
   def add_child(self, child: 'Geo'):
     child.parent_id = self.geog_id
     self.children.append(child)
+
+  def get_child_geo_collection(self):
+    return GeoCollection.from_list(self.children)
+
+  @property
+  def simplified_multipolygons(self) -> MultiPolygon:
+    if self._multipolygon is None:
+      return None
+
+    if isinstance(self._multipolygon, Polygon):
+      simplified = self._multipolygon.simplify(0.01, preserve_topology=True)
+      return MultiPolygon([simplified]) if simplified.geom_type == 'Polygon' else simplified
+    elif isinstance(self._multipolygon, MultiPolygon):
+      simplified_polys = [poly.simplify(0.01, preserve_topology=True) for poly in self._multipolygon.geoms]
+      return MultiPolygon(simplified_polys)
+    else:
+      self.logger.warning(f"Unexpected geometry type: {type(self._multipolygon)}")
+      return None
+      
+  @property
+  def simplified_geometry(self) -> List[List[List[float]]]:
+    simplified = self.simplified_multipolygons
+    if simplified is None:
+      return []
+
+    result = []
+    for polygon in simplified.geoms:
+      coords = list(polygon.exterior.coords)
+      # Convert to [lat, lng] and round
+      polygon_coords = [[round(lat, 6), round(lng, 6)] for lng, lat in coords]
+      result.append(polygon_coords)
+
+    return result
+  
+  @property
+  def simplified_geometry_lng_first(self) -> List[List[List[float]]]:
+    return self.geometry_lng_first(simplified=True)
+
+  
+  def geometry_lng_first(self, simplified=False) -> Optional[List[List[List[float]]]]:
+    """
+    Returns the geometry with coordinates swapped from [lat, lng] to [lng, lat].
+    
+    Returns:
+        Optional[List[List[List[float]]]]: Swapped geometry or None if no geometry exists.
+    """
+    if self.geometry is None:
+        return None
+    
+    return [
+        [
+            [coord[1], coord[0]] for coord in polygon
+        ]
+        for polygon in (self.simplified_geometry if simplified else self.geometry)
+    ]
 
   @property
   def is_neighbourhood(self) -> bool:
@@ -106,7 +238,7 @@ class Geo:
 
   @property
   def is_region(self) -> bool:
-    return self.level == 40
+    return self.level == 40 or self.level == 35
 
   def contains_point(self, lat: float, lng: float) -> bool:
     if self._multipolygon is None:
@@ -150,38 +282,90 @@ class Geo:
     if self._multipolygon is None:
       print(f"No geometry found for {self.name}")
       return
+    
+    plot_geometries(geometries=[self._multipolygon], 
+                    names=[self.name], 
+                    geog_ids=[self.geog_id], 
+                    figsize=figsize, 
+                    point_of_interest=point_of_interest)
 
-    fig, ax = plt.subplots(figsize=figsize)
+    # fig, ax = plt.subplots(figsize=figsize)
     
 
-    # Create a GeoDataFrame from this Geo object
-    gdf = gpd.GeoDataFrame(geometry=[self._multipolygon], crs="EPSG:4326")
-    gdf_projected = gdf.to_crs(epsg=3857)
+    # # Create a GeoDataFrame from this Geo object
+    # gdf = gpd.GeoDataFrame(geometry=[self._multipolygon], crs="EPSG:4326")
+    # gdf_projected = gdf.to_crs(epsg=3857)
     
-    # Plot the geometry
-    gdf_projected.plot(ax=ax, color='blue', alpha=0.5, edgecolor='black', linewidth=2)
+    # # Plot the geometry
+    # gdf_projected.plot(ax=ax, color='blue', alpha=0.5, edgecolor='black', linewidth=2)
     
-    # Set plot bounds
-    ax.set_xlim(gdf_projected.total_bounds[[0, 2]])
-    ax.set_ylim(gdf_projected.total_bounds[[1, 3]])
+    # # Set plot bounds
+    # ax.set_xlim(gdf_projected.total_bounds[[0, 2]])
+    # ax.set_ylim(gdf_projected.total_bounds[[1, 3]])
     
-    # Add basemap
-    ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik, zoom='auto')
+    # # Add basemap
+    # ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik, zoom='auto')
     
-    # Set title and remove axis
-    ax.set_title(f"{self.name} ({self.geog_id})")
-    ax.set_axis_off()
+    # # Set title and remove axis
+    # ax.set_title(f"{self.name} ({self.geog_id})")
+    # ax.set_axis_off()
     
-    # Add point of interest if provided
-    if point_of_interest:
-      lat, lng = point_of_interest
-      point = gpd.GeoDataFrame(geometry=[Point(lng, lat)], crs="EPSG:4326")
-      point_projected = point.to_crs(epsg=3857)
-      point_projected.plot(ax=ax, color='red', markersize=100, marker='o', label='Point of Interest')
-      plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    # # Add point of interest if provided
+    # if point_of_interest:
+    #   lat, lng = point_of_interest
+    #   point = gpd.GeoDataFrame(geometry=[Point(lng, lat)], crs="EPSG:4326")
+    #   point_projected = point.to_crs(epsg=3857)
+    #   point_projected.plot(ax=ax, color='red', markersize=100, marker='o', label='Point of Interest')
+    #   plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
     
-    plt.tight_layout()
-    plt.show()
+    # plt.tight_layout()
+    # plt.show()
+
+
+  def sample_random_point(self):
+    """
+    Sample a random point uniformly within the geographic area represented by this Geo object.
+
+    Returns:
+        tuple: A tuple containing (latitude, longitude) of the sampled point.
+                Returns None if the geometry is not defined.
+
+    Note:
+        This method uses rejection sampling with a convex hull approach.
+        It assumes that the _multipolygon attribute is using (longitude, latitude) 
+        coordinate order, which is common in GIS systems.
+    """
+    if self._multipolygon is None:
+      self.logger.warning(f"No geometry defined for {self.name} ({self.geog_id})")
+      return None
+
+    if isinstance(self._multipolygon, MultiPolygon):
+      # For multipolygons, choose a polygon based on area weights
+      areas = [p.area for p in self._multipolygon.geoms]
+      total_area = sum(areas)
+      weights = [area / total_area for area in areas]
+      chosen_poly = np.random.choice(self._multipolygon.geoms, p=weights)
+    else:
+      chosen_poly = self._multipolygon
+
+    convex_hull = chosen_poly.convex_hull
+    min_x, min_y, max_x, max_y = convex_hull.bounds
+    
+    max_attempts = 1000  # Limit the number of attempts to avoid infinite loops
+    
+    for _ in range(max_attempts):
+      x = np.random.uniform(min_x, max_x)
+      y = np.random.uniform(min_y, max_y)
+      point = Point(x, y)
+      
+      if chosen_poly.contains(point):
+        # Return as (latitude, longitude)
+        return (y, x)
+    
+    # If we couldn't find a point after max_attempts, fall back to a centroid
+    self.logger.warning(f"Could not sample random point for {self.name} ({self.geog_id}). Using centroid.")
+    centroid = chosen_poly.centroid
+    return (centroid.y, centroid.x)
 
   def __str__(self):
     # return f"{self.name} (Level {self.level})"
@@ -321,7 +505,7 @@ class GeoCollection:
   def filter(self, predicate) -> 'GeoCollection':
     return GeoCollection.from_list([geo for geo in self._geos if predicate(geo)])
 
-  def find_containing(self, lat: float, lng: float) -> List[Geo]:
+  def find_containing(self, lat: float, lng: float) -> 'GeoCollection':
     """
     Finds and returns a list of Geo objects that contain the given latitude and longitude.
 
@@ -332,12 +516,48 @@ class GeoCollection:
     Returns:
     List[Geo]: A list of Geo objects that contain the specified point.
     """
-    return [geo for geo in self._geos if geo.contains_point(lat, lng)]
+    # return [geo for geo in self._geos if geo.contains_point(lat, lng)]
+    return self.filter(lambda geo: geo.contains_point(lat, lng))
 
-  def random_sample(self) -> Optional[Geo]:
+  def sample(self) -> Optional[Geo]:
     if not self._geos:
       return None
     return random.choice(self._geos)
+
+ 
+  def search(self, query: str, level: Optional[int] = None) -> 'GeoCollection':
+    """
+    Search for Geo objects by name, optionally filtered by level.
+
+    Args:
+      query (str): The search query string.
+      level (Optional[int]): The geographic level to filter by (if provided).
+
+    Returns:
+      GeoCollection: A new GeoCollection containing Geo objects matching the search criteria.
+    """
+    query = query.lower()
+    matching_geos = [
+      geo for geo in self._geos
+      if query in geo.name.lower() and (level is None or geo.level == level)
+    ]
+    return GeoCollection.from_list(matching_geos)
+
+  def show(self, figsize=(10, 10), point_of_interest: tuple = None, max_geos=3):
+    """
+    show a max of max_geos geos on a map
+    """
+    geometries = []
+    names = []
+    geog_ids = []
+    for geo in self._geos[:max_geos]:
+      if geo._multipolygon is not None:
+        geometries.append(geo._multipolygon)
+        names.append(geo.name)
+        geog_ids.append(geo.geog_id)
+    
+    plot_geometries(geometries, names, geog_ids, 
+                    figsize=figsize, point_of_interest=point_of_interest)
 
   def __len__(self) -> int:
     return len(self._geos)
@@ -446,14 +666,12 @@ class GeoCollection:
       guid = ','.join([geo.geog_id for geo in reversed(found_geos)])
       return guid if guid else None
     
-    if 'guid' not in df.columns:
-      df['guid'] = None
-
     # Apply the filter to the DataFrame only if filter is not None
     df_filtered = df[filter(df)] if filter is not None else df
 
     total_rows = len(df_filtered)
     for i, row in tqdm(df_filtered.iterrows(), total=total_rows):
+      # if (row['guid'] is None or row['computed_guid'] is not None) and (cutoff_timestamp is None or row['lastTransition'] < cutoff_timestamp):
       if row['guid'] is None and (cutoff_timestamp is None or row['lastTransition'] < cutoff_timestamp):
         lat, lng = row['lat'], row['lng']
 

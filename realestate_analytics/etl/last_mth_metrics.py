@@ -365,6 +365,8 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     # Reorder columns
     final_results = final_results[['geog_id', 'propertyType', 'median_price', 'new_listings_count']]
 
+    final_results.new_listings_count = final_results.new_listings_count.fillna(0).astype(int)
+
     self.logger.info(f'Calculated metrics for {len(final_results)} (geog_id, propertyType) pairs, including "ALL" property type')
 
     self.last_mth_metrics_results = final_results

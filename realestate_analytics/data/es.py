@@ -492,18 +492,20 @@ class Datastore:
                                   ):
     """
     This is used in context of nearby_comparable_solds.NearbyComparableSoldsProcessor ETL pipeline.
+    Fetches current active or non-active listings based on specified filters for a NearbyComparableSoldsProcessor ETL pipeline.
+
     Parameters:
-    - selects (List[str]): List of fields to retrieve.
-    - prov_code (str, optional): Province code to filter listings.
-    - addedOn_start_time (datetime, optional): Start time for filtering by addedOn date.
-    - addedOn_end_time (datetime, optional): End time for filtering by addedOn date.
-    - updated_start_time (datetime, optional): Start time for filtering by lastUpdate date.
-    - updated_end_time (datetime, optional): End time for filtering by lastUpdate date.
+    - selects (List[str]): Fields to retrieve.
+    - prov_code (str, optional): Province code to filter listings by.
+    - addedOn_start_time (datetime, optional): Start time for filtering listings added on.
+    - addedOn_end_time (datetime, optional): End time for filtering listings added on.
+    - updated_start_time (datetime, optional): Start time for filtering listings last updated.
+    - updated_end_time (datetime, optional): End time for filtering listings last updated.
+    - use_script_for_last_update (bool, optional): If True, uses a script for filtering by last update time. Requires both updated_start_time and updated_end_time to be set.
+    - active (bool, optional): If True, fetches active listings. If False, fetches non-active listings.
 
     Returns:
-    Tuple[bool, pd.DataFrame]: A tuple containing:
-    - A boolean indicating success (True) or failure (False)
-    - A DataFrame representing the current active listings.
+    Tuple[bool, pd.DataFrame]: A tuple containing a boolean indicating if the fetch was successful, and a DataFrame of the listings.
     """
 
     self.logger.info(f'Fetching current {"active" if active else "non active"} listings for province: {prov_code}')
@@ -511,7 +513,6 @@ class Datastore:
 
     try:
       must_filters = [
-          # {"match": {"listingStatus": "ACTIVE"}},
           {"match": {"transactionType": "SALE"}},
           {"bool": {"should": self.property_type_query_mappings}}
       ]
@@ -832,7 +833,15 @@ class Datastore:
     This is part of the solution until guid is properly stamped to new future sold listings
     """
     data_dir = Path(data_dir)
-    all_geo_entry_df = pd.read_csv(data_dir/'all_geo_entry.txt', sep='\t')
+    all_geo_entry_df = pd.read_csv(data_dir/'all_geo_entry.txt', sep='\t')  # read in new .txt dump
+
+    # combine with previous geo_entry_df
+    prev_geo_entry_df = self.cache.get('all_geo_entry')
+    all_geo_entry_df = pd.concat([prev_geo_entry_df, all_geo_entry_df], ignore_index=True)
+    # drop duplicates and keep last
+    all_geo_entry_df.drop_duplicates(subset=['MLS', 'CITY', 'PROV_STATE'], keep='last', inplace=True)
+    all_geo_entry_df.reset_index(drop=True, inplace=True)
+
     self.cache.set(key='all_geo_entry', value=all_geo_entry_df)
 
   def fix_guid_in_sold_listing_cache(self):

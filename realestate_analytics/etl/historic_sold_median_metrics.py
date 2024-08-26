@@ -340,7 +340,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     return success, failed
   
 
-  def cleanup(self):
+  def cleanup(self, remove_es_metrics=False):
     super().cleanup()
     
     cache_keys = ['five_years_sold_listing',
@@ -373,10 +373,25 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
     self.logger.info("Instance variables reset.")
 
-    # remove metrics from mkt_trends_ts index
-    # updated, failures = self.remove_metrics_from_mkt_trends_ts()
-    # self.logger.info(f"Removed metrics from {updated} doc in mkt_trends_ts index with {len(failures)} failures.")
+    # Remove selected metrics from ES if specified
+    if remove_es_metrics:
+      self.logger.info("Removing selected metrics from ES documents...")
+      updated, failures = self.remove_metrics_from_mkt_trends_ts()
+      self.logger.info(f"Removed metrics from {updated} docs in mkt_trends_ts index with {len(failures)} failures.")
       
+  
+  def reset(self, remove_es_metrics=False):
+    super().reset()
+    if remove_es_metrics:
+      self.cleanup(remove_es_metrics=remove_es_metrics)
+  
+
+  def full_refresh(self, remove_es_metrics=False):
+      self.logger.info("Starting full refresh for SoldMedianMetricsProcessor...")
+      if remove_es_metrics:
+        self.cleanup(remove_es_metrics=remove_es_metrics)
+      super().full_refresh()  # This will call self.run()
+      self.logger.info("Full refresh completed for SoldMedianMetricsProcessor.")
 
   def compute_5_year_metrics_old(self):
     # Construct date range for the past 60 full months plus the current month to date.
@@ -776,7 +791,8 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
   def remove_metrics_from_mkt_trends_ts(self):
     '''
-    This remove the entire metrics node from the mkt_trends_ts index.
+    This method selectively removes only the metrics computed by SoldMedianMetricsProcessor
+    from the mkt_trends_ts index, preserving other important metrics.
     '''
     def generate_actions():
       # Use scan to efficiently retrieve all documents that have a 'metrics' field
@@ -788,7 +804,14 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
           "_index": self.datastore.mkt_trends_index_name,
           "_id": hit["_id"],
           "script": {
-            "source": "ctx._source.remove('metrics')",
+            "source": """
+              if (ctx._source.metrics != null) {
+                ctx._source.metrics.remove('median_price');
+                ctx._source.metrics.remove('median_dom');
+                ctx._source.metrics.remove('over_ask_percentage');
+                ctx._source.metrics.remove('below_ask_percentage');
+              }
+            """,
           }
         }
 

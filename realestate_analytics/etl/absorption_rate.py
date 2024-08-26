@@ -162,6 +162,9 @@ class AbsorptionRateProcessor(BaseETLProcessor):
       # Combine results
       self.absorption_rates = pd.concat([self.absorption_rates, all_property_types], ignore_index=True)
 
+      self.absorption_rates.sold_count = self.absorption_rates.sold_count.astype(int)
+      self.absorption_rates.current_count = self.absorption_rates.current_count.astype(int)
+
       self.logger.info(f"Final absorption rates calculated for {len(self.absorption_rates)} geog_id-propertyType combinations, including 'ALL' property type.")
     except Exception as e:
       self.logger.error(f"Unexpected error calculating absorption rates: {e}")
