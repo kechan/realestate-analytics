@@ -19,6 +19,8 @@ Retrieves the historic median sold price data for a specific geographic area and
 **Query Parameters:**
 - `geog_id` (required): Geographic ID to filter by
 - `property_type` (optional): Property type to filter by. Use 'ALL' or leave empty for all property types combined.
+- `return_geojson` (optional): Set to 'true' to return data in GeoJSON format. Default is 'false'.
+
 
 **Example CURL request:**
 ```bash
@@ -63,12 +65,54 @@ curl -X GET "http://your-api-domain.com/metrics/historic_sold/price?geog_id=g20_
   - `month` (string): The date for the data point, formatted as `YYYY-MM`.
   - `value` (number): The median sold price for that specific month.
 
-### Explanation:
 
-- The `geog_id` and `property_type` in the response correspond to the parameters used in the request.
-- The `data` array contains the historical median prices over time, with each entry consisting of a `date` and a `value`.
-- The `month` is represented in `YYYY-MM` format, indicating the year and month for which the median price was calculated.
-- The `value` is the median price for the respective month.
+**Example CURL request:**
+```bash
+curl -X GET "http://your-api-domain.com/metrics/historic_sold/price?geog_id=g20_dpz9hct3&property_type=ALL&return_geojson=true"
+```
+
+**Response Example (GeoJSON format):**
+```json
+{
+  "type": "Feature",
+  "geometry": null,
+  "properties": {
+    "name": "Scarborough",
+    "geog_id": "g20_dpz9hct3",
+    "property_type": "ALL",
+    "level": 20,
+    "parent_geog_id": "g30_dpz89rm7",
+    "has_children": true,
+    "metric_type": "median_price",
+    "metric_data": [
+      {
+        "month": "2019-08",
+        "value": 600000
+      },
+      {
+        "month": "2019-09",
+        "value": 706500
+      },
+      // ... more data points ...
+    ]
+  }
+}
+```
+
+**Response Structure:**
+- `type` (string): Always "Feature" for GeoJSON format.
+- `geometry` (null): Geometry is not included in this response.
+- `properties` (object): Contains the geographic properties and metric data.
+  - `name` (string): The name of the geographic area.
+  - `geog_id` (string): The geographic ID used for filtering the data.
+  - `property_type`: The property type for which the data is reported.
+  - `level` (integer): The geographic level.
+  - `parent_geog_id` (string): The ID of the parent geographic area, if any.
+  - `has_children` (boolean): Indicates whether this geographic area has child areas.
+  - `metric_type` (string): The type of metric, in this case "median_price".
+  - `metric_data` (array of objects): The time series data for the metric.
+    - `month` (string): The month for the data point, formatted as "YYYY-MM".
+    - `value` (number): The median price value for that month.
 
 ### 2. Historic Sold Median Days on Market (DOM)
 
@@ -81,6 +125,8 @@ Retrieves the historic median days on market data for a specific geographic area
 **Query Parameters:**
 - `geog_id` (required): Geographic ID to filter by
 - `property_type` (optional): Property type to filter by. Use 'ALL' or leave empty for all property types combined.
+- `return_geojson` (optional): Set to 'true' to return data in GeoJSON format. Default is 'false'.
+
 
 **Example CURL request:**
 ```bash
@@ -121,12 +167,41 @@ curl -X GET "http://your-api-domain.com/metrics/historic_sold/dom?geog_id=g20_dp
   - `month` (string): The date for the data point, formatted as `YYYY-MM`.
   - `value` (number): The median days on market for that specific month.
 
-### Explanation:
+**Example CURL request:**
+```bash
+curl -X GET "http://your-api-domain.com/metrics/historic_sold/dom?geog_id=g20_dpz9hct3&property_type=ALL&return_geojson=true"
+```
 
-- The `geog_id` and `property_type` in the response reflect the parameters used in the request.
-- The `data` array contains the historical median days on market over time, with each entry consisting of a `date` and a `value`.
-- The `month` is formatted as `YYYY-MM`, representing the year and month for which the median DOM was calculated.
-- The `value` represents the median number of days properties stayed on the market before being sold in that particular month.
+**Response Example (GeoJSON format):**
+```json
+{
+  "type": "Feature",
+  "geometry": null,
+  "properties": {
+    "name": "Scarborough",
+    "geog_id": "g20_dpz9hct3",
+    "property_type": "ALL",
+    "level": 20,
+    "parent_geog_id": "g30_dpz89rm7",
+    "has_children": true,
+    "metric_type": "median_dom",
+    "metric_data": [
+      {
+        "month": "2019-08",
+        "value": 14
+      },
+      {
+        "month": "2019-09",
+        "value": 13
+      },
+      // ... more data points ...
+    ]
+  }
+}
+```
+
+**Response Structure:** (Same as the price endpoint, with "metric_type" being "median_dom")
+
 
 ### 3. Historic Sold Over Ask Percentage
 
@@ -139,6 +214,7 @@ Retrieves the historic percentage of properties sold over asking price for a spe
 **Query Parameters:**
 - `geog_id` (required): Geographic ID to filter by
 - `property_type` (optional): Property type to filter by. Use 'ALL' or leave empty for all property types combined.
+- `return_geojson` (optional): Set to 'true' to return data in GeoJSON format. Default is 'false'.
 
 **Example CURL request:**
 ```bash
@@ -179,12 +255,41 @@ curl -X GET "http://your-api-domain.com/metrics/historic_sold/over-ask?geog_id=g
   - `month` (string): The date for the data point, formatted as `YYYY-MM`.
   - `value` (number): The percentage of properties sold over the asking price for that specific month.
 
-### Explanation:
+**Example CURL request:**
+```bash
+curl -X GET "http://your-api-domain.com/metrics/historic_sold/over-ask?geog_id=g20_dpz9hct3&property_type=DETACHED&return_geojson=true"
+```
 
-- The `geog_id` and `property_type` in the response match the parameters provided in the request.
-- The `data` array contains the historical percentage of properties sold over the asking price, with each entry consisting of a `date` and a `value`.
-- The `month` is represented in `YYYY-MM` format, indicating the year and month for which the percentage was calculated.
-- The `value` represents the percentage of properties that sold for more than the asking price during that particular month.
+**Response Example (GeoJSON format):**
+```json
+{
+  "type": "Feature",
+  "geometry": null,
+  "properties": {
+    "name": "Scarborough",
+    "geog_id": "g20_dpz9hct3",
+    "property_type": "DETACHED",
+    "level": 20,
+    "parent_geog_id": "g30_dpz89rm7",
+    "has_children": true,
+    "metric_type": "over_ask_percentage",
+    "metric_data": [
+      {
+        "month": "2019-08",
+        "value": 46.15
+      },
+      {
+        "month": "2019-09",
+        "value": 37.78
+      },
+      // ... more data points ...
+    ]
+  }
+}
+```
+
+**Response Structure:** (Same as the price endpoint, with "metric_type" being "over_ask_percentage")
+
 
 ### 4. Historic Sold Under Ask Percentage
 
@@ -197,6 +302,7 @@ Retrieves the historic percentage of properties sold under asking price for a sp
 **Query Parameters:**
 - `geog_id` (required): Geographic ID to filter by
 - `property_type` (optional): Property type to filter by. Use 'ALL' or leave empty for all property types combined.
+- `return_geojson` (optional): Set to 'true' to return data in GeoJSON format. Default is 'false'.
 
 **Example CURL request:**
 ```bash
@@ -237,12 +343,41 @@ curl -X GET "http://your-api-domain.com/metrics/historic_sold/under-ask?geog_id=
   - `month` (string): The date for the data point, formatted as `YYYY-MM`.
   - `value` (number): The percentage of properties sold under the asking price for that specific month.
 
-### Explanation:
+**Example CURL request:**
+```bash
+curl -X GET "http://your-api-domain.com/metrics/historic_sold/under-ask?geog_id=g20_dpz9hct3&property_type=CONDO&return_geojson=true"
+```
 
-- The `geog_id` and `property_type` in the response correspond to the parameters provided in the request.
-- The `data` array contains the historical percentage of properties sold under the asking price, with each entry consisting of a `date` and a `value`.
-- The `month` is represented in `YYYY-MM` format, indicating the year and month for which the percentage was calculated.
-- The `value` represents the percentage of properties that sold for less than the asking price during that particular month.
+**Response Example (GeoJSON format):**
+```json
+{
+  "type": "Feature",
+  "geometry": null,
+  "properties": {
+    "name": "Scarborough",
+    "geog_id": "g20_dpz9hct3",
+    "property_type": "CONDO",
+    "level": 20,
+    "parent_geog_id": "g30_dpz89rm7",
+    "has_children": true,
+    "metric_type": "under_ask_percentage",
+    "metric_data": [
+      {
+        "month": "2019-08",
+        "value": 53.85
+      },
+      {
+        "month": "2019-09",
+        "value": 62.22
+      },
+      // ... more data points ...
+    ]
+  }
+}
+```
+
+**Response Structure:** (Same as the price endpoint, with "metric_type" being "under_ask_percentage")
+
 
 ### 5. Last Month Metrics
 
@@ -255,6 +390,8 @@ Retrieves various metrics for the last month for a specific geographic area and 
 **Query Parameters:**
 - `geog_id` (required): Geographic ID to filter by
 - `property_type` (optional): Property type to filter by. Use 'ALL' or leave empty for all property types combined.
+- `return_geojson` (optional): Set to 'true' to return data in GeoJSON format. Default is 'false'.
+
 
 **Example CURL request:**
 ```bash
@@ -266,7 +403,7 @@ curl -X GET "http://your-api-domain.com/metrics/last-month?geog_id=g20_dpz9hct3&
 {
   "month": "202407",
   "geog_id": "g20_dpz9hct3",
-  "propertyType": "DETACHED",
+  "property_type": "DETACHED",
   "median_price": 1187000,
   "new_listings_count": 288
 }
@@ -276,16 +413,53 @@ curl -X GET "http://your-api-domain.com/metrics/last-month?geog_id=g20_dpz9hct3&
 
 - `month` (string): The year and month for which the metrics are calculated, formatted as `YYYYMM`.
 - `geog_id` (string): The geographic ID used for filtering the data.
-- `propertyType` (string): The property type used for filtering the data.
+- `property_type` (string): The property type used for filtering the data.
 - `median_price` (number): The median sold price for properties in that geographic area and property type during the specified month.
 - `new_listings_count` (number): The number of new listings in that geographic area and property type during the specified month.
 
-### Explanation:
+**Example CURL request:**
+```bash
+curl -X GET "http://your-api-domain.com/metrics/last-month?geog_id=g20_dpz9hct3&property_type=ALL&return_geojson=true"
+```
 
-- The `month` indicates the specific month for which the metrics are being reported.
-- The `geog_id` and `propertyType` reflect the parameters used in the request.
-- The `median_price` is the median price of properties sold during the specified month in the given geographic area and property type.
-- The `new_listings_count` represents the total number of new listings that were recorded during the specified month for the given geographic area and property type.
+**Response Example (GeoJSON format):**
+```json
+{
+  "type": "Feature",
+  "geometry": null,
+  "properties": {
+    "name": "Scarborough",
+    "geog_id": "g20_dpz9hct3",
+    "property_type": "ALL",
+    "level": 20,
+    "parent_geog_id": "g30_dpz89rm7",
+    "has_children": true,
+    "metric_type": "last_month_metrics",
+    "metric_data": {
+      "month": "202407",
+      "median_price": 1187000,
+      "new_listings_count": 288
+    }
+  }
+}
+```
+
+**Response Structure:**
+- `type` (string): Always "Feature" for GeoJSON format.
+- `geometry` (null): Geometry is not included in this response.
+- `properties` (object): Contains the geographic properties and metric data.
+  - `name` (string): The name of the geographic area.
+  - `geog_id` (string): The geographic ID used for filtering the data.
+  - `property_type` (string): The property type for which the monthly metrics are calculated.
+  - `level` (integer): The geographic level.
+  - `parent_geog_id` (string): The ID of the parent geographic area, if any.
+  - `has_children` (boolean): Indicates whether this geographic area has child areas.
+  - `metric_type` (string): The type of metric, in this case "last_month_metrics".
+  - `metric_data` (object): The last month's metrics data.
+    - `month` (string): The month for which the data is reported, formatted as "YYYYMM".
+    - `median_price` (number): The median sold price for the last month.
+    - `new_listings_count` (integer): The number of new listings in the last month.
+
 
 ### 6. Absorption Rate
 
@@ -298,6 +472,8 @@ Retrieves the absorption rate for a specific geographic area and property type.
 **Query Parameters:**
 - `geog_id` (required): Geographic ID to filter by
 - `property_type` (optional): Property type to filter by. Use 'ALL' or leave empty for all property types combined.
+- `return_geojson` (optional): Set to 'true' to return data in GeoJSON format. Default is 'false'.
+
 
 **Example CURL request:**
 ```bash
@@ -309,7 +485,7 @@ curl -X GET "http://your-api-domain.com/metrics/absorption-rate?geog_id=g20_dpz9
 {
   "month": "202408",
   "geog_id": "g20_dpz9hct3",
-  "propertyType": "ALL",
+  "property_type": "ALL",
   "sold_count": 373,
   "current_count": 718,
   "absorption_rate": 0.5194986072423399
@@ -320,18 +496,56 @@ curl -X GET "http://your-api-domain.com/metrics/absorption-rate?geog_id=g20_dpz9
 
 - `month` (string): The year and month for which the absorption rate is calculated, formatted as `YYYYMM`.
 - `geog_id` (string): The geographic ID used for filtering the data.
-- `propertyType` (string): The property type used for filtering the data.
+- `property_type` (string): The property type used for filtering the data.
 - `sold_count` (number): The number of properties sold during the specified month.
 - `current_count` (number): The number of properties currently on the market during the specified month.
 - `absorption_rate` (number): The absorption rate, calculated as the ratio of `sold_count` to `current_count`.
 
-### Explanation:
+**Example CURL request:**
+```bash
+curl -X GET "http://your-api-domain.com/metrics/absorption-rate?geog_id=g20_dpz9hct3&property_type=ALL&return_geojson=true"
+```
 
-- The `month` field indicates the specific month for which the absorption rate is calculated.
-- The `geog_id` and `propertyType` fields reflect the parameters used in the request.
-- The `sold_count` represents the number of properties that were sold during the specified month in the given geographic area and property type.
-- The `current_count` represents the total number of properties that were available on the market during that month.
-- The `absorption_rate` is a key metric that indicates the market's temperature, showing how quickly properties are being sold. It is calculated as `sold_count / current_count`.
+**Response Example (GeoJSON format):**
+```json
+{
+  "type": "Feature",
+  "geometry": null,
+  "properties": {
+    "name": "Scarborough",
+    "geog_id": "g20_dpz9hct3",
+    "property_type": "ALL",
+    "level": 20,
+    "parent_geog_id": "g30_dpz89rm7",
+    "has_children": true,    
+    "metric_type": "absorption_rate",
+    "metric_data": {
+      "month": "202408",
+      "sold_count": 376,
+      "current_count": 695,
+      "absorption_rate": 0.5410071942446043
+    }
+  }
+}
+```
+
+**Response Structure:**
+- `type` (string): Always "Feature" for GeoJSON format.
+- `geometry` (null): Geometry is not included in this response.
+- `properties` (object): Contains the geographic properties and metric data.
+  - `name` (string): The name of the geographic area.
+  - `geog_id` (string): The geographic ID used for filtering the data.
+  - `property_type` (string): The property type for which the absorption rate is calculated.
+  - `level` (integer): The geographic level.
+  - `parent_geog_id` (string): The ID of the parent geographic area, if any.
+  - `has_children` (boolean): Indicates whether this geographic area has child areas.
+  - `metric_type` (string): The type of metric, in this case "absorption_rate".
+  - `metric_data` (object): The absorption rate data.
+    - `month` (string): The month for which the data is reported, formatted as "YYYYMM".
+    - `sold_count` (integer): The number of properties sold during the specified month.
+    - `current_count` (integer): The number of properties currently on the market.
+    - `absorption_rate` (number): The absorption rate, calculated as the ratio of sold_count to current_count.
+
 
 ### 7. Get Geographic Entities
 

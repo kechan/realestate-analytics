@@ -623,9 +623,7 @@ class GeoCollection:
 
   def assign_guids_to_listing_df(self, df: pd.DataFrame, filter: Callable = None, cutoff_timestamp: pd.Timestamp = None):
     """
-    Compute, construct and assign guid to df. 
-
-    
+    Compute, construct and assign guid for df
     """
     assert 'lat' in df.columns and 'lng' in df.columns, "Latitude and longitude columns are required in the DataFrame"
     
@@ -665,6 +663,9 @@ class GeoCollection:
       # Construct the GUID string
       guid = ','.join([geo.geog_id for geo in reversed(found_geos)])
       return guid if guid else None
+    
+    # just fix here those 'None' a string with None, they are really None.
+    df['guid'] = df['guid'].replace({'None': None})
     
     # Apply the filter to the DataFrame only if filter is not None
     df_filtered = df[filter(df)] if filter is not None else df
