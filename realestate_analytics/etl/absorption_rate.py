@@ -130,7 +130,8 @@ class AbsorptionRateProcessor(BaseETLProcessor):
         current_counts = self.archiver.retrieve(f'current_listing_counts_{last_month_yearmonth}')   # load from archive
         if current_counts is None:
           # TODO: during dev, the snapshot for last mth may indeed be missing, we just use the current listing_df.
-          # This should be removed after a few successful end of mth runs after deployment, and probably even raise an error if current_counts is not found.
+          # This should be removed after a few successful end of mth runs after deployment, and probably even raise 
+          # an error if current_counts is not found.
           expanded_current = expand_guid(self.listing_df)
           current_counts = expanded_current.groupby(['geog_id', 'propertyType']).size().reset_index(name='current_count')
           self.logger.warning(f"Current listing counts for {last_month_yearmonth} not found in archive. Using current listing_df.")

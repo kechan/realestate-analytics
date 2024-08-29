@@ -2,8 +2,8 @@ from typing import Dict, Any
 import argparse
 import logging
 import yaml
-import os
-from datetime import datetime
+import os, json
+from datetime import datetime, timedelta
 from pathlib import Path
 import pandas as pd
 
@@ -28,6 +28,37 @@ def rotate_log_file(log_filename: Path):
     rotated_log_filename = log_filename.with_name(f"{log_filename.stem}_{timestamp}{log_filename.suffix}")
     log_filename.rename(rotated_log_filename)
     logging.info(f"Rotated old log file to {rotated_log_filename}")
+
+def get_last_deletion_check_date(tracking_file: Path) -> datetime:
+  if tracking_file.exists():
+    with open(tracking_file, 'r') as f:
+      data = json.load(f)
+    return datetime.fromisoformat(data['last_check'])
+  return datetime.min
+
+def update_deletion_check_date(tracking_file: Path):
+  with open(tracking_file, 'w') as f:
+    json.dump({'last_check': datetime.now().isoformat()}, f)
+
+def should_check_deletions(tracking_file: Path) -> bool:
+  last_check = get_last_deletion_check_date(tracking_file)
+  today = datetime.now().date()
+  last_check_date = last_check.date()
+
+  # Check if it's been 7 days since the last check
+  if (today - last_check_date).days >= 7:
+    return True
+  
+  # Check if it's the first day of the month
+  if today.day == 1 and last_check_date.month != today.month:
+    return True
+  
+  # Check if it's the last day of the month
+  tomorrow = today + timedelta(days=1)
+  if tomorrow.month != today.month and last_check_date.month != today.month:
+    return True
+  
+  return False
 
 def main():
   parser = argparse.ArgumentParser(description="Run NearbyComparableSoldsProcessor ETL")
@@ -77,11 +108,16 @@ def main():
   datastore = Datastore(host=es_host, port=es_port)
   bq_datastore = BigQueryDatastore()
 
+  # Set up the tracking file for BigQuery deletion checks and determine if we should check for deletions
+  bq_deletion_check_file = get_script_dir() / "bq_deletion_check.json"
+  check_bq_deletions = should_check_deletions(bq_deletion_check_file)
+
   # Initialize and run the processor
   processor = NearbyComparableSoldsProcessor(
     job_id=job_id,
     datastore=datastore,
-    bq_datastore=bq_datastore
+    bq_datastore=bq_datastore,
+    check_bq_deletions=check_bq_deletions
   )
 
   if args.force_full_load:

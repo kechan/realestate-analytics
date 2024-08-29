@@ -94,11 +94,13 @@ def compare_comparable_results(prev_result: Dict[str, Dict[str, List]],
   return diff_result
 
 class NearbyComparableSoldsProcessor(BaseETLProcessor):
-  def __init__(self, job_id: str, datastore: Datastore, bq_datastore: BigQueryDatastore = None):
+  def __init__(self, job_id: str, datastore: Datastore, bq_datastore: BigQueryDatastore = None, check_bq_deletions = False):
     super().__init__(job_id=job_id, datastore=datastore, bq_datastore=bq_datastore)
 
+    self.check_bq_deletions = check_bq_deletions
+
     self.sold_listing_df = None
-    self.listing_df = None
+    self.listing_df = None    
 
     self.sold_listing_selects = [
       'mls',
@@ -318,21 +320,27 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
         self.logger.info(f"Dropping {len(inactive_indices)} non active listings")
         self.listing_df.drop(inactive_indices, inplace=True)
 
-        # Remove known deletions since last run
-        # TODO: need to work out a sensible schedule, which should take into account BQ querying cost.
-        # Note: for the purpose of computing nearby solds, it isnt critical to remove these, 
-        # as updating an already deleted listing should be a no op for ES update
-        
-        deleted_listings_df = self.bq_datastore.get_deleted_listings(start_time=last_run, end_time=end_time)
-        if len(deleted_listings_df) > 0:
-          len_listing_df_before_delete = len(self.listing_df)
+        # Remove known deletions from BQ since last run
+        if self.check_bq_deletions:
+          # Note: for the purpose of computing nearby solds, it isnt critical to remove these, 
+          # as updating an already deleted listing should be a no op for ES update
+          # But this is also used in Absorption Rate ETL, so we need to ensure it is at least done at the end of month snapshot
+          # The responsiblity of this schedule should on the run script that invoke this class.
+          self.logger.info("Checking for deleted listings in BigQuery since last run... and removed them from current listings.")
+          deleted_listings_df = self.bq_datastore.get_deleted_listings(start_time=last_run, end_time=end_time)
+          if len(deleted_listings_df) > 0:
+            len_listing_df_before_delete = len(self.listing_df)
 
-          deleted_listing_ids = deleted_listings_df['listingId'].tolist()
-          idxs_to_remove = self.listing_df.q("_id.isin(@deleted_listing_ids)").index
-          self.listing_df.drop(index=idxs_to_remove, inplace=True)
-          self.listing_df.reset_index(drop=True, inplace=True)
-          len_listing_df_after_delete = len(self.listing_df)
-          self.logger.info(f'removed {len_listing_df_before_delete - len_listing_df_after_delete} deleted listings since last run')
+            deleted_listing_ids = deleted_listings_df['listingId'].tolist()
+            idxs_to_remove = self.listing_df.q("_id.isin(@deleted_listing_ids)").index
+            self.listing_df.drop(index=idxs_to_remove, inplace=True)
+            self.listing_df.reset_index(drop=True, inplace=True)
+            len_listing_df_after_delete = len(self.listing_df)
+            self.logger.info(f'removed {len_listing_df_before_delete - len_listing_df_after_delete} deleted listings since last run')
+          else:
+            self.logger.info("No deleted listings found in BigQuery for the specified time range.")
+        else:
+          self.logger.info("Skipping check for deleted listings in BigQuery (as per configuration).")
 
       # if all operations are successful, update the data cache 
       self._save_to_cache()
@@ -450,7 +458,7 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
 
     self.logger.info("Cleanup completed. All cached data has been cleared and instance variables reset.")
 
-    # TODO: remove comparable_sold_listings from all in index.
+    # Manipulating or deleting from ES should be more deliberately rather than bundling them under cleanup().
     # updated, failures = self.delete_comparable_sold_listings()
     # self.logger.info(f"Removed comparable_sold_listings from {updated} documents with {len(failures)} failures.")
 

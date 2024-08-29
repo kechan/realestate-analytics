@@ -5,6 +5,8 @@ from realestate_analytics.api.endpoints import historic_sold_metrics, last_mth_m
 from realestate_analytics.api.etl_script_kickoff_endpoints import router as etl_router
 from realestate_analytics.api.etl_monitoring_endpoints import router as monitoring_router
 
+# uvicorn main:app --reload --log-level debug
+
 # This should be at the top of your main FastAPI application file
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',

@@ -393,7 +393,11 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       super().full_refresh()  # This will call self.run()
       self.logger.info("Full refresh completed for SoldMedianMetricsProcessor.")
 
+
   def compute_5_year_metrics_old(self):
+    """
+    Warning: this method is obsolete
+    """
     # Construct date range for the past 60 full months plus the current month to date.
 
     current_date = self.get_current_datetime().date()
@@ -507,7 +511,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
   def add_geog_ids_to_sold_listings(self):    
     """
-    Warning: this method likely obsolete
+    Warning: this method is obsolete
     """
     legacy_data_path = False   # TODO: remove this when guid bug is fixed on the ES.
 
