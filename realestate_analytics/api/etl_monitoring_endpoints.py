@@ -24,12 +24,14 @@ class StageInfo(BaseModel):
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
     duration: Optional[float] = None
+    annotation: Optional[str] = None
 
 class JobStatus(BaseModel):
     job_id: str
     overall_status: str
     stages: Dict[str, StageInfo]
     errors: List[str] = []
+
 
 
 @router.get("/job/{job_id}", response_model=JobStatus)
@@ -40,7 +42,7 @@ async def get_job_status(job_id: str):
     if not log_path.exists():
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
-    stages = ['extract', 'transform', 'load']  # Add any additional stages here
+    stages = ['Extract', 'Transform', 'Load'] # Add any additional stages here
     job_status = JobStatus(job_id=job_id, overall_status="In Progress", stages={})
     job_status.stages = {stage: StageInfo(status="Not Completed") for stage in stages}
 
@@ -89,6 +91,9 @@ def parse_monitor_line(line: str, job_status: JobStatus):
         job_status.stages[stage].status = "Completed"
         if job_status.stages[stage].start_time:
             duration = (job_status.stages[stage].end_time - job_status.stages[stage].start_time).total_seconds()
-            job_status.stages[stage].duration = round(duration, 2)                
+            if duration == 0.0:
+                job_status.stages[stage].annotation = "Restored from cache during rerun."
+
+            job_status.stages[stage].duration = round(duration, 2)
 
 
