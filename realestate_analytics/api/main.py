@@ -2,6 +2,8 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from realestate_analytics.api.endpoints import historic_sold_metrics, last_mth_metrics, absorption_rate, geos
+from realestate_analytics.api.etl_script_kickoff_endpoints import router as etl_router
+from realestate_analytics.api.etl_monitoring_endpoints import router as monitoring_router
 
 # This should be at the top of your main FastAPI application file
 logging.basicConfig(level=logging.DEBUG,
@@ -21,6 +23,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# Include the ETL script kickoff endpoints router with the /op prefix
+app.include_router(etl_router, prefix="/op", tags=["operations"])
+
+# Include the ETL monitoring endpoints router with the /monitoring prefix
+app.include_router(monitoring_router, prefix="/monitor", tags=["monitoring"])
+
+# geo info and metrics related routers
 app.include_router(historic_sold_metrics.router, prefix="/metrics/historic_sold", tags=["historic_sold"])
 app.include_router(last_mth_metrics.router, prefix="/metrics", tags=["last-month"])
 app.include_router(absorption_rate.router, prefix="/metrics", tags=["absorption-rate"])

@@ -18,6 +18,17 @@ DEFAULT_ES_HOST = "localhost"
 DEFAULT_ES_PORT = 9200
 DEFAULT_LOG_LEVEL = "INFO"
 
+def get_script_dir():
+  return Path(__file__).resolve().parent
+
+def rotate_log_file(log_filename: Path):
+  """Rename the existing log file by appending a timestamp if it exists."""
+  if log_filename.exists():
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    rotated_log_filename = log_filename.with_name(f"{log_filename.stem}_{timestamp}{log_filename.suffix}")
+    log_filename.rename(rotated_log_filename)
+    logging.info(f"Rotated old log file to {rotated_log_filename}")
+
 def main():
   parser = argparse.ArgumentParser(description="Run NearbyComparableSoldsProcessor ETL")
   parser.add_argument("--config", required=True, help="Path to the YAML configuration file")
@@ -28,22 +39,25 @@ def main():
   args = parser.parse_args()
 
   # Load configuration
-  config = load_config(Path(args.config))
+  config = load_config(Path(args.config).resolve())
 
   # Use config values, command-line args, or defaults
   es_host = args.es_host or config.get('es_host') or DEFAULT_ES_HOST
   es_port = args.es_port or config.get('es_port') or DEFAULT_ES_PORT
   log_level = args.log_level or config.get('log_level') or DEFAULT_LOG_LEVEL
 
-  # nearby_solds_run.csv keeps historical run results
-  hist_runs_csv_path = Path("nearby_solds_run.csv")
+  # nearby_solds_run.csv keeps historical run results, which for simplicity be always in the same directory as this script
+  hist_runs_csv_path = get_script_dir() / "nearby_solds_run.csv"
 
   # Set up job ID and logging
   job_id = get_next_job_id(hist_runs_csv_path, job_prefix="nearby_solds")
-  log_filename = f"{job_id}.log"
+  log_filename = get_script_dir() / f"{job_id}.log"
+
+  # Rotate old log file if it exists
+  rotate_log_file(log_filename)
 
   logging.basicConfig(
-    filename=log_filename,
+    filename=str(log_filename),
     level=log_level,
     format='%(asctime)s [%(levelname)s] [Logger: %(name)s]: %(message)s',
     filemode='a'

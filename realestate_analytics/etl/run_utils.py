@@ -153,40 +153,40 @@ def update_run_csv(csv_path: Path, job_id: str, processor: BaseETLProcessor) -> 
 
 
 def send_etl_failure_alert(job_id: str, stage_statuses: Dict[str, bool]):
-    try:
-      _ = load_dotenv(find_dotenv())
+  try:
+    _ = load_dotenv(find_dotenv())
 
-      sender_email = os.getenv('ANALYTICS_ETL_SENDER_EMAIL', None)
-      receiver_emails = os.getenv('ANALYTICS_ETL_RECEIVER_EMAILS', '').split(',')
-      email_password = os.getenv('ANALYTICS_ETL_EMAIL_PASSWORD', None)
+    sender_email = os.getenv('ANALYTICS_ETL_SENDER_EMAIL', None)
+    receiver_emails = os.getenv('ANALYTICS_ETL_RECEIVER_EMAILS', '').split(',')
+    email_password = os.getenv('ANALYTICS_ETL_EMAIL_PASSWORD', None)
 
-      if sender_email is None or email_password is None or not receiver_emails:
-        logging.warning("Email credentials or receivers not found in environment variables. Email alert will not be sent.")
-        return
+    if sender_email is None or email_password is None or not receiver_emails:
+      logging.warning("Email credentials or receivers not found in environment variables. Email alert will not be sent.")
+      return
 
-      subject = f"ETL Job Failure Alert: {job_id}"
+    subject = f"ETL Job Failure Alert: {job_id}"
 
-      html_content = f"""
-      <html>
-        <body>
-          <h2>ETL Job Failure Alert</h2>
-          <p>Job ID: {job_id}</p>
-          <p>Status: <span style="color:red">FAILED</span></p>
-          <h3>Stage Statuses:</h3>
-          <ul>
-      """
+    html_content = f"""
+    <html>
+      <body>
+        <h2>ETL Job Failure Alert</h2>
+        <p>Job ID: {job_id}</p>
+        <p>Status: <span style="color:red">FAILED</span></p>
+        <h3>Stage Statuses:</h3>
+        <ul>
+    """
 
-      for stage, status in stage_statuses.items():
-          color = "green" if status else "red"
-          html_content += f"<li>{stage}: <span style='color:{color}'>{status}</span></li>"
+    for stage, status in stage_statuses.items():
+      color = "green" if status else "red"
+      html_content += f"<li>{stage}: <span style='color:{color}'>{status}</span></li>"
 
-      html_content += """
-          </ul>
-          <p>Please check the logs for more details.</p>
-        </body>
-      </html>
-      """
+    html_content += """
+        </ul>
+        <p>Please check the logs for more details.</p>
+      </body>
+    </html>
+    """
 
-      send_email_alert(subject, html_content, sender_email, receiver_emails, email_password)
-    except Exception as e:
-      logging.error(f"Failed to send ETL email alert: {str(e)}")
+    send_email_alert(subject, html_content, sender_email, receiver_emails, email_password)
+  except Exception as e:
+    logging.error(f"Failed to send ETL email alert: {str(e)}")
