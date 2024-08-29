@@ -861,9 +861,7 @@ class Datastore:
           parsed[f'geog_id_{level}'] = geog_id
       return parsed
     
-    sold_listing_cache_keys = ['five_years_sold_listing', 'one_year_sold_listing']
-
-    for sold_listing_cache_key in sold_listing_cache_keys:
+    for sold_listing_cache_key in ['five_years_sold_listing', 'one_year_sold_listing']:
 
       sold_listing_df = self.cache.get(sold_listing_cache_key)
       geo_entry_df = self.cache.get('all_geo_entry')

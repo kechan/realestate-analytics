@@ -672,6 +672,9 @@ class GeoCollection:
 
     total_rows = len(df_filtered)
     for i, row in tqdm(df_filtered.iterrows(), total=total_rows):
+      if pd.isna(row['lat']) or pd.isna(row['lng']):   # # Skip if lat or lng are None or NaN
+        continue
+
       # if (row['guid'] is None or row['computed_guid'] is not None) and (cutoff_timestamp is None or row['lastTransition'] < cutoff_timestamp):
       if row['guid'] is None and (cutoff_timestamp is None or row['lastTransition'] < cutoff_timestamp):
         lat, lng = row['lat'], row['lng']
