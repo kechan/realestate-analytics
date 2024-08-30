@@ -2,7 +2,7 @@ from typing import Dict, Any
 import argparse
 import logging
 import yaml
-import os, json
+import os, json, sys
 from datetime import datetime, timedelta
 from pathlib import Path
 import pandas as pd
@@ -17,6 +17,7 @@ from realestate_analytics.data.bq import BigQueryDatastore
 DEFAULT_ES_HOST = "localhost"
 DEFAULT_ES_PORT = 9200
 DEFAULT_LOG_LEVEL = "INFO"
+JOB_ID_PREFIX = "nearby_solds"
 
 def get_script_dir():
   return Path(__file__).resolve().parent
@@ -27,7 +28,7 @@ def rotate_log_file(log_filename: Path):
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     rotated_log_filename = log_filename.with_name(f"{log_filename.stem}_{timestamp}{log_filename.suffix}")
     log_filename.rename(rotated_log_filename)
-    logging.info(f"Rotated old log file to {rotated_log_filename}")
+    print(f"Rotated old log file to {rotated_log_filename}")
 
 def get_last_deletion_check_date(tracking_file: Path) -> datetime:
   if tracking_file.exists():
@@ -67,10 +68,20 @@ def main():
   parser.add_argument("--es_port", type=int, help="Elasticsearch port")
   parser.add_argument("--force_full_load", action="store_true", help="Force a full load instead of incremental")
   parser.add_argument("--log_level", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Logging level")
+
+  #TODO: Remove this after dev
+  parser.add_argument("--sim_failure_at_pre_transform", action="store_true", help="Simulate a failure at the transform stage")
+  parser.add_argument("--sim_success_at_post_load", action="store_true", help="Simulate a success at the post-load stage")
+
   args = parser.parse_args()
 
   # Load configuration
-  config = load_config(Path(args.config).resolve())
+  config_path = Path(args.config).resolve()
+  if not config_path.exists():
+    print(f"Configuration file not found: {config_path}. Exiting.")
+    sys.exit(1)
+
+  config = load_config(config_path=config_path)
 
   # Use config values, command-line args, or defaults
   es_host = args.es_host or config.get('es_host') or DEFAULT_ES_HOST
@@ -81,7 +92,7 @@ def main():
   hist_runs_csv_path = get_script_dir() / "nearby_solds_run.csv"
 
   # Set up job ID and logging
-  job_id = get_next_job_id(hist_runs_csv_path, job_prefix="nearby_solds")
+  job_id = get_next_job_id(hist_runs_csv_path, job_prefix=JOB_ID_PREFIX)
   log_filename = get_script_dir() / f"{job_id}.log"
 
   # Rotate old log file if it exists
@@ -91,7 +102,7 @@ def main():
     filename=str(log_filename),
     level=log_level,
     format='%(asctime)s [%(levelname)s] [Logger: %(name)s]: %(message)s',
-    filemode='a'
+    filemode='w'
   )
   # Set specific log levels for certain loggers
   # TODO: adjust this during deployment as needed
@@ -112,6 +123,9 @@ def main():
   bq_deletion_check_file = get_script_dir() / "bq_deletion_check.json"
   check_bq_deletions = should_check_deletions(bq_deletion_check_file)
 
+  if check_bq_deletions:
+    update_deletion_check_date(bq_deletion_check_file)
+
   # Initialize and run the processor
   processor = NearbyComparableSoldsProcessor(
     job_id=job_id,
@@ -120,10 +134,19 @@ def main():
     check_bq_deletions=check_bq_deletions
   )
 
+  if args.sim_failure_at_pre_transform:
+    processor.simulate_failure_at = "transform"
+
+  if args.sim_success_at_post_load:
+    processor.simulate_success_at = "load"
+
   if args.force_full_load:
     processor.cleanup()
 
-  processor.run()
+  try:
+    processor.run()
+  except Exception as e:
+    logging.exception(f"Error during .run() for job {job_id}: {e}")
 
   # Update the CSV with the run results
   update_run_csv(csv_path=hist_runs_csv_path, job_id=job_id, processor=processor)
