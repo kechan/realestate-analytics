@@ -90,7 +90,7 @@ def get_next_job_id(csv_path: Path, job_prefix: str) -> str:
   last_job_id = last_job['job_id']
   last_number = int(last_job_id.split('_')[-1])
   
-  if last_job['all_status'] == False:
+  if last_job['all'] == False:
     return last_job_id  # Rerun the failed job
   else:
     return f"{job_prefix}_{last_number + 1}"
@@ -143,11 +143,12 @@ def update_run_csv(csv_path: Path, job_id: str, processor: BaseETLProcessor) -> 
   df.to_csv(csv_path, index=False)
 
   # Send email alert if all_status is False
-  if not all_status:
-    try:
-      send_etl_failure_alert(job_id, stage_statuses)
-    except Exception as e:
-      logging.error(f"Error occurred while attempting to send failure alert: {str(e)}")
+  # TODO: Test this only on PROD env, uncomment before deployment
+  # if not all_status:
+  #   try:
+  #     send_etl_failure_alert(job_id, stage_statuses)
+  #   except Exception as e:
+  #     logging.error(f"Error occurred while attempting to send failure alert: {str(e)}")
 
   return all_status
 

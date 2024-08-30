@@ -793,7 +793,7 @@ class Datastore:
 
     if not sources:
       self.logger.info("No listings found")
-      return False, pd.DataFrame()
+      return True, pd.DataFrame()
 
     try:
       listings_df = pd.DataFrame(sources)

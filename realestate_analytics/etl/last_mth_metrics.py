@@ -15,9 +15,6 @@ from elasticsearch.exceptions import NotFoundError, ConnectionError, RequestErro
 
 import logging, sys, pytz
 
-# Set up logging to write to stdout
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 class LastMthMetricsProcessor(BaseETLProcessor):
   def __init__(self, job_id: str, datastore: Datastore, bq_datastore: BigQueryDatastore = None):
@@ -209,7 +206,13 @@ class LastMthMetricsProcessor(BaseETLProcessor):
       self.logger.error(f"Failed to load delta listings from {start_time} to {end_time}")
       raise ValueError("Failed to load delta listings from datastore")
     
-    self.logger.info(f'Loaded {len(self.delta_listing_df)} listings from {start_time} to {end_time}')
+    if len(self.delta_listing_df) == 0:
+      self.logger.warning(f"No new listings found between {start_time} and {end_time}")
+      # Create an empty DataFrame with the expected structure, but no dummy row
+      self.delta_listing_df = pd.DataFrame(columns=self.listing_selects + ['_id'])
+      self.delta_listing_df.reset_index(drop=True, inplace=True)
+    else:
+      self.logger.info(f'Loaded {len(self.delta_listing_df)} listings from {start_time} to {end_time}')
 
     listing_df = self.cache.get('on_current_listing')
     self.delta_listing_df['is_deleted'] = False  # New delta listings are not deleted

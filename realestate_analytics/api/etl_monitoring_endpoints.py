@@ -43,6 +43,9 @@ async def get_job_status(job_id: str):
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
     stages = ['Extract', 'Transform', 'Load'] # Add any additional stages here
+    if job_id.startswith("last_mth_metrics"):
+        stages.extend(['End_of_mth_run', 'Compute_last_month_metrics', 'Remove_deleted_listings', 'Update_mkt_trends'])
+        
     job_status = JobStatus(job_id=job_id, overall_status="In Progress", stages={})
     job_status.stages = {stage: StageInfo(status="Not Completed") for stage in stages}
 
