@@ -172,3 +172,4 @@ scripts/*.log
 scripts/prod_config.yaml
 scripts/uat_config.yaml
 scripts/*.txt
+scripts/*.json
