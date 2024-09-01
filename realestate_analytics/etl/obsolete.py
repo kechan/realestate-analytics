@@ -418,5 +418,75 @@ def compute_metrics(df, date_mask, geo_level):
   return price_series, dom_series, over_ask_series, below_ask_series
 
 
+    def generate_actions():
+      for _, row in self.last_mth_metrics_results.iterrows():
+        doc_id = f"{row['geog_id']}_{row['propertyType']}"
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_index_name,
+          "_id": doc_id,
+          "script": {
+            "source": """
+            if (ctx._source.metrics == null) {
+              ctx._source.metrics = new HashMap();
+            }
+            
+            // Function to update or append metric
+            void updateMetric(String metricName, Map newEntry) {
+              if (ctx._source.metrics[metricName] == null) {
+                ctx._source.metrics[metricName] = [];
+              }
+              int existingIndex = -1;
+              for (int i = 0; i < ctx._source.metrics[metricName].size(); i++) {
+                if (ctx._source.metrics[metricName][i].month == newEntry.month) {
+                  existingIndex = i;
+                  break;
+                }
+              }
+              if (existingIndex >= 0) {
+                ctx._source.metrics[metricName][existingIndex] = newEntry;
+              } else {
+                ctx._source.metrics[metricName].add(newEntry);
+              }
+            }
+            
+            // Update last_mth_median_asking_price
+            updateMetric('last_mth_median_asking_price', params.median_price);
+            
+            // Update last_mth_new_listings
+            updateMetric('last_mth_new_listings', params.new_listings_count);
+            
+            ctx._source.last_updated = params.last_updated;
+            """,
+            "params": {
+              "median_price": {
+                "month": last_month,
+                "value": row['median_price']
+              },
+              "new_listings_count": {
+                "month": last_month,
+                "value": int(row['new_listings_count'])
+              },
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          },
+          "upsert": {
+            "geog_id": row['geog_id'],
+            "propertyType": row['propertyType'],
+            "geo_level": int(row['geog_id'].split('_')[0][1:]),
+            "metrics": {
+              "last_mth_median_asking_price": [{
+                "month": last_month,
+                "value": row['median_price']
+              }],
+              "last_mth_new_listings": [{
+                "month": last_month,
+                "value": int(row['new_listings_count'])
+              }]
+            },
+            "last_updated": self.get_current_datetime().isoformat()
+          }
+        }
+   
 
 '''

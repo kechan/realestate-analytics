@@ -36,6 +36,9 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
     self.LOAD_SUCCESS_THRESHOLD = 0.5
 
+    self.es_store_script_name  = "update_last_month_metrics"
+    self.ensure_stored_script_exists()
+
   def setup_extra_stages(self, 
                          add_extra_stage: Callable[[str], None], 
                          add_extra_cleanup_stage: Callable[[str], None]) -> None:
@@ -254,7 +257,9 @@ class LastMthMetricsProcessor(BaseETLProcessor):
         total_attempts = success + len(failed)
         if total_attempts != 0 and success / total_attempts < self.LOAD_SUCCESS_THRESHOLD:
           self.logger.error(f"Less than 50% success rate. Only {success} out of {total_attempts} documents deleted.")
-          raise ValueError("Failed to remove deleted listings. This must be successful to proceed.")      
+          # don't raise 'cos there are many valid errors (such as not found)
+          # we will just log error here without causing trouble
+          # raise ValueError("Failed to remove deleted listings. This must be successful to proceed.")      
         else:
           self._mark_success('remove_deleted_listings')
 
@@ -386,7 +391,8 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
     first_day_current_month = current_date.replace(day=1)
     last_month_start = (first_day_current_month - timedelta(days=1)).replace(day=1)
-    last_month_end = first_day_current_month - timedelta(days=1)
+    # last_month_end = first_day_current_month - timedelta(days=1)  # bug
+    last_month_end = first_day_current_month
 
     last_month_start = last_month_start.date()
     last_month_end = last_month_end.date()
@@ -426,6 +432,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     self.logger.info(f"Successfully deleted {success} documents from Elasticsearch")
     if failed:
       self.logger.error(f"Failed to delete {len(failed)} documents from Elasticsearch")
+      self.datastore.summarize_delete_failures(failed)
 
     if self.cache.cache_dir:
       self._save_to_cache()
@@ -445,73 +452,58 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     def generate_actions():
       for _, row in self.last_mth_metrics_results.iterrows():
         doc_id = f"{row['geog_id']}_{row['propertyType']}"
+        
+        median_price_entry = {
+          "month": last_month,
+          "value": row['median_price']
+        }
+        new_listings_entry = {
+          "month": last_month,
+          "value": int(row['new_listings_count'])
+        }
+        
+        upsert_doc = {
+          "geog_id": row['geog_id'],
+          "propertyType": row['propertyType'],
+          "geo_level": int(row['geog_id'].split('_')[0][1:]),
+          "metrics": {
+            "last_mth_median_asking_price": [median_price_entry],
+            "last_mth_new_listings": [new_listings_entry]
+          },
+          "last_updated": self.get_current_datetime().isoformat()
+        }
+        
         yield {
           "_op_type": "update",
           "_index": self.datastore.mkt_trends_index_name,
           "_id": doc_id,
           "script": {
-            "source": """
-            if (ctx._source.metrics == null) {
-              ctx._source.metrics = new HashMap();
-            }
-            
-            // Function to update or append metric
-            void updateMetric(String metricName, Map newEntry) {
-              if (ctx._source.metrics[metricName] == null) {
-                ctx._source.metrics[metricName] = [];
-              }
-              int existingIndex = -1;
-              for (int i = 0; i < ctx._source.metrics[metricName].size(); i++) {
-                if (ctx._source.metrics[metricName][i].month == newEntry.month) {
-                  existingIndex = i;
-                  break;
-                }
-              }
-              if (existingIndex >= 0) {
-                ctx._source.metrics[metricName][existingIndex] = newEntry;
-              } else {
-                ctx._source.metrics[metricName].add(newEntry);
-              }
-            }
-            
-            // Update last_mth_median_asking_price
-            updateMetric('last_mth_median_asking_price', params.median_price);
-            
-            // Update last_mth_new_listings
-            updateMetric('last_mth_new_listings', params.new_listings_count);
-            
-            ctx._source.last_updated = params.last_updated;
-            """,
+            "id": self.es_store_script_name,
             "params": {
-              "median_price": {
-                "month": last_month,
-                "value": row['median_price']
-              },
-              "new_listings_count": {
-                "month": last_month,
-                "value": int(row['new_listings_count'])
-              },
+              "metric_name": "last_mth_median_asking_price",
+              "new_entry": median_price_entry,
               "last_updated": self.get_current_datetime().isoformat()
             }
           },
-          "upsert": {
-            "geog_id": row['geog_id'],
-            "propertyType": row['propertyType'],
-            "geo_level": int(row['geog_id'].split('_')[0][1:]),
-            "metrics": {
-              "last_mth_median_asking_price": [{
-                "month": last_month,
-                "value": row['median_price']
-              }],
-              "last_mth_new_listings": [{
-                "month": last_month,
-                "value": int(row['new_listings_count'])
-              }]
-            },
-            "last_updated": self.get_current_datetime().isoformat()
-          }
+          "upsert": upsert_doc
         }
- 
+        
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_index_name,
+          "_id": doc_id,
+          "script": {
+            "id": self.es_store_script_name,
+            "params": {
+              "metric_name": "last_mth_new_listings",
+              "new_entry": new_listings_entry,
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          },
+          "upsert": upsert_doc
+        }
+
+    
     # Perform bulk update with error handling
     success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
     
@@ -573,6 +565,11 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
   def _save_to_cache(self):
     super()._save_to_cache()
+
+    # reset index before saving to cache to avoid "serializing a non-default index"
+    # before saving to cache
+    self.listing_df.reset_index(drop=True, inplace=True)   
+
     self.cache.set('on_current_listing', self.listing_df)
     self.logger.info(f"Saved {len(self.listing_df)} listings to cache.")
 
@@ -611,6 +608,53 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     
   def post_end_of_mth_run(self):
     pass
+
+  def ensure_stored_script_exists(self):
+    try:
+      # Check if the script already exists
+      self.datastore.es.get_script(id=self.es_store_script_name)
+      self.logger.info(f"Stored script '{self.es_store_script_name}' already exists")
+    except NotFoundError:
+      # Script doesn't exist, so create it
+      self.create_stored_script()
+    except Exception as e:
+      self.logger.error(f"Error checking for stored script: {e}")
+
+  def create_stored_script(self):
+    script = {
+      "script": {
+        "lang": "painless",
+        "source": """
+          if (ctx._source.metrics == null) {
+            ctx._source.metrics = new HashMap();
+          }
+          if (ctx._source.metrics[params.metric_name] == null) {
+            ctx._source.metrics[params.metric_name] = [];
+          }
+          def metrics = ctx._source.metrics[params.metric_name];
+          def existingIndex = metrics.indexOf(params.new_entry);
+          if (existingIndex != -1) {
+            metrics[existingIndex] = params.new_entry;
+          } else {
+            metrics.add(params.new_entry);
+          }
+          ctx._source.last_updated = params.last_updated;
+        """
+      }
+    }
+    
+    self.datastore.es.put_script(id=self.es_store_script_name, body=script)
+    self.logger.info(f"Stored script '{self.es_store_script_name}' created successfully")
+
+  def delete_stored_script(self):
+    try:
+      self.datastore.es.delete_script(id=self.es_store_script_name)
+      self.logger.info(f"Stored script '{self.es_store_script_name}' deleted successfully")
+    except NotFoundError:
+      self.logger.info(f"Stored script '{self.es_store_script_name}' not found, nothing to delete")
+    except Exception as e:
+      self.logger.error(f"Error deleting stored script '{self.es_store_script_name}': {e}")
+
 
 # For dev
 if __name__ == "__main__":

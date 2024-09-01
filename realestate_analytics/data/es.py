@@ -1034,7 +1034,7 @@ class Datastore:
     if self.es:
       self.es.close()
 
-  # helper to summarize update failures
+  # helper to summarize update and delete failures
   def summarize_update_failures(self, update_failures):
     reasons = Counter()
 
@@ -1042,6 +1042,20 @@ class Datastore:
       error = failure['update'].get('error', {})
       reason = error.get('type', 'unknown')
       reasons[reason] += 1
+
+    self.logger.info("ES failures summary:")
+    self.logger.info("\tSummary,\t\tCount")
+    self.logger.info("\t-----------------")
+    for reason, count in reasons.items():
+      self.logger.info(f"\t\"{reason}\", {count}")
+    self.logger.info("\t-----------------")
+
+  def summarize_delete_failures(self, delete_failures):
+    reasons = Counter()
+
+    for failure in delete_failures:
+      error = failure.get('delete', {}).get('result', {})
+      reasons[error] += 1
 
     self.logger.info("ES failures summary:")
     self.logger.info("\tSummary,\t\tCount")

@@ -230,7 +230,7 @@ class Geo:
 
   @property
   def is_neighbourhood(self) -> bool:
-    return self.level == 10
+    return self.level == 10 or self.level == 20
 
   @property
   def is_city(self) -> bool:
@@ -321,6 +321,8 @@ class Geo:
     # plt.tight_layout()
     # plt.show()
 
+  def show_children(self, figsize=(10, 10), point_of_interest: tuple = None, max_geos=20):
+    self.get_child_geo_collection().show(figsize=(10, 10), max_geos=max_geos)  # Scarborough
 
   def sample_random_point(self):
     """
@@ -472,8 +474,6 @@ class Geo:
     return '.dill' if use_dill else '.pkl'
   
 
-
-
 class GeoCollection:
   logger = logging.getLogger(__name__)
 
@@ -573,6 +573,10 @@ class GeoCollection:
     else:
       raise TypeError("Index must be an integer or string")
 
+  def __repr__(self):
+    geos_str = ",\n\t".join(repr(geo) for geo in self._geos)
+    return f"GeoCollection([\n\t{geos_str}\n])"
+  
   @classmethod
   def from_list(cls, geo_list: List[Geo]) -> 'GeoCollection':
     collection = cls()

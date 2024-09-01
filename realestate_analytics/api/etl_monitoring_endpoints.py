@@ -82,10 +82,17 @@ def parse_monitor_line(line: str, job_status: JobStatus):
     if not timestamp_match:
         return
 
-    timestamp = datetime.strptime(timestamp_match.group(1), '%Y-%m-%d %H:%M:%S')
+    try:
+        timestamp = datetime.strptime(timestamp_match.group(1), '%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        # Handle incorrect timestamp format
+        return
     
     if "Starting" in line:
         stage = line.split("Starting")[-1].split("stage")[0].strip()
+        if stage not in job_status.stages:
+            job_status.stages[stage] = StageInfo(status="In Progress", annotation="Unexpected stage")
+
         job_status.stages[stage].start_time = timestamp
         job_status.stages[stage].status = "In Progress"
     elif "Completed" in line:
