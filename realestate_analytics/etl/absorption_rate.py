@@ -135,6 +135,8 @@ class AbsorptionRateProcessor(BaseETLProcessor):
           expanded_current = expand_guid(self.listing_df)
           current_counts = expanded_current.groupby(['geog_id', 'propertyType']).size().reset_index(name='current_count')
           self.logger.warning(f"Current listing counts for {last_month_yearmonth} not found in archive. Using current listing_df.")
+        else:
+          self.logger.info(f"Loaded current listing counts for {last_month_yearmonth} from archive.")
 
       # Group by geog_id and propertyType
       sold_counts = expanded_sold.groupby(['geog_id', 'propertyType']).size().reset_index(name='sold_count')

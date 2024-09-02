@@ -488,5 +488,57 @@ def compute_metrics(df, date_mask, geo_level):
           }
         }
    
-
+    def generate_actions():
+      for _, row in self.last_mth_metrics_results.iterrows():
+        doc_id = f"{row['geog_id']}_{row['propertyType']}"
+        
+        median_price_entry = {
+          "month": last_month,
+          "value": row['median_price']
+        }
+        new_listings_entry = {
+          "month": last_month,
+          "value": int(row['new_listings_count'])
+        }
+        
+        upsert_doc = {
+          "geog_id": row['geog_id'],
+          "propertyType": row['propertyType'],
+          "geo_level": int(row['geog_id'].split('_')[0][1:]),
+          "metrics": {
+            "last_mth_median_asking_price": [median_price_entry],
+            "last_mth_new_listings": [new_listings_entry]
+          },
+          "last_updated": self.get_current_datetime().isoformat()
+        }
+        
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_index_name,
+          "_id": doc_id,
+          "script": {
+            "id": self.es_store_script_name,
+            "params": {
+              "metric_name": "last_mth_median_asking_price",
+              "new_entry": median_price_entry,
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          },
+          "upsert": upsert_doc
+        }
+        
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_index_name,
+          "_id": doc_id,
+          "script": {
+            "id": self.es_store_script_name,
+            "params": {
+              "metric_name": "last_mth_new_listings",
+              "new_entry": new_listings_entry,
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          },
+          "upsert": upsert_doc
+        }
 '''
