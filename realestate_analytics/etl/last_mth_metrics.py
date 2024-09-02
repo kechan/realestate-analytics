@@ -36,8 +36,8 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
     self.LOAD_SUCCESS_THRESHOLD = 0.5
 
-    self.es_store_script_name  = "update_last_month_metrics"
-    self.ensure_stored_script_exists()
+    # self.es_store_script_name  = "update_last_month_metrics"
+    # self.ensure_stored_script_exists()
 
   def setup_extra_stages(self, 
                          add_extra_stage: Callable[[str], None], 
@@ -451,58 +451,123 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
     def generate_actions():
       for _, row in self.last_mth_metrics_results.iterrows():
-        doc_id = f"{row['geog_id']}_{row['propertyType']}"
-        
-        median_price_entry = {
-          "month": last_month,
-          "value": row['median_price']
-        }
-        new_listings_entry = {
-          "month": last_month,
-          "value": int(row['new_listings_count'])
-        }
-        
-        upsert_doc = {
-          "geog_id": row['geog_id'],
-          "propertyType": row['propertyType'],
-          "geo_level": int(row['geog_id'].split('_')[0][1:]),
-          "metrics": {
-            "last_mth_median_asking_price": [median_price_entry],
-            "last_mth_new_listings": [new_listings_entry]
-          },
-          "last_updated": self.get_current_datetime().isoformat()
-        }
-        
+        composite_id = f"{row['geog_id']}_{row['propertyType']}"
+
+        # Update for last_mth_median_asking_price
         yield {
           "_op_type": "update",
           "_index": self.datastore.mkt_trends_index_name,
-          "_id": doc_id,
+          "_id": composite_id,
           "script": {
-            "id": self.es_store_script_name,
+            "source": """
+            if (ctx._source.metrics == null) {
+              ctx._source.metrics = new HashMap();
+            }
+            if (ctx._source.metrics.last_mth_median_asking_price == null) {
+              ctx._source.metrics.last_mth_median_asking_price = [];
+            }
+            // Check if an entry for this month already exists
+            int existingIndex = -1;
+            for (int i = 0; i < ctx._source.metrics.last_mth_median_asking_price.size(); i++) {
+              if (ctx._source.metrics.last_mth_median_asking_price[i].month == params.new_metric.month) {
+                existingIndex = i;
+                break;
+              }
+            }
+            if (existingIndex >= 0) {
+              // Replace existing entry
+              ctx._source.metrics.last_mth_median_asking_price[existingIndex] = params.new_metric;
+            } else {
+              // Append new entry
+              ctx._source.metrics.last_mth_median_asking_price.add(params.new_metric);
+            }
+            ctx._source.geog_id = params.geog_id;
+            ctx._source.propertyType = params.propertyType;
+            ctx._source.geo_level = params.geo_level;
+            ctx._source.last_updated = params.last_updated;
+            """,
             "params": {
-              "metric_name": "last_mth_median_asking_price",
-              "new_entry": median_price_entry,
+              "new_metric": {
+                "month": last_month,
+                "value": float(row['median_price'])
+              },
+              "geog_id": row['geog_id'],
+              "propertyType": row['propertyType'],
+              "geo_level": int(row['geog_id'].split('_')[0][1:]),
               "last_updated": self.get_current_datetime().isoformat()
             }
           },
-          "upsert": upsert_doc
-        }
-        
-        yield {
-          "_op_type": "update",
-          "_index": self.datastore.mkt_trends_index_name,
-          "_id": doc_id,
-          "script": {
-            "id": self.es_store_script_name,
-            "params": {
-              "metric_name": "last_mth_new_listings",
-              "new_entry": new_listings_entry,
-              "last_updated": self.get_current_datetime().isoformat()
-            }
-          },
-          "upsert": upsert_doc
+          "upsert": {
+            "geog_id": row['geog_id'],
+            "propertyType": row['propertyType'],
+            "geo_level": int(row['geog_id'].split('_')[0][1:]),
+            "metrics": {
+              "last_mth_median_asking_price": [{
+                "month": last_month,
+                "value": float(row['median_price'])
+              }]
+            },
+            "last_updated": self.get_current_datetime().isoformat()
+          }
         }
 
+        # Update for last_mth_new_listings
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_index_name,
+          "_id": composite_id,
+          "script": {
+            "source": """
+            if (ctx._source.metrics == null) {
+              ctx._source.metrics = new HashMap();
+            }
+            if (ctx._source.metrics.last_mth_new_listings == null) {
+              ctx._source.metrics.last_mth_new_listings = [];
+            }
+            // Check if an entry for this month already exists
+            int existingIndex = -1;
+            for (int i = 0; i < ctx._source.metrics.last_mth_new_listings.size(); i++) {
+              if (ctx._source.metrics.last_mth_new_listings[i].month == params.new_metric.month) {
+                existingIndex = i;
+                break;
+              }
+            }
+            if (existingIndex >= 0) {
+              // Replace existing entry
+              ctx._source.metrics.last_mth_new_listings[existingIndex] = params.new_metric;
+            } else {
+              // Append new entry
+              ctx._source.metrics.last_mth_new_listings.add(params.new_metric);
+            }
+            ctx._source.geog_id = params.geog_id;
+            ctx._source.propertyType = params.propertyType;
+            ctx._source.geo_level = params.geo_level;
+            ctx._source.last_updated = params.last_updated;
+            """,
+            "params": {
+              "new_metric": {
+                "month": last_month,
+                "value": int(row['new_listings_count'])
+              },
+              "geog_id": row['geog_id'],
+              "propertyType": row['propertyType'],
+              "geo_level": int(row['geog_id'].split('_')[0][1:]),
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          },
+          "upsert": {
+            "geog_id": row['geog_id'],
+            "propertyType": row['propertyType'],
+            "geo_level": int(row['geog_id'].split('_')[0][1:]),
+            "metrics": {
+              "last_mth_new_listings": [{
+                "month": last_month,
+                "value": int(row['new_listings_count'])
+              }]
+            },
+            "last_updated": self.get_current_datetime().isoformat()
+          }
+        }
     
     # Perform bulk update with error handling
     success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
@@ -609,6 +674,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
   def post_end_of_mth_run(self):
     pass
 
+# ES Update solution using stored script (this may not be needed and appeared more complex)
   def ensure_stored_script_exists(self):
     try:
       # Check if the script already exists

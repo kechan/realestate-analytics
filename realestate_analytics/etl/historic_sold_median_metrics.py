@@ -796,13 +796,12 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
   def remove_metrics_from_mkt_trends_ts(self):
     '''
     This method selectively removes only the metrics computed by SoldMedianMetricsProcessor
-    from the mkt_trends_ts index, preserving other important metrics.
+    from the mkt trends index, preserving other important metrics.
     '''
     def generate_actions():
-      # Use scan to efficiently retrieve all documents that have a 'metrics' field
       for hit in scan(self.datastore.es, 
                       index=self.datastore.mkt_trends_index_name, 
-                      query={"query": {"exists": {"field": "metrics"}}}):
+                      query={"query": {"match_all": {}}}):
         yield {
           "_op_type": "update",
           "_index": self.datastore.mkt_trends_index_name,
