@@ -1,6 +1,6 @@
 from typing import List, Dict, Any, Tuple, Union
 
-import os, json, time, traceback
+import os, json, time, traceback, re
 from datetime import datetime, timedelta
 from collections import Counter
 from dotenv import load_dotenv, find_dotenv
@@ -834,13 +834,18 @@ class Datastore:
     """
     data_dir = Path(data_dir)
     all_geo_entry_df = pd.read_csv(data_dir/'all_geo_entry.txt', sep='\t')  # read in new .txt dump
+    self.logger.info(f"Read in {len(all_geo_entry_df)} rows from updated all_geo_entry.txt")
 
     # combine with previous geo_entry_df
     prev_geo_entry_df = self.cache.get('all_geo_entry')
+    self.logger.info(f"Read in {len(prev_geo_entry_df)} rows from previous all_geo_entry cache") 
+
     all_geo_entry_df = pd.concat([prev_geo_entry_df, all_geo_entry_df], ignore_index=True)
     # drop duplicates and keep last
     all_geo_entry_df.drop_duplicates(subset=['MLS', 'CITY', 'PROV_STATE'], keep='last', inplace=True)
     all_geo_entry_df.reset_index(drop=True, inplace=True)
+
+    self.logger.info(f"Output {len(all_geo_entry_df)} rows to updated all_geo_entry cache")
 
     self.cache.set(key='all_geo_entry', value=all_geo_entry_df)
 
@@ -848,18 +853,6 @@ class Datastore:
     """
     This is a temporary fix to update guid in sold listing cache
     """
-    # Function to parse geog_ids
-    def parse_geog_ids(geog_string):
-      if pd.isna(geog_string):
-        return {}
-      geog_ids = geog_string.split(',')
-      parsed = {}
-      for geog_id in geog_ids:
-        match = re.match(r'g(\d+)_\w+', geog_id)
-        if match:
-          level = match.group(1)
-          parsed[f'geog_id_{level}'] = geog_id
-      return parsed
     
     for sold_listing_cache_key in ['five_years_sold_listing', 'one_year_sold_listing']:
 
@@ -871,6 +864,8 @@ class Datastore:
         return
       
       len_b4_sold_listing = len(sold_listing_df)
+      self.logger.info(f'len of {sold_listing_cache_key} before fixing guid: {len_b4_sold_listing}')
+
       geo_entry_df.drop_duplicates(subset=['MLS', 'CITY', 'PROV_STATE'], keep='last', inplace=True)
 
       # Merge the geo_entry_df with the sold_listing_df
@@ -882,15 +877,19 @@ class Datastore:
 
       # sold_listing_df['guid'] = sold_listing_df['GEOGRAPHIES']
       for index, row in sold_listing_df.iterrows():
-        if pd.isna(row['guid']) or row['guid'] == '':
+        if pd.isna(row['guid']) or row['guid'] == '' or row['guid'] == 'None':
           sold_listing_df.at[index, 'guid'] = row['GEOGRAPHIES']
 
-      sold_listing_df.drop(columns=['MLS', 'CITY', 'PROV_STATE', 'GEOGRAPHIES'], inplace=True)
+      sold_listing_df.drop(columns=['MLS', 'CITY', 'PROV_STATE', 'GEOGRAPHIES'], inplace=True)  # remove the extra columns from geo_entry
       len_after_sold_listing = len(sold_listing_df)
+      self.logger.info(f'len of {sold_listing_cache_key} after fixing guid: {len_after_sold_listing}')
 
       assert len_b4_sold_listing == len_after_sold_listing, "Length of sold listing df changed after fixing guid"
 
       self.cache.set(key=sold_listing_cache_key, value=sold_listing_df)
+
+      perc_guid_null = round(sold_listing_df.guid.isnull().sum()/len(sold_listing_df) * 100, 2)
+      self.logger.info(f"% of guid null in {sold_listing_cache_key}: {perc_guid_null}%")
 
  
   def _update_es_sold_listings_with_guid(self):

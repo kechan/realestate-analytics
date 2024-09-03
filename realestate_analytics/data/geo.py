@@ -627,13 +627,21 @@ class GeoCollection:
 
   def assign_guids_to_listing_df(self, df: pd.DataFrame, filter: Callable = None, cutoff_timestamp: pd.Timestamp = None):
     """
-    Compute, construct and assign guid for df
+    Compute, construct and assign guid for listing df
     """
     assert 'lat' in df.columns and 'lng' in df.columns, "Latitude and longitude columns are required in the DataFrame"
     
     self.logger.info(f'# of geos in collection: {len(self)}')
 
     def construct_guid(lat: float, lng: float) -> str:
+      """
+      Construct a GUID for a given latitude and longitude.
+      Returns:
+      - str: A string representing the GUID, which is a comma-separated list of geo
+            region identifiers that contain the given point, ordered from the finest level
+            of granularity to the coarsest. Returns None if no geographic regions contain
+            the point.
+      """
       levels = [40, 35, 30, 20, 10]
       found_geos = []
       searched_levels = set()

@@ -541,4 +541,17 @@ def compute_metrics(df, date_mask, geo_level):
           },
           "upsert": upsert_doc
         }
+
+        # Function to parse geog_ids
+        def parse_geog_ids(geog_string):
+          if pd.isna(geog_string):
+            return {}
+          geog_ids = geog_string.split(',')
+          parsed = {}
+          for geog_id in geog_ids:
+            match = re.match(r'g(\d+)_\w+', geog_id)
+            if match:
+              level = match.group(1)
+              parsed[f'geog_id_{level}'] = geog_id
+          return parsed
 '''
