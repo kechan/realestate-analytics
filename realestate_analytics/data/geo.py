@@ -647,7 +647,7 @@ class GeoCollection:
       searched_levels = set()
 
       def search_geo(level, parent_geo=None):
-        """Search for the geo at the current level."""
+        """Search for the geo at the current level or that belonging to the given parent."""
         if level in searched_levels:
           return None
         geos = parent_geo.children if parent_geo else self.get_by_level(level)
