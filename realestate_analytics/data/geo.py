@@ -377,7 +377,7 @@ class Geo:
     return attributes_str
 
   def __repr__(self):
-    return f"Geo(geog_id='{self.geog_id}', name='{self.name}', level={self.level})"
+    return f"Geo(geog_id='{self.geog_id}', name='{self.name}', level={self.level}, longId={self.long_id})"
 
 
   @classmethod

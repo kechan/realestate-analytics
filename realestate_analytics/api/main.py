@@ -1,6 +1,7 @@
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from realestate_analytics.api.endpoints import historic_sold_metrics, last_mth_metrics, absorption_rate, geos
 from realestate_analytics.api.etl_script_kickoff_endpoints import router as etl_router
 from realestate_analytics.api.etl_monitoring_endpoints import router as monitoring_router
@@ -24,6 +25,14 @@ async def lifespan(app: FastAPI):
     logger.debug("Application is shutting down")
 
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3001"],  # Add your React app's URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Include the ETL script kickoff endpoints router with the /op prefix
 app.include_router(etl_router, prefix="/op", tags=["operations"])
