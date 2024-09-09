@@ -322,7 +322,7 @@ class Geo:
     # plt.show()
 
   def show_children(self, figsize=(10, 10), point_of_interest: tuple = None, max_geos=20):
-    self.get_child_geo_collection().show(figsize=(10, 10), max_geos=max_geos)  # Scarborough
+    self.get_child_geo_collection().show(figsize=(10, 10), max_geos=max_geos)
 
   def sample_random_point(self):
     """

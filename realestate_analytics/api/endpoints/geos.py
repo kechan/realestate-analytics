@@ -121,7 +121,7 @@ async def get_geos(
         geos = geo_collection.get_by_level(40)
 
     if geometry:
-        geos = [
+        geos_info = [
             GeoInfoWithGeometry(
                 name=geo.name,
                 geog_id=geo.geog_id,
@@ -132,7 +132,7 @@ async def get_geos(
             ) for geo in geos
         ]
     else:
-      geos = [
+      geos_info = [
           GeoInfo(
               name=geo.name,
               geog_id=geo.geog_id,
@@ -142,8 +142,8 @@ async def get_geos(
           ) for geo in geos
       ]
 
-    # return geos
-    return geos_to_geojson_feature_collection(geos)
+    geos_info.sort(key=lambda x: x.name)
+    return geos_to_geojson_feature_collection(geos_info)
 
 # note search has to precede other routes that come after, do not mix up the order
 # @router.get("/search", response_model=List[GeoInfo])
@@ -181,8 +181,25 @@ async def search_geos(
             ) for geo in matching_collection
         ]
 
-    # return geos
+    geos.sort(key=lambda x: x.name)
     return geos_to_geojson_feature_collection(geos)
+
+
+@router.get("/gta-cities", response_model=GeoJSONFeatureCollection)
+async def get_gta_cities(
+    geometry: bool = Query(False, description="Include geometry data if true"),
+    geo_collection: GeoCollection = Depends(get_geo_collection)
+):
+    """
+    Retrieve all cities (level 30) under the Greater Toronto Area (GTA).
+    """
+    # Reuse the get_geos function with hardcoded parameters for GTA
+    return await get_geos(
+        level=30,  # City level
+        parent_id="g40_dpz3tpuh",  # GTA's geog_id
+        geometry=geometry,
+        geo_collection=geo_collection
+    )
 
 
 @router.get("/{geog_id}", response_model=GeoJSONFeature)
@@ -259,6 +276,7 @@ async def get_geo_hierarchy(
     
     # return list(reversed(hierarchy))
     return geos_to_geojson_feature_collection(list(reversed(hierarchy)))
+
 
 
 

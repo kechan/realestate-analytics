@@ -22,10 +22,10 @@ class FileBasedCache:
         List[str]: A list of all valid cache keys.
     """
     keys = set()
-    for file in self.cache_dir.iterdir():
+    for file in self.cache_dir.rglob('*'):
       if file.is_file():
-        # Remove the suffix (_df or .txt) to get the key
-        key = file.stem
+        relative_path = file.relative_to(self.cache_dir)
+        key = str(relative_path.parent / relative_path.stem)
         if file.suffix == '.txt' or key.endswith('_df'):
           keys.add(key[:-3] if key.endswith('_df') else key)
     
@@ -38,7 +38,15 @@ class FileBasedCache:
 
   def _get_cache_path(self, key: str, suffix: str) -> Path:
     # suffix = '_df' if is_df else '.txt'   # TODO: only pandas dataframes or text files for now
-    return self.cache_dir / f'{key}{suffix}'
+    if '/' in key:
+      parts = key.split('/')
+      subdirs = parts[:-1]
+      filename = parts[-1]
+      path = self.cache_dir.joinpath(*subdirs)
+      path.mkdir(parents=True, exist_ok=True)
+      return path / f'{filename}{suffix}'
+    else:
+      return self.cache_dir / f'{key}{suffix}'
   
   def set(self, key: str, value: Any, expiry: Optional[timedelta] = None):
     # is_df = isinstance(value, pd.DataFrame)
@@ -98,8 +106,11 @@ class FileBasedCache:
           path.unlink()
 
   def clear(self) -> None:
-    for cache_file in self.cache_dir.ls('*'):
-      cache_file.unlink()
+    for item in self.cache_dir.rglob('*'):
+      if item.is_file():
+        item.unlink()
+      elif item.is_dir() and not any(item.iterdir()):
+        item.rmdir()
 
   # def get_last_run(self) -> Optional[datetime]:
   #   return self.get('last_run')    
