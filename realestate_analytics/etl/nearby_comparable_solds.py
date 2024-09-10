@@ -342,6 +342,8 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
         else:
           self.logger.info("Skipping check for deleted listings in BigQuery (as per configuration).")
 
+        self.listing_df.reset_index(drop=True, inplace=True)
+
       # if all operations are successful, update the data cache 
       self._save_to_cache()
       self.cache.set(self.last_run_key, end_time)   # save to cache: last run time, and the data.
