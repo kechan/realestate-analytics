@@ -834,6 +834,128 @@ curl -X GET "http://your-api-domain.com/geos/hierarchy/g20_dpz9hct3?geometry=tru
 **Response Structure:**
 Same as the "Get Geographic Entities" endpoint, with features ordered from the top-most ancestor to the specified geographic entity.
 
+### 11. Get GTA Cities
+
+Retrieves a list of cities in the Greater Toronto Area (GTA), optionally including geometry data.
+
+**Endpoint:** `/geos/gta-cities`
+
+**Method:** GET
+
+**Query Parameters:**
+- `geometry` (optional): Include geometry data for each city if set to `true`. Default is `false`.
+
+**Example CURL requests:**
+```bash
+curl -X GET "http://your-api-domain.com/geos/gta-cities?geometry=false"
+```
+```bash
+curl -X GET "http://your-api-domain.com/geos/gta-cities?geometry=true"
+```
+
+**Response Example (without geometry):**
+```json
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": null,
+      "properties": {
+        "name": "Ajax",
+        "geog_id": "g30_dpzc9djg",
+        "level": 30,
+        "parent_geog_id": "g40_dpz3tpuh",
+        "has_children": true
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": null,
+      "properties": {
+        "name": "Aurora",
+        "geog_id": "g30_dpzd21k0",
+        "level": 30,
+        "parent_geog_id": "g40_dpz3tpuh",
+        "has_children": false
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": null,
+      "properties": {
+        "name": "Bradford West Gwillimbury",
+        "geog_id": "g30_dpz6urb8",
+        "level": 30,
+        "parent_geog_id": "g40_dpz3tpuh",
+        "has_children": false
+      }
+    }
+  ]
+}
+```
+
+**Response Example (with geometry):**
+```json
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-78.99693, 43.89518],
+            [-78.9705, 43.83349],
+            // ... more coordinates ...
+          ]
+        ]
+      },
+      "properties": {
+        "name": "Ajax",
+        "geog_id": "g30_dpzc9djg",
+        "level": 30,
+        "parent_geog_id": "g40_dpz3tpuh",
+        "has_children": true
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-79.46693, 44.00018],
+            [-79.4505, 43.95349],
+            // ... more coordinates ...
+          ]
+        ]
+      },
+      "properties": {
+        "name": "Aurora",
+        "geog_id": "g30_dpzd21k0",
+        "level": 30,
+        "parent_geog_id": "g40_dpz3tpuh",
+        "has_children": false
+      }
+    }
+  ]
+}
+```
+
+**Response Structure:**
+- `type`: Always "FeatureCollection" for this endpoint.
+- `features`: An array of GeoJSON Feature objects, each representing a city.
+  - `type`: Always "Feature" for each entity.
+  - `geometry`: The city's geometry data if `geometry=true`, otherwise `null`.
+  - `properties`: Contains the attributes of the city.
+    - `name`: The name of the city.
+    - `geog_id`: The unique identifier for the city.
+    - `level`: The hierarchical level of the city (always 30 for cities).
+    - `parent_geog_id`: The ID of the parent geographic entity (GTA level).
+    - `has_children`: Indicates whether this city has sub-geographic entities.
+
 
 ## Notes
 

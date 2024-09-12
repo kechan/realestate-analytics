@@ -25,7 +25,8 @@ class BaseETLProcessor(ABC):
     if not self.check_dependencies():
       raise Exception("Failed to establish connection to required datastores")
 
-    self.last_run_key = f"{self.__class__.__name__}_last_run"
+    self.cache_prefix = f"{self.__class__.__name__}/"
+    self.last_run_key = f"{self.cache_prefix}last_run"
 
     self.cache_dir = None
     self.archive_dir = None
@@ -269,13 +270,13 @@ class BaseETLProcessor(ABC):
 
   # checkpoints marker helper methods
   def _was_success(self, stage: str) -> bool:
-    return self.cache.get(f"{self.job_id}_{stage}_success") is not None
+    return self.cache.get(f"{self.cache_prefix}{self.job_id}_{stage}_success") is not None
 
   def _mark_success(self, stage: str):
-    self.cache.set(f"{self.job_id}_{stage}_success", " ")
+    self.cache.set(f"{self.cache_prefix}{self.job_id}_{stage}_success", " ")
 
   def _unmark_success(self, stage: str):
-    self.cache.delete(f"{self.job_id}_{stage}_success")
+    self.cache.delete(f"{self.cache_prefix}{self.job_id}_{stage}_success")
 
 
   # Event hooks

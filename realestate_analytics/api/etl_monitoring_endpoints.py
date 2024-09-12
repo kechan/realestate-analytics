@@ -9,6 +9,11 @@ from datetime import datetime
 
 from dotenv import load_dotenv, find_dotenv
 
+# from realestate_analytics.etl.nearby_comparable_solds import NearbyComparableSoldsProcessor
+# from realestate_analytics.etl.historic_sold_median_metrics import SoldMedianMetricsProcessor
+# from realestate_analytics.etl.last_mth_metrics import LastMthMetricsProcessor
+# from realestate_analytics.etl.absorption_rate import AbsorptionRateProcessor
+
 from realestate_analytics.api.dependencies import get_cache
 
 logger = logging.getLogger(__name__)
@@ -24,14 +29,98 @@ SCRIPT_DIR = Path(SCRIPT_DIR)
 if not SCRIPT_DIR.is_dir():
     raise EnvironmentError(f"ANALYTICS_ETL_SCRIPT_DIR '{SCRIPT_DIR}' is not a valid directory")
 
-etl_type_to_log_prefix = {
-  "nearby_comparable_solds": "nearby_solds",
-  "historic_metrics": "hist_median_metrics",
-  "last_mth_metrics": "last_mth_metrics",
-  "absorption_rate": "absorption_rate",
-}
+# Note: log prefix is also the job id prefix
+# etl_type_to_log_prefix = {
+#   "nearby_comparable_solds": "nearby_solds",
+#   "historic_metrics": "hist_median_metrics",
+#   "last_mth_metrics": "last_mth_metrics",
+#   "absorption_rate": "absorption_rate",
+# }
+
+# etl_type_to_class_names = {
+#   "nearby_comparable_solds": "NearbyComparableSoldsProcessor",
+#   "historic_metrics": "SoldMedianMetricsProcessor",
+#   "last_mth_metrics": "LastMthMetricsProcessor",
+#   "absorption_rate": "AbsorptionRateProcessor",
+# }
 
 router = APIRouter()
+
+class ETLJobInfo:
+    # etl_type are the top level keys in _INFO
+    _INFO = {
+        "nearby_comparable_solds": {
+            "log_prefix": "nearby_solds",
+            "class_name": "NearbyComparableSoldsProcessor"
+        },
+        "historic_metrics": {
+            "log_prefix": "hist_median_metrics",
+            "class_name": "SoldMedianMetricsProcessor"
+        },
+        "last_mth_metrics": {
+            "log_prefix": "last_mth_metrics",
+            "class_name": "LastMthMetricsProcessor"
+        },
+        "absorption_rate": {
+            "log_prefix": "absorption_rate",
+            "class_name": "AbsorptionRateProcessor"
+        }
+    }
+
+    @classmethod
+    def get_log_prefix(cls, etl_type: str) -> str:
+        return cls._INFO[etl_type]["log_prefix"]
+
+    @classmethod
+    def get_class_name(cls, etl_type: str) -> str:
+        return cls._INFO[etl_type]["class_name"]
+
+    @classmethod
+    def get_etl_type_by_log_prefix(cls, log_prefix: str) -> str:
+        for etl_type, info in cls._INFO.items():
+            if info["log_prefix"] == log_prefix:
+                return etl_type
+        return None
+
+    @classmethod
+    def get_etl_type_by_class_name(cls, class_name: str) -> str:
+        for etl_type, info in cls._INFO.items():
+            if info["class_name"] == class_name:
+                return etl_type
+        return None
+
+    @classmethod
+    def is_valid_etl_type(cls, etl_type: str) -> bool:
+        return etl_type in cls._INFO
+
+    @classmethod
+    def get_all_etl_types(cls) -> List[str]:
+        return list(cls._INFO.keys())
+
+    @classmethod
+    def get_log_prefix_from_job_id(cls, job_id: str) -> str:
+        for info in cls._INFO.values():
+            if job_id.startswith(info["log_prefix"]):
+                return info["log_prefix"]
+        return None
+
+    @classmethod
+    def get_class_name_from_job_id(cls, job_id: str) -> Optional[str]:
+        log_prefix = cls.get_log_prefix_from_job_id(job_id)
+        if log_prefix:
+            etl_type = cls.get_etl_type_by_log_prefix(log_prefix)
+            return cls.get_class_name(etl_type)
+        return None
+
+    @classmethod
+    def get_etl_type_from_job_id(cls, job_id: str) -> Optional[str]:
+        # ETLJobInfo.get_etl_type_by_log_prefix(ETLJobInfo.get_log_prefix_from_job_id(job_id))
+        log_prefix = cls.get_log_prefix_from_job_id(job_id)
+        if log_prefix:
+            return cls.get_etl_type_by_log_prefix(log_prefix)
+        return None
+        
+
 
 class StageInfo(BaseModel):
     status: str
@@ -59,10 +148,14 @@ async def get_valid_etl_types():
     """
     Returns a list of all valid ETL types.
     """
-    return list(etl_type_to_log_prefix.keys())
+    # return list(etl_type_to_log_prefix.keys())
+    return ETLJobInfo.get_all_etl_types()
 
 @router.get("/job/{job_id}", response_model=JobStatus)
 async def get_job_status(job_id: str):
+    etl_class_name = ETLJobInfo.get_class_name_from_job_id(job_id)
+    print(f'etl_class_name: {etl_class_name}')
+    
     cache = get_cache()
     log_path = SCRIPT_DIR/f"{job_id}.log"
 
@@ -77,13 +170,13 @@ async def get_job_status(job_id: str):
     job_status.stages = {stage: StageInfo(status="Not Completed") for stage in stages}
 
     # Check if the job is completed
-    if cache.get(f"{job_id}_all_success") is not None:
+    if cache.get(f"{etl_class_name}/{job_id}_all_success") is not None:
         job_status.overall_status = "Completed"
         job_status.stages = {stage: StageInfo(status="Completed") for stage in stages}
     else:
         # Check individual stages
         for stage in stages:
-            cache_key = f"{job_id}_{stage}_success"
+            cache_key = f"{etl_class_name}/{job_id}_{stage}_success"
             if cache.get(cache_key) is not None:
                 job_status.stages[stage] = StageInfo(status="Completed")                           
 
@@ -106,9 +199,11 @@ async def get_job_status(job_id: str):
 
 # Helper function to validate etl_type and retrieve the log prefix
 def validate_etl_type_and_get_log_prefix(etl_type: Optional[str]):
-    if etl_type and etl_type not in etl_type_to_log_prefix:
+    # if etl_type and etl_type not in etl_type_to_log_prefix:
+    if etl_type and not ETLJobInfo.is_valid_etl_type(etl_type):
         raise HTTPException(status_code=400, detail=f"Invalid ETL type: {etl_type}")
-    return etl_type_to_log_prefix.get(etl_type) if etl_type else None
+    # return etl_type_to_log_prefix.get(etl_type) if etl_type else None
+    return ETLJobInfo.get_log_prefix(etl_type) if etl_type else None
 
 
 # Helper function to filter and retrieve log files (skips rotated logs if needed)
@@ -130,7 +225,8 @@ async def get_job_summaries(log_files: List[Path], etl_type: Optional[str], limi
         job_status = await get_job_status(job_id)
 
         # Derive ETL type from job_id
-        derived_etl_type = next((et for et, prefix in etl_type_to_log_prefix.items() if job_id.startswith(prefix)), None)
+        # derived_etl_type = next((et for et, prefix in etl_type_to_log_prefix.items() if job_id.startswith(prefix)), None)
+        derived_etl_type = ETLJobInfo.get_etl_type_from_job_id(job_id)
 
         # Only add job if it matches the requested ETL type (if specified)
         if not etl_type or derived_etl_type == etl_type:
@@ -204,6 +300,7 @@ async def get_active_job(etl_type: Optional[str] = None):
             return job_status
     
     return None
+
 
 def parse_monitor_line(line: str, job_status: JobStatus):
     timestamp_match = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)

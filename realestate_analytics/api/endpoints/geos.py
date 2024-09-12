@@ -223,7 +223,8 @@ async def get_geo_by_id(
             level=geo.level,
             parent_geog_id=geo.parent_id,
             has_children=len(geo.children) > 0,
-            geometry=geo.geometry
+            # geometry=geo.geometry
+            geometry=geo.simplified_geometry
         )
     else:
         # Use the original model without geometry

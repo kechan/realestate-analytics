@@ -176,8 +176,10 @@ class AbsorptionRateProcessor(BaseETLProcessor):
 
   def _load_from_cache(self):
     super()._load_from_cache()
-    self.sold_listing_df = self.cache.get('one_year_sold_listing')
-    self.listing_df = self.cache.get('on_listing')   # from NearbyComparableSoldsProcessor
+    nearby_comparable_solds_prefix = 'NearbyComparableSoldsProcessor/'
+
+    self.sold_listing_df = self.cache.get(f'{nearby_comparable_solds_prefix}one_year_sold_listing')
+    self.listing_df = self.cache.get(f'{nearby_comparable_solds_prefix}on_listing')   # from NearbyComparableSoldsProcessor
     
     if self.sold_listing_df is None or self.listing_df is None:
       self.logger.error("Missing sold_listing_df or listing_df.")

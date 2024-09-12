@@ -233,8 +233,8 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
 
       else:    # incremental/delta load 
         # Load existing data from cache
-        self.sold_listing_df = self.cache.get('one_year_sold_listing')
-        self.listing_df = self.cache.get('on_listing')
+        self.sold_listing_df = self.cache.get(f'{self.cache_prefix}one_year_sold_listing')
+        self.listing_df = self.cache.get(f'{self.cache_prefix}on_listing')
 
         if self.sold_listing_df is None or self.listing_df is None:
           self.logger.error("Cache is inconsistent. Missing prior sold_listing_df or listing_df.")
@@ -357,8 +357,8 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
   def _load_from_cache(self):
     super()._load_from_cache()
     
-    self.sold_listing_df = self.cache.get('one_year_sold_listing')
-    self.listing_df = self.cache.get("on_listing")
+    self.sold_listing_df = self.cache.get(f'{self.cache_prefix}one_year_sold_listing')
+    self.listing_df = self.cache.get(f"{self.cache_prefix}on_listing")
 
     if self.sold_listing_df is None or self.listing_df is None:
       self.logger.error("Missing sold_listing_df or listing_df in cache.")
@@ -370,8 +370,8 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
   def _save_to_cache(self):
     super()._save_to_cache()
     
-    self.cache.set('one_year_sold_listing', self.sold_listing_df)
-    self.cache.set('on_listing', self.listing_df)
+    self.cache.set(f'{self.cache_prefix}one_year_sold_listing', self.sold_listing_df)
+    self.cache.set(f'{self.cache_prefix}on_listing', self.listing_df)
 
     self.logger.info(f"Saved {len(self.sold_listing_df)} sold listings and {len(self.listing_df)} current listings to cache.")
 
@@ -379,7 +379,7 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
   def transform(self):
     if self._was_success('transform'):  # load the cache and skip instead
       self.logger.info("Transform already successful. Loading checkpoint from cache.")
-      diff_result_json = self.cache.get(f"{self.job_id}_transform_diff_result").replace("'", '"')
+      diff_result_json = self.cache.get(f"{self.cache_prefix}{self.job_id}_transform_diff_result").replace("'", '"')
       diff_result_json = diff_result_json.replace("'", '"')
       self.diff_result = json.loads(diff_result_json)
       return
@@ -390,8 +390,8 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
 
       # optimize such that we dont update on things that didnt change from last run.
       # Retrieve previous result from cache
-      # prev_result = eval(self.cache.get('comparable_sold_listings_result')) # it deserializes back to dict
-      prev_result_json = self.cache.get('comparable_sold_listings_result')
+      # prev_result = eval(self.cache.get(f'{self.cache_prefix}comparable_sold_listings_result')) # it deserializes back to dict
+      prev_result_json = self.cache.get(f'{self.cache_prefix}comparable_sold_listings_result')
       if prev_result_json:
         prev_result_json = prev_result_json.replace("'", '"')
         self.logger.info("Found previous comparable_sold_listings_result in cache. Deserializing...")
@@ -411,11 +411,11 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
         self.diff_result = self.comparable_sold_listings_result
       
       # Cache the full current result for next time
-      self.cache.set('comparable_sold_listings_result', self.comparable_sold_listings_result)
+      self.cache.set(f'{self.cache_prefix}comparable_sold_listings_result', self.comparable_sold_listings_result)
       self.logger.info(f"{len(self.diff_result)} listings to be updated.")
       
       # checkpoint the diff results
-      self.cache.set(f"{self.job_id}_transform_diff_result", self.diff_result)  # save the diff result in case a recovery is needed.
+      self.cache.set(f"{self.cache_prefix}{self.job_id}_transform_diff_result", self.diff_result)  # save the diff result in case a recovery is needed.
       self._mark_success('transform')
 
     except Exception as e:
@@ -445,9 +445,9 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
     super().cleanup()
     
     # remove resident cache data
-    self.cache.delete('one_year_sold_listing')
-    self.cache.delete('on_listing')
-    self.cache.delete('comparable_sold_listings_result')
+    self.cache.delete(f'{self.cache_prefix}one_year_sold_listing')
+    self.cache.delete(f'{self.cache_prefix}on_listing')
+    self.cache.delete(f'{self.cache_prefix}comparable_sold_listings_result')
 
     self.delete_checkpoints_data()
 
@@ -673,7 +673,7 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
     
 
   def delete_checkpoints_data(self):
-    self.cache.delete(f"{self.job_id}_transform_diff_result")
+    self.cache.delete(f"{self.cache_prefix}{self.job_id}_transform_diff_result")
 
 
 if __name__ == '__main__':

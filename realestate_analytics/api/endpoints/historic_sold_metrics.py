@@ -36,7 +36,7 @@ async def get_sold_median_price(
     return_geojson: bool = Query(False, description="Return data in GeoJSON format if true")
 ):
     cache = get_cache()
-    price_series = cache.get('five_years_price_series')
+    price_series = cache.get('SoldMedianMetricsProcessor/five_years_price_series')
     if price_series is None:
         raise HTTPException(status_code=404, detail="Price series data not found")
     
@@ -79,7 +79,7 @@ async def get_sold_median_dom(
     return_geojson: bool = Query(False, description="Return data in GeoJSON format if true")
 ):
     cache = get_cache()
-    dom_series = cache.get('five_years_dom_series')
+    dom_series = cache.get('SoldMedianMetricsProcessor/five_years_dom_series')
     if dom_series is None:
         raise HTTPException(status_code=404, detail="Days on market series data not found")
     
@@ -122,7 +122,7 @@ async def get_sold_over_ask_percentage(
     return_geojson: bool = Query(False, description="Return data in GeoJSON format if true")
 ):
     cache = get_cache()
-    over_ask_series = cache.get('five_years_over_ask_series')
+    over_ask_series = cache.get('SoldMedianMetricsProcessor/five_years_over_ask_series')
     if over_ask_series is None:
         raise HTTPException(status_code=404, detail="Over ask percentage series data not found")
     
@@ -165,7 +165,7 @@ async def get_sold_under_ask_percentage(
     return_geojson: bool = Query(False, description="Return data in GeoJSON format if true")
 ):
     cache = get_cache()
-    under_ask_series = cache.get('five_years_below_ask_series')
+    under_ask_series = cache.get('SoldMedianMetricsProcessor/five_years_below_ask_series')
     if under_ask_series is None:
         raise HTTPException(status_code=404, detail="Under ask percentage series data not found")
     

@@ -28,12 +28,18 @@ class TestComparableSolds(unittest.TestCase):
 
       cls.cache = FileBasedCache(cache_dir=cache_dir)
       cls.datastore = Datastore(host=es_host, port=es_port)
+
+      # Create a temporary processor to get the cache prefix
+      temp_processor = NearbyComparableSoldsProcessor('unittest', cls.datastore)
+      cls.cache_prefix = temp_processor.cache_prefix
       
       # Load cached data
-      cls.listing_df = cls.cache.get('on_listing')
-      cls.sold_listing_df = cls.cache.get('one_year_sold_listing')
-      cls.computed_results = json.loads(cls.cache.get('comparable_sold_listings_result').replace("'", '"'))   # from last run of NearbyComparableSoldsProcessor
-      
+      cls.listing_df = cls.cache.get(f'{cls.cache_prefix}on_listing')
+      cls.sold_listing_df = cls.cache.get(f'{cls.cache_prefix}one_year_sold_listing')
+
+      # from last run of NearbyComparableSoldsProcessor      
+      cls.computed_results = json.loads(cls.cache.get(f'{cls.cache_prefix}comparable_sold_listings_result').replace("'", '"'))
+
       print(f'len(listing_df): {cls.listing_df.shape[0]}')
       print(f'len(sold_listing_df): {cls.sold_listing_df.shape[0]}')
       print(f'len(computed_results): {len(cls.computed_results)}')

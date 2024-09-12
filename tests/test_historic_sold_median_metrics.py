@@ -27,13 +27,16 @@ class TestMedianSoldPriceAndDOM(unittest.TestCase):
     if not cls.datastore.ping():
       raise AssertionError(f"Unable to connect to Elasticsearch at {es_host}:{es_port}. All tests will fail.")      
         
+    # Create a temporary processor to get the cache prefix
+    temp_processor = SoldMedianMetricsProcessor('unittest', cls.datastore)
+    cls.cache_prefix = temp_processor.cache_prefix
     
     # Load the sold listings data and results from cache
-    cls.sold_listings_df = cls.cache.get('five_years_sold_listing')
-    cls.price_series_df = cls.cache.get('five_years_price_series')
-    cls.dom_series_df = cls.cache.get('five_years_dom_series')
-    cls.over_ask_series_df = cls.cache.get('five_years_over_ask_series')
-    cls.below_ask_series_df = cls.cache.get('five_years_below_ask_series')
+    cls.sold_listings_df = cls.cache.get(f'{cls.cache_prefix}five_years_sold_listing')
+    cls.price_series_df = cls.cache.get(f'{cls.cache_prefix}five_years_price_series')
+    cls.dom_series_df = cls.cache.get(f'{cls.cache_prefix}five_years_dom_series')
+    cls.over_ask_series_df = cls.cache.get(f'{cls.cache_prefix}five_years_over_ask_series')
+    cls.below_ask_series_df = cls.cache.get(f'{cls.cache_prefix}five_years_below_ask_series')
     
     # Ensure lastTransition is datetime
     cls.sold_listings_df['lastTransition'] = pd.to_datetime(cls.sold_listings_df['lastTransition'])

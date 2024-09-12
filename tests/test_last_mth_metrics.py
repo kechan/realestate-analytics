@@ -22,20 +22,22 @@ class TestLastMthMetrics(unittest.TestCase):
     cache_dir = Path(os.getenv('ANALYTICS_CACHE_DIR'))
     cls.cache = FileBasedCache(cache_dir=cache_dir)
 
-    cls.listing_df = cls.cache.get('on_current_listing')
-    cls.listing_df = cls.listing_df[~cls.listing_df['is_deleted']]    # account for soft deletions
-    cls.listing_df.reset_index(drop=True, inplace=True)
-    print(f'# of current listings: {cls.listing_df.shape[0]}')
-
     es_host = os.getenv('UAT_ES_HOST')
     es_port = int(os.getenv('UAT_ES_PORT'))
     cls.datastore = Datastore(host=es_host, port=es_port)
     cls.bq_datastore = BigQueryDatastore()
 
     cls.last_mth_metrics_processor = LastMthMetricsProcessor(
+      job_id='last_mth_metrics_unittest',
       datastore=cls.datastore,
       bq_datastore=cls.bq_datastore
     )
+    cls.cache_prefix = cls.last_mth_metrics_processor.cache_prefix
+
+    cls.listing_df = cls.cache.get(f'{cls.cache_prefix}on_current_listing')
+    cls.listing_df = cls.listing_df[~cls.listing_df['is_deleted']]    # account for soft deletions
+    cls.listing_df.reset_index(drop=True, inplace=True)
+    print(f'# of current listings: {cls.listing_df.shape[0]}')
 
     cls.last_mth_metrics_processor.extract(from_cache=True)
 

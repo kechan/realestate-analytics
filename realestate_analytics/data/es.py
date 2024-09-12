@@ -854,7 +854,7 @@ class Datastore:
     This is a temporary fix to update guid in sold listing cache
     """
     
-    for sold_listing_cache_key in ['five_years_sold_listing', 'one_year_sold_listing']:
+    for sold_listing_cache_key in ['SoldMedianMetricsProcessor/five_years_sold_listing', 'NearbyComparableSoldsProcessor/one_year_sold_listing']:
 
       sold_listing_df = self.cache.get(sold_listing_cache_key)
       geo_entry_df = self.cache.get('all_geo_entry')
@@ -897,7 +897,7 @@ class Datastore:
     Fix legacy sold listings with guid (aka geog_id).
     Run this only after carefully preparing one_year_sold_listing
     '''
-    sold_listing_df = self.cache.get('one_year_sold_listing')
+    sold_listing_df = self.cache.get('NearbyComparableSoldsProcessor/one_year_sold_listing')
     def generate_updates():
       for _, row in sold_listing_df.iterrows():
         if pd.notna(row['guid']):
@@ -915,7 +915,7 @@ class Datastore:
 
 
   def _delete_computed_guid(self, index_name: str):
-    sold_listing_cache_keys = ['five_years_sold_listing', 'one_year_sold_listing']
+    sold_listing_cache_keys = ['SoldMedianMetricsProcessor/five_years_sold_listing', 'NearbyComparableSoldsProcessor/one_year_sold_listing']
 
     for sold_listing_cache_key in sold_listing_cache_keys:
       sold_listing_df = self.cache.get(sold_listing_cache_key)

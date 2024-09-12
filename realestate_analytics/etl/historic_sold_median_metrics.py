@@ -91,7 +91,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
       else:   # inc/delta load
         # Load existing data from cache
-        self.sold_listing_df = self.cache.get('five_years_sold_listing')
+        self.sold_listing_df = self.cache.get(f'{self.cache_prefix}five_years_sold_listing')
         if self.sold_listing_df is None:
           self.logger.error("Cache is inconsistent. Missing prior sold_listing_df.")
           raise ValueError("Cache is inconsistent. Missing prior sold_listing_df.")
@@ -136,7 +136,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
   def _load_from_cache(self):
     super()._load_from_cache() 
 
-    self.sold_listing_df = self.cache.get('five_years_sold_listing')
+    self.sold_listing_df = self.cache.get(f'{self.cache_prefix}five_years_sold_listing')
 
     self.geo_entry_df = self.cache.get('all_geo_entry')
     self.geo_entry_df.drop_duplicates(subset=['MLS', 'CITY', 'PROV_STATE'], keep='last', inplace=True)
@@ -157,19 +157,19 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     else:
       cache_df = self.sold_listing_df
     
-    self.cache.set('five_years_sold_listing', cache_df)
+    self.cache.set(f'{self.cache_prefix}five_years_sold_listing', cache_df)
 
-    # self.cache.set('five_years_sold_listing', self.sold_listing_df)
+    # self.cache.set(f'{self.cache_prefix}five_years_sold_listing', self.sold_listing_df)
     self.logger.info(f"Saved {len(self.sold_listing_df)} sold listings to cache.")
 
 
   def transform(self):
     if self._was_success('transform'):
       self.logger.info("Transform already successful. Loading checkpoint from cache.")
-      self.diff_price_series = self.cache.get(f"{self.job_id}_diff_price_series")
-      self.diff_dom_series = self.cache.get(f"{self.job_id}_diff_dom_series")
-      self.diff_over_ask_series = self.cache.get(f"{self.job_id}_diff_over_ask_series")
-      self.diff_below_ask_series = self.cache.get(f"{self.job_id}_diff_below_ask_series")
+      self.diff_price_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_price_series")
+      self.diff_dom_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_dom_series")
+      self.diff_over_ask_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_over_ask_series")
+      self.diff_below_ask_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_below_ask_series")
       return
 
     try:
@@ -180,10 +180,10 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       # self.compute_5_year_metrics_old()
 
       # optimize such that we don't update on things that didnt change from last run
-      prev_price_series = self.cache.get('five_years_price_series')
-      prev_dom_series = self.cache.get('five_years_dom_series')
-      prev_over_ask_series = self.cache.get('five_years_over_ask_series')
-      prev_below_ask_series = self.cache.get('five_years_below_ask_series')
+      prev_price_series = self.cache.get(f'{self.cache_prefix}five_years_price_series')
+      prev_dom_series = self.cache.get(f'{self.cache_prefix}five_years_dom_series')
+      prev_over_ask_series = self.cache.get(f'{self.cache_prefix}five_years_over_ask_series')
+      prev_below_ask_series = self.cache.get(f'{self.cache_prefix}five_years_below_ask_series')
 
       if (prev_price_series is None or prev_dom_series is None or 
           prev_over_ask_series is None or prev_below_ask_series is None):
@@ -205,10 +205,10 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
                          f'{len(self.diff_below_ask_series)} below-ask percentage time series.')
 
       # Cache the current data for the next run
-      self.cache.set('five_years_price_series', self.final_price_series)
-      self.cache.set('five_years_dom_series', self.final_dom_series)
-      self.cache.set('five_years_over_ask_series', self.final_over_ask_series)
-      self.cache.set('five_years_below_ask_series', self.final_below_ask_series)
+      self.cache.set(f'{self.cache_prefix}five_years_price_series', self.final_price_series)
+      self.cache.set(f'{self.cache_prefix}five_years_dom_series', self.final_dom_series)
+      self.cache.set(f'{self.cache_prefix}five_years_over_ask_series', self.final_over_ask_series)
+      self.cache.set(f'{self.cache_prefix}five_years_below_ask_series', self.final_below_ask_series)
 
       # checkpoint the diff_*_series
       self.diff_price_series.reset_index(drop=True, inplace=True)
@@ -216,10 +216,10 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       self.diff_over_ask_series.reset_index(drop=True, inplace=True)
       self.diff_below_ask_series.reset_index(drop=True, inplace=True)
 
-      self.cache.set(f"{self.job_id}_diff_price_series", self.diff_price_series)
-      self.cache.set(f"{self.job_id}_diff_dom_series", self.diff_dom_series)
-      self.cache.set(f"{self.job_id}_diff_over_ask_series", self.diff_over_ask_series)
-      self.cache.set(f"{self.job_id}_diff_below_ask_series", self.diff_below_ask_series)
+      self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_price_series", self.diff_price_series)
+      self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_dom_series", self.diff_dom_series)
+      self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_over_ask_series", self.diff_over_ask_series)
+      self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_below_ask_series", self.diff_below_ask_series)
 
       self._mark_success('transform')
 
@@ -352,7 +352,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     
     for key in cache_keys:
       try:
-        self.cache.delete(key)
+        self.cache.delete(f'{self.cache_prefix}{key}')
       except Exception as e:
         self.logger.error(f"Error deleting cache key {key}: {e}")
 
@@ -917,10 +917,10 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
   
 
   def delete_checkpoints_data(self):
-    self.cache.delete(f"{self.job_id}_diff_price_series")
-    self.cache.delete(f"{self.job_id}_diff_dom_series")
-    self.cache.delete(f"{self.job_id}_diff_over_ask_series")
-    self.cache.delete(f"{self.job_id}_diff_below_ask_series")
+    self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_price_series")
+    self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_dom_series")
+    self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_over_ask_series")
+    self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_below_ask_series")
 
 
 if __name__ == '__main__':

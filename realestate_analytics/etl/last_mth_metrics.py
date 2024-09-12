@@ -109,13 +109,13 @@ class LastMthMetricsProcessor(BaseETLProcessor):
   def transform(self):
     if self._was_success('transform'):
       self.logger.info("Transform stage already completed. Loading checkpoints from cache.")
-      self.delta_listing_df = self.cache.get(f'{self.job_id}_delta_on_current_listing')
+      self.delta_listing_df = self.cache.get(f'{self.cache_prefix}{self.job_id}_delta_on_current_listing')
       return
 
     # there's no transform needed
     if self.delta_listing_df is None:
       self.logger.info("No transform needed. Just loading checkpoints from cache.")
-      self.delta_listing_df = self.cache.get(f'{self.job_id}_delta_on_current_listing')
+      self.delta_listing_df = self.cache.get(f'{self.cache_prefix}{self.job_id}_delta_on_current_listing')
     
     self._mark_success('transform')
 
@@ -181,7 +181,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     self.cache.set(key=self.last_run_key, value=end_time)
 
     # checkpoint such that listing_df can be picked on on rerun 
-    self.cache.set(key=f'{self.job_id}_delta_on_current_listing', value=self.listing_df)
+    self.cache.set(key=f'{self.cache_prefix}{self.job_id}_delta_on_current_listing', value=self.listing_df)
 
 
     
@@ -217,7 +217,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     else:
       self.logger.info(f'Loaded {len(self.delta_listing_df)} listings from {start_time} to {end_time}')
 
-    listing_df = self.cache.get('on_current_listing')
+    listing_df = self.cache.get(f'{self.cache_prefix}on_current_listing')
     self.delta_listing_df['is_deleted'] = False  # New delta listings are not deleted
 
     self.listing_df = pd.concat([listing_df, self.delta_listing_df], ignore_index=True)
@@ -227,7 +227,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     self.cache.set(key=self.last_run_key, value=end_time)
 
     # checkpoint the delta cache, such that this can be picked on on rerun 
-    self.cache.set(key=f'{self.job_id}_delta_on_current_listing', value=self.delta_listing_df)
+    self.cache.set(key=f'{self.cache_prefix}{self.job_id}_delta_on_current_listing', value=self.delta_listing_df)
 
 
   def end_of_mth_run(self):
@@ -291,7 +291,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
   def update_es_tracking_index(self):
 
     if self.delta_listing_df is None:
-      self.delta_listing_df = self.cache.get('delta_on_current_listing')
+      self.delta_listing_df = self.cache.get(f'{self.cache_prefix}{self.job_id}_delta_on_current_listing')
       if self.delta_listing_df is not None:
         self.logger.info(f"Loaded {len(self.delta_listing_df)} delta listings from cache.")
 
@@ -624,7 +624,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     super()._load_from_cache()
 
     # regard less of first_load, we will always load from the same cache
-    self.listing_df = self.cache.get('on_current_listing')
+    self.listing_df = self.cache.get(f'{self.cache_prefix}on_current_listing')
     self.logger.info(f"Loaded {len(self.listing_df)} listings from cache.")
 
 
@@ -635,7 +635,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     # before saving to cache
     self.listing_df.reset_index(drop=True, inplace=True)   
 
-    self.cache.set('on_current_listing', self.listing_df)
+    self.cache.set(f'{self.cache_prefix}on_current_listing', self.listing_df)
     self.logger.info(f"Saved {len(self.listing_df)} listings to cache.")
 
 
@@ -653,8 +653,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
   def cleanup(self):
     super().cleanup()
-    self.cache.delete('on_current_listing')
-    # self.cache.delete('delta_on_current_listing')
+    self.cache.delete(f'{self.cache_prefix}on_current_listing')
 
     # reset instance variables
     self.listing_df = None
@@ -665,7 +664,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
 
   def delete_checkpoints_data(self):
-    self.cache.delete(f'{self.job_id}_delta_on_current_listing')
+    self.cache.delete(f'{self.cache_prefix}{self.job_id}_delta_on_current_listing')
 
   def pre_end_of_mth_run(self):
     if getattr(self, 'simulate_failure_at', None) == 'end_of_mth_run':

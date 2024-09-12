@@ -31,8 +31,9 @@ class TestAbsorptionRate(unittest.TestCase):
     )
 
     # Load cached data
-    cls.sold_listing_df = cls.cache.get('one_year_sold_listing')
-    cls.listing_df = cls.cache.get('on_listing')
+    nearby_comparable_solds_prefix = 'NearbyComparableSoldsProcessor/'
+    cls.sold_listing_df = cls.cache.get(f'{nearby_comparable_solds_prefix}one_year_sold_listing')
+    cls.listing_df = cls.cache.get(f'{nearby_comparable_solds_prefix}on_listing')
 
     print(f'# of sold listings: {cls.sold_listing_df.shape[0]}')
     print(f'# of current listings: {cls.listing_df.shape[0]}')

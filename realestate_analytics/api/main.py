@@ -27,11 +27,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3001"],  # Add your React app's URL
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+  CORSMiddleware,
+  allow_origins=["http://localhost:3001", "http://localhost:3000"],  # Add your React app's URLs
+  allow_credentials=True,
+  allow_methods=["*"],
+  allow_headers=["*"],
 )
 
 # Include the ETL script kickoff endpoints router with the /op prefix
