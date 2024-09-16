@@ -849,6 +849,7 @@ class Datastore:
 
     self.cache.set(key='all_geo_entry', value=all_geo_entry_df)
 
+
   def fix_guid_in_sold_listing_cache(self):
     """
     This is a temporary fix to update guid in sold listing cache
@@ -895,23 +896,73 @@ class Datastore:
   def _update_es_sold_listings_with_guid(self):
     '''
     Fix legacy sold listings with guid (aka geog_id).
-    Run this only after carefully preparing one_year_sold_listing
+    Run this only after carefully preparing five_years_sold_listing
     '''
-    sold_listing_df = self.cache.get('NearbyComparableSoldsProcessor/one_year_sold_listing')
-    def generate_updates():
-      for _, row in sold_listing_df.iterrows():
-        if pd.notna(row['guid']):
-          yield {
-            '_op_type': 'update',
-            '_index': self.datastore.sold_listing_index_name,
-            '_id': row['_id'],
-            'doc': {
-              'guid': row['guid'] if pd.notna(row['guid']) else None
+    sold_listing_df = self.cache.get('SoldMedianMetricsProcessor/five_years_sold_listing')
+    if sold_listing_df is None or sold_listing_df.empty:
+      self.logger.error("Failed to retrieve 5-year sold listing data from cache.")
+      return
+
+    # Query for documents with valid coordinates, recent transactions, and missing guids
+    query = {
+      "query": {
+        "bool": {
+          "must": [
+            {
+              "range": {"lat": {"gte": -90.0, "lte": 90.0}}
+            },
+            {
+              "range": {"lng": {"gte": -180.0, "lte": 180.0}}
+            },
+            {
+              "range": {
+                "lastTransition": {
+                  "gte": "now-30d/d",   # last 30 days
+                  "lte": "now"
+                }
+              }
+            }
+          ],
+          "must_not": {
+            "exists": {
+              "field": "guid.keyword"
             }
           }
+        }
+      }
+    }
+
+    # Use the scan helper to efficiently retrieve all matching documents
+    documents_to_update = scan(
+      self.es,
+      index=self.sold_listing_index_name,
+      query=query,
+      _source=["_id"]
+    )
+
+    def generate_updates():
+      for doc in documents_to_update:
+        doc_id = doc["_id"]
+        _df = sold_listing_df.q("_id == @doc_id")
+        if not _df.empty:
+          guid = _df.iloc[0].guid
+          if pd.notna(guid):
+            yield {
+              '_op_type': 'update',
+              '_index': self.sold_listing_index_name,
+              '_id': doc_id,
+              'doc': {
+                'guid': guid
+              }
+            }
 
     # Perform bulk update
-    bulk(self.datastore.es, generate_updates())
+    success, failed = bulk(self.es, generate_updates(), stats_only=True, raise_on_error=False)
+    self.logger.info(f"Successfully updated {success} documents with guid.")
+    if failed:
+      self.logger.error(f"Failed to update {failed} documents")
+
+    return success, failed
 
 
   def _delete_computed_guid(self, index_name: str):

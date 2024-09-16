@@ -166,6 +166,7 @@ cython_debug/
 # Mac OS X
 .DS_Store
 .vscode/
+*.swp
 
 scripts/*.csv
 scripts/*.log
