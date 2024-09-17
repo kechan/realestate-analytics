@@ -199,3 +199,45 @@ async def get_sold_under_ask_percentage(
     )
 
     return feature.model_dump()
+
+@router.get("/sold-listing-count")
+async def get_sold_listing_count(
+    geog_id: str = Query(..., description="Geographic ID to filter by"),
+    property_type: Optional[str] = Query(None, description="Property type to filter by. Use 'ALL' or leave empty for all property types combined."),
+    return_geojson: bool = Query(False, description="Return data in GeoJSON format if true")
+):
+    cache = get_cache()
+    sold_listing_count_series = cache.get('SoldMedianMetricsProcessor/five_years_sold_listing_count_series')
+    if sold_listing_count_series is None:
+        raise HTTPException(status_code=404, detail="Sold listing count series data not found")
+    
+    data = get_time_series_data(sold_listing_count_series, geog_id, property_type)
+    if data is None:
+        raise HTTPException(status_code=404, detail="No data found for the specified parameters")
+    
+    if not return_geojson:
+        return {"geog_id": geog_id, "property_type": property_type or "ALL", "data": data}
+    
+    # GeoJSON response
+    geo_collection: GeoCollection = get_geo_collection()
+    geo = geo_collection.get_by_id(geog_id)
+    if not geo:
+        raise HTTPException(status_code=404, detail=f"{geog_id} not found")
+    
+    properties = GeoProperties(
+        name=geo.name,
+        geog_id=geo.geog_id,
+        property_type=property_type or "ALL",
+        level=geo.level,
+        parent_geog_id=geo.parent_id,
+        has_children=len(geo.children) > 0,
+        metric_type="sold_listing_count",
+        metric_data=data
+    )
+
+    feature = GeoJSONFeature(
+        geometry=None,  # We're not including geometry in this response
+        properties=properties
+    )
+
+    return feature.model_dump()

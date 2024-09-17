@@ -379,7 +379,98 @@ curl -X GET "http://your-api-domain.com/metrics/historic_sold/under-ask?geog_id=
 **Response Structure:** (Same as the price endpoint, with "metric_type" being "under_ask_percentage")
 
 
-### 5. Last Month Metrics
+
+### 5. Historic Sold Listing Count
+
+Retrieves the historic count of sold listings for a specific geographic area and property type.
+
+**Endpoint:** `/metrics/historic_sold/sold-listing-count`
+
+**Method:** GET
+
+**Query Parameters:**
+- `geog_id` (required): Geographic ID to filter by
+- `property_type` (optional): Property type to filter by. Use 'ALL' or leave empty for all property types combined.
+- `return_geojson` (optional): Set to 'true' to return data in GeoJSON format. Default is 'false'.
+
+**Example CURL request:**
+```bash
+curl -X GET "http://your-api-domain.com/metrics/historic_sold/sold-listing-count?geog_id=g20_dpz9hct3&property_type=DETACHED"
+```
+
+**Response Example:**
+```json
+{
+  "geog_id": "g20_dpz9hct3",
+  "property_type": "DETACHED",
+  "data": [
+    {
+      "month": "2019-08",
+      "value": 45
+    },
+    {
+      "month": "2019-09",
+      "value": 52
+    },
+    {
+      "month": "2024-06",
+      "value": 63
+    },
+    {
+      "month": "2024-07",
+      "value": 58
+    }
+  ]
+}
+```
+
+**Response Structure:**
+
+- `geog_id` (string): The geographic ID used for filtering the data.
+- `property_type` (string): The property type used for filtering the data.
+- `data` (array of objects): A list of date-value pairs representing the count of sold listings for each time period.
+  - `month` (string): The date for the data point, formatted as `YYYY-MM`.
+  - `value` (number): The count of sold listings for that specific month.
+
+**Example CURL request:**
+```bash
+curl -X GET "http://your-api-domain.com/metrics/historic_sold/sold-listing-count?geog_id=g20_dpz9hct3&property_type=DETACHED&return_geojson=true"
+```
+
+**Response Example (GeoJSON format):**
+```json
+{
+  "type": "Feature",
+  "geometry": null,
+  "properties": {
+    "name": "Scarborough",
+    "geog_id": "g20_dpz9hct3",
+    "property_type": "DETACHED",
+    "level": 20,
+    "parent_geog_id": "g30_dpz89rm7",
+    "has_children": true,
+    "metric_type": "sold_listing_count",
+    "metric_data": [
+      {
+        "month": "2019-08",
+        "value": 45
+      },
+      {
+        "month": "2019-09",
+        "value": 52
+      },
+      // ... more data points ...
+    ]
+  }
+}
+```
+
+**Response Structure:** (Same as the price endpoint, with "metric_type" being "sold_listing_count")
+
+
+
+
+### 6. Last Month Metrics
 
 Retrieves various metrics for the last month for a specific geographic area and property type.
 
@@ -460,8 +551,7 @@ curl -X GET "http://your-api-domain.com/metrics/last-month?geog_id=g20_dpz9hct3&
     - `median_price` (number): The median sold price for the last month.
     - `new_listings_count` (integer): The number of new listings in the last month.
 
-
-### 6. Absorption Rate
+### 7. Absorption Rate
 
 Retrieves the absorption rate for a specific geographic area and property type.
 
@@ -547,7 +637,7 @@ curl -X GET "http://your-api-domain.com/metrics/absorption-rate?geog_id=g20_dpz9
     - `absorption_rate` (number): The absorption rate, calculated as the ratio of sold_count to current_count.
 
 
-### 7. Get Geographic Entities
+### 8. Get Geographic Entities
 
 Retrieves a list of geographic entities, optionally filtered by level and/or parent.
 
@@ -621,7 +711,7 @@ curl -X GET "http://your-api-domain.com/geos?parent_id=g20_dpz9hct3&level=30&geo
     - `has_children`: Indicates whether this geographic entity has child entities
 
 
-### 8. Search Geographic Entities
+### 9. Search Geographic Entities
 
 Searches for geographic entities by name, optionally filtered by level.
 
@@ -694,7 +784,7 @@ Same as the "Get Geographic Entities" endpoint.
 **Notes:**
 - Returns an empty list (`[]`) if no matching geographic entities are found.
 
-### 9. Get Specific Geographic Entity
+### 10. Get Specific Geographic Entity
 
 Retrieves details of a specific geographic entity by its ID.
 
@@ -743,7 +833,7 @@ curl -X GET "http://your-api-domain.com/geos/g10_dpz9p7cv?geometry=true"
 - `properties`: Contains the attributes of the geographic entity (same as in previous endpoints)
 
 
-### 10. Get Geographic Hierarchy
+### 11. Get Geographic Hierarchy
 
 Retrieves the full hierarchy (ancestors) of a geographic entity.
 
@@ -834,7 +924,7 @@ curl -X GET "http://your-api-domain.com/geos/hierarchy/g20_dpz9hct3?geometry=tru
 **Response Structure:**
 Same as the "Get Geographic Entities" endpoint, with features ordered from the top-most ancestor to the specified geographic entity.
 
-### 11. Get GTA Cities
+### 12. Get GTA Cities
 
 Retrieves a list of cities in the Greater Toronto Area (GTA), optionally including geometry data.
 

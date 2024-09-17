@@ -554,4 +554,70 @@ def compute_metrics(df, date_mask, geo_level):
               level = match.group(1)
               parsed[f'geog_id_{level}'] = geog_id
           return parsed
+
+  def compute_5_year_metrics_old(self):
+    """
+    Warning: this method is obsolete
+    """
+    # Construct date range for the past 60 full months plus the current month to date.
+
+    current_date = self.get_current_datetime().date()
+    current_month_start = date(current_date.year, current_date.month, 1)
+    start_date = (current_month_start.replace(day=1) - pd.DateOffset(months=12*5)).date()
+    self.logger.info(f'Computing 5 yr metrics for start_date: {start_date} to current_date: {current_date}')
+
+    self.sold_listing_df.lastTransition = pd.to_datetime(self.sold_listing_df.lastTransition)
+
+    # Add 'sold_over_ask' and 'sold_below_ask' (a boolean column)
+    self.sold_listing_df['sold_over_ask'] = self.sold_listing_df['soldPrice'] > self.sold_listing_df['price']
+    self.sold_listing_df['sold_below_ask'] = self.sold_listing_df['soldPrice'] < self.sold_listing_df['price']
+
+    # Create a boolean mask for the date range filter
+    date_mask = (
+        (self.sold_listing_df['lastTransition'].dt.date >= start_date) &
+        (self.sold_listing_df['lastTransition'].dt.date < current_date)
+    )
+
+    if not date_mask.any():
+      self.logger.error("No data available for the specified date range")
+      raise ValueError("No data available for the specified date range")
+
+    # filter sold listings for the required date range
+    # df = self.sold_listing_df[
+    #   (self.sold_listing_df['lastTransition'].dt.date >= start_date) &
+    #   (self.sold_listing_df['lastTransition'].dt.date < current_date)
+    # ]
+
+    # if df.empty:
+    #   self.logger.error("No data available for the specified date range")
+    #   raise ValueError("No data available for the specified date range")
+
+    # Compute metrics for each geographic level and concat into a single dataframe
+    all_price_series = []
+    all_dom_series = []
+    all_over_ask_series = []
+    all_below_ask_series = []
+
+    for level in self.geo_levels:
+      price_series, dom_series, over_ask_series, below_ask_series = compute_metrics(self.sold_listing_df, date_mask, level)
+
+      price_series['geo_level'] = level
+      dom_series['geo_level'] = level
+      over_ask_series['geo_level'] = level
+      below_ask_series['geo_level'] = level
+
+      all_price_series.append(price_series)
+      all_dom_series.append(dom_series)
+      all_over_ask_series.append(over_ask_series)
+      all_below_ask_series.append(below_ask_series)
+
+    # Combine results from all levels
+    self.final_price_series = pd.concat(all_price_series, ignore_index=True)
+    self.final_dom_series = pd.concat(all_dom_series, ignore_index=True)
+    self.final_over_ask_series = pd.concat(all_over_ask_series, ignore_index=True)
+    self.final_below_ask_series = pd.concat(all_below_ask_series, ignore_index=True)
+
+
+
+
 '''

@@ -244,6 +244,13 @@ class Datastore:
                   "month": {"type": "date", "format": "yyyy-MM"},
                   "value": {"type": "float"}
                 }
+              },
+              "sold_listing_count": {
+                "type": "nested",
+                "properties": {
+                  "month": {"type": "date", "format": "yyyy-MM"},
+                  "value": {"type": "integer"}
+                }
               }
             }
           },

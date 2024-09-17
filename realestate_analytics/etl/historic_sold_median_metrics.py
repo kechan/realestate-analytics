@@ -29,11 +29,13 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     self.final_dom_series = None
     self.final_over_ask_series = None
     self.final_below_ask_series = None
+    self.final_sold_listing_count_series = None
 
     self.diff_price_series = None
     self.diff_dom_series = None
     self.diff_over_ask_series = None
     self.diff_below_ask_series = None
+    self.diff_sold_listing_count_series = None
 
     self.sold_listing_selects = [
       'mls',
@@ -170,6 +172,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       self.diff_dom_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_dom_series")
       self.diff_over_ask_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_over_ask_series")
       self.diff_below_ask_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_below_ask_series")
+      self.diff_sold_listing_count_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_sold_listing_count_series")
       return
 
     try:
@@ -184,42 +187,50 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       prev_dom_series = self.cache.get(f'{self.cache_prefix}five_years_dom_series')
       prev_over_ask_series = self.cache.get(f'{self.cache_prefix}five_years_over_ask_series')
       prev_below_ask_series = self.cache.get(f'{self.cache_prefix}five_years_below_ask_series')
+      prev_sold_listing_count_series = self.cache.get(f'{self.cache_prefix}five_years_sold_listing_count_series')
 
       if (prev_price_series is None or prev_dom_series is None or 
-          prev_over_ask_series is None or prev_below_ask_series is None):
+          prev_over_ask_series is None or prev_below_ask_series is None or prev_sold_listing_count_series is None):
         self.logger.info("No previous times series found. Keeping entire currently computed time series.")
         self.diff_price_series = self.final_price_series
         self.diff_dom_series = self.final_dom_series
         self.diff_over_ask_series = self.final_over_ask_series
         self.diff_below_ask_series = self.final_below_ask_series
+        self.diff_sold_listing_count_series = self.final_sold_listing_count_series
       else:
         self.logger.info("Previous times series found. Computing update delta.")
         self.diff_price_series = self._get_delta_dataframe(self.final_price_series, prev_price_series)
         self.diff_dom_series = self._get_delta_dataframe(self.final_dom_series, prev_dom_series)
         self.diff_over_ask_series = self._get_delta_dataframe(self.final_over_ask_series, prev_over_ask_series)
         self.diff_below_ask_series = self._get_delta_dataframe(self.final_below_ask_series, prev_below_ask_series)
+        self.diff_sold_listing_count_series = self._get_delta_dataframe(self.final_sold_listing_count_series, prev_sold_listing_count_series)
 
       self.logger.info(f'Prepared to update {len(self.diff_price_series)} price time series, '
                          f'{len(self.diff_dom_series)} DOM time series, and '
-                         f'{len(self.diff_over_ask_series)} over-ask percentage time series.'
-                         f'{len(self.diff_below_ask_series)} below-ask percentage time series.')
+                         f'{len(self.diff_over_ask_series)} over-ask percentage time series, and '
+                         f'{len(self.diff_below_ask_series)} below-ask percentage time series, and '
+                         f'{len(self.diff_sold_listing_count_series)} listing count time series.'
+                         )
 
       # Cache the current data for the next run
       self.cache.set(f'{self.cache_prefix}five_years_price_series', self.final_price_series)
       self.cache.set(f'{self.cache_prefix}five_years_dom_series', self.final_dom_series)
       self.cache.set(f'{self.cache_prefix}five_years_over_ask_series', self.final_over_ask_series)
       self.cache.set(f'{self.cache_prefix}five_years_below_ask_series', self.final_below_ask_series)
+      self.cache.set(f'{self.cache_prefix}five_years_sold_listing_count_series', self.final_sold_listing_count_series)
 
       # checkpoint the diff_*_series
       self.diff_price_series.reset_index(drop=True, inplace=True)
       self.diff_dom_series.reset_index(drop=True, inplace=True)
       self.diff_over_ask_series.reset_index(drop=True, inplace=True)
       self.diff_below_ask_series.reset_index(drop=True, inplace=True)
+      self.diff_sold_listing_count_series.reset_index(drop=True, inplace=True)
 
       self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_price_series", self.diff_price_series)
       self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_dom_series", self.diff_dom_series)
       self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_over_ask_series", self.diff_over_ask_series)
       self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_below_ask_series", self.diff_below_ask_series)
+      self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_sold_listing_count_series", self.diff_sold_listing_count_series)
 
       self._mark_success('transform')
 
@@ -265,7 +276,8 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       'soldPrice': 'median',
       'daysOnMarket': 'median',
       'sold_over_ask': lambda x: (x.sum() / len(x)) * 100,
-      'sold_below_ask': lambda x: (x.sum() / len(x)) * 100
+      'sold_below_ask': lambda x: (x.sum() / len(x)) * 100,
+      '_id': 'count'
     }).reset_index()
 
     # Calculate metrics for all property types combined
@@ -274,7 +286,8 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       'soldPrice': 'median',
       'daysOnMarket': 'median',
       'sold_over_ask': lambda x: (x.sum() / len(x)) * 100,
-      'sold_below_ask': lambda x: (x.sum() / len(x)) * 100
+      'sold_below_ask': lambda x: (x.sum() / len(x)) * 100,
+      '_id': 'count'
     }).reset_index()
     metrics_all['propertyType'] = None
 
@@ -293,9 +306,12 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     below_ask_series = metrics_combined.pivot(index=['geog_id', 'propertyType'],
                                               columns='lastTransition',
                                               values='sold_below_ask')
+    sold_listing_count_series = metrics_combined.pivot(index=['geog_id', 'propertyType'],
+                                                  columns='lastTransition',
+                                                  values='_id')                                              
 
     # Rename columns to YYYY-MM format
-    for series in [price_series, dom_series, over_ask_series, below_ask_series]:
+    for series in [price_series, dom_series, over_ask_series, below_ask_series, sold_listing_count_series]:
       series.columns = series.columns.strftime('%Y-%m')
 
       # Remove the 'lastTransition' label from the column index
@@ -308,7 +324,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       # Replace NaN with None in the propertyType 
       series['propertyType'] = series['propertyType'].where(series['propertyType'].notna(), None)                                              
 
-    return price_series, dom_series, over_ask_series, below_ask_series
+    return price_series, dom_series, over_ask_series, below_ask_series, sold_listing_count_series
 
   def _merge_series(self, series_list):
     if not series_list:
@@ -347,7 +363,8 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
                   'five_years_dom_series',
                   'five_years_price_series',
                   'five_years_over_ask_series',
-                  'five_years_below_ask_series'
+                  'five_years_below_ask_series',
+                  'five_years_sold_listing_count_series',
                   ]
     
     for key in cache_keys:
@@ -365,11 +382,13 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     self.final_dom_series = None
     self.final_over_ask_series = None
     self.final_below_ask_series = None
+    self.final_sold_listing_count_series = None
 
     self.diff_price_series = None
     self.diff_dom_series = None
     self.diff_over_ask_series = None
     self.diff_below_ask_series = None
+    self.diff_sold_listing_count_series = None
 
     self.logger.info("Instance variables reset.")
 
@@ -394,69 +413,6 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       self.logger.info("Full refresh completed for SoldMedianMetricsProcessor.")
 
 
-  def compute_5_year_metrics_old(self):
-    """
-    Warning: this method is obsolete
-    """
-    # Construct date range for the past 60 full months plus the current month to date.
-
-    current_date = self.get_current_datetime().date()
-    current_month_start = date(current_date.year, current_date.month, 1)
-    start_date = (current_month_start.replace(day=1) - pd.DateOffset(months=12*5)).date()
-    self.logger.info(f'Computing 5 yr metrics for start_date: {start_date} to current_date: {current_date}')
-
-    self.sold_listing_df.lastTransition = pd.to_datetime(self.sold_listing_df.lastTransition)
-
-    # Add 'sold_over_ask' and 'sold_below_ask' (a boolean column)
-    self.sold_listing_df['sold_over_ask'] = self.sold_listing_df['soldPrice'] > self.sold_listing_df['price']
-    self.sold_listing_df['sold_below_ask'] = self.sold_listing_df['soldPrice'] < self.sold_listing_df['price']
-
-    # Create a boolean mask for the date range filter
-    date_mask = (
-        (self.sold_listing_df['lastTransition'].dt.date >= start_date) &
-        (self.sold_listing_df['lastTransition'].dt.date < current_date)
-    )
-
-    if not date_mask.any():
-      self.logger.error("No data available for the specified date range")
-      raise ValueError("No data available for the specified date range")
-
-    # filter sold listings for the required date range
-    # df = self.sold_listing_df[
-    #   (self.sold_listing_df['lastTransition'].dt.date >= start_date) &
-    #   (self.sold_listing_df['lastTransition'].dt.date < current_date)
-    # ]
-
-    # if df.empty:
-    #   self.logger.error("No data available for the specified date range")
-    #   raise ValueError("No data available for the specified date range")
-
-    # Compute metrics for each geographic level and concat into a single dataframe
-    all_price_series = []
-    all_dom_series = []
-    all_over_ask_series = []
-    all_below_ask_series = []
-
-    for level in self.geo_levels:
-      price_series, dom_series, over_ask_series, below_ask_series = compute_metrics(self.sold_listing_df, date_mask, level)
-
-      price_series['geo_level'] = level
-      dom_series['geo_level'] = level
-      over_ask_series['geo_level'] = level
-      below_ask_series['geo_level'] = level
-
-      all_price_series.append(price_series)
-      all_dom_series.append(dom_series)
-      all_over_ask_series.append(over_ask_series)
-      all_below_ask_series.append(below_ask_series)
-
-    # Combine results from all levels
-    self.final_price_series = pd.concat(all_price_series, ignore_index=True)
-    self.final_dom_series = pd.concat(all_dom_series, ignore_index=True)
-    self.final_over_ask_series = pd.concat(all_over_ask_series, ignore_index=True)
-    self.final_below_ask_series = pd.concat(all_below_ask_series, ignore_index=True)
-
-
   def compute_5_year_metrics(self):
     current_date = self.get_current_datetime().date()
     current_month_start = date(current_date.year, current_date.month, 1)
@@ -467,6 +423,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     all_dom_series = []
     all_over_ask_series = []
     all_below_ask_series = []
+    all_sold_listing_count_series = []
 
     # Convert current_date to a pandas.Timestamp
     current_date_ts = pd.Timestamp(current_date)
@@ -481,12 +438,13 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       batch_df = self._get_batch(start_date, end_date)
       expanded_batch_df = self._expand_batch(batch_df)
 
-      price_series, dom_series, over_ask_series, below_ask_series = self.compute_metrics(expanded_batch_df)
+      price_series, dom_series, over_ask_series, below_ask_series, sold_listing_count_series = self.compute_metrics(expanded_batch_df)
 
       all_price_series.append(price_series)
       all_dom_series.append(dom_series)
       all_over_ask_series.append(over_ask_series)
       all_below_ask_series.append(below_ask_series)
+      all_sold_listing_count_series.append(sold_listing_count_series)
 
       start_date = end_date
 
@@ -495,6 +453,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     self.final_dom_series = self._merge_series(all_dom_series)
     self.final_over_ask_series = self._merge_series(all_over_ask_series)
     self.final_below_ask_series = self._merge_series(all_below_ask_series)
+    self.final_sold_listing_count_series = self._merge_series(all_sold_listing_count_series)
 
     # Add 'geo_level' column to each final series
     def _extract_geo_level(geog_id):
@@ -507,6 +466,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     self.final_dom_series['geo_level'] = self.final_dom_series['geog_id'].apply(_extract_geo_level)
     self.final_over_ask_series['geo_level'] = self.final_over_ask_series['geog_id'].apply(_extract_geo_level)
     self.final_below_ask_series['geo_level'] = self.final_below_ask_series['geog_id'].apply(_extract_geo_level)
+    self.final_sold_listing_count_series['geo_level'] = self.final_sold_listing_count_series['geog_id'].apply(_extract_geo_level)
 
 
   def add_geog_ids_to_sold_listings(self):    
@@ -765,6 +725,57 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
           }
         }
 
+      # Process listing count series
+      for _, row in self.diff_sold_listing_count_series.iterrows():
+        new_metrics = {
+          "sold_listing_count": []
+        }
+
+        for col in self.diff_sold_listing_count_series.columns:
+          if col.startswith('20'):
+            month = col
+            value = row[col]
+            if pd.notna(value):
+              new_metrics["sold_listing_count"].append({
+                "month": month,
+                "value": int(value)
+              })
+
+        property_type_id = "ALL" if row['propertyType'] is None else row['propertyType']
+        composite_id = f"{row['geog_id']}_{property_type_id}"
+
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_index_name,
+          "_id": composite_id,
+          "script": {
+            "source": """
+            if (ctx._source.metrics == null) {
+              ctx._source.metrics = new HashMap();
+            }
+            ctx._source.metrics.sold_listing_count = params.new_metrics.sold_listing_count;
+            ctx._source.geog_id = params.geog_id;
+            ctx._source.propertyType = params.propertyType;
+            ctx._source.geo_level = params.geo_level;
+            ctx._source.last_updated = params.last_updated;
+            """,
+            "params": {
+              "new_metrics": new_metrics,
+              "geog_id": row['geog_id'],
+              "propertyType": property_type_id,
+              "geo_level": int(row['geo_level']),
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          },
+          "upsert": {
+            "geog_id": row['geog_id'],
+            "propertyType": property_type_id,
+            "geo_level": int(row['geo_level']),
+            "metrics": new_metrics,
+            "last_updated": self.get_current_datetime().isoformat()
+          }
+        }
+
     # Perform bulk update
     success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
 
@@ -813,6 +824,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
                 ctx._source.metrics.remove('median_dom');
                 ctx._source.metrics.remove('over_ask_percentage');
                 ctx._source.metrics.remove('below_ask_percentage');
+                ctx._source.metrics.remove('sold_listing_count');
               }
             """,
           }
@@ -921,6 +933,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_dom_series")
     self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_over_ask_series")
     self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_below_ask_series")
+    self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_sold_listing_count_series")
 
 
 if __name__ == '__main__':
