@@ -449,11 +449,27 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     # Modified last_month to simulate a diff month
     # last_month = (datetime.now().replace(day=1) + timedelta(days=1)).strftime('%Y-%m')
 
+    self.logger.info(f"Updating last month's median asking price on ES")
+    success_price, failed_price = self.update_last_mth_median_asking_price(last_month)
+
+    self.logger.info(f"Updating last month's new listings count on ES")
+    success_listings, failed_listings = self.update_last_mth_new_listings(last_month)
+
+    total_success = success_price + success_listings
+    total_failed = len(failed_price) + len(failed_listings)
+
+    # Perform bulk update with error handling
+    self.logger.info(f"Successfully updated {total_success} documents in market trends index")
+    if total_failed > 0:
+      self.logger.error(f"Failed to update {total_failed} documents in market trends index")
+    
+    return total_success, failed_price + failed_listings
+  
+
+  def update_last_mth_median_asking_price(self, last_month):
     def generate_actions():
       for _, row in self.last_mth_metrics_results.iterrows():
         composite_id = f"{row['geog_id']}_{row['propertyType']}"
-
-        # Update for last_mth_median_asking_price
         yield {
           "_op_type": "update",
           "_index": self.datastore.mkt_trends_index_name,
@@ -510,8 +526,14 @@ class LastMthMetricsProcessor(BaseETLProcessor):
             "last_updated": self.get_current_datetime().isoformat()
           }
         }
+  
+    return bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
 
-        # Update for last_mth_new_listings
+
+  def update_last_mth_new_listings(self, last_month):
+    def generate_actions():
+      for _, row in self.last_mth_metrics_results.iterrows():
+        composite_id = f"{row['geog_id']}_{row['propertyType']}"
         yield {
           "_op_type": "update",
           "_index": self.datastore.mkt_trends_index_name,
@@ -568,16 +590,9 @@ class LastMthMetricsProcessor(BaseETLProcessor):
             "last_updated": self.get_current_datetime().isoformat()
           }
         }
-    
-    # Perform bulk update with error handling
-    success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
-    
-    self.logger.info(f"Successfully updated {success} documents in market trends index")
-    if failed:
-      self.logger.error(f"Failed to update {len(failed)} documents in market trends index")
-    
-    return success, failed
   
+    return bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
+
 
   def remove_last_mth_metrics(self):
     """
