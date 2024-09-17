@@ -1,4 +1,4 @@
-import logging
+import os, logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,7 +6,16 @@ from realestate_analytics.api.endpoints import historic_sold_metrics, last_mth_m
 from realestate_analytics.api.etl_script_kickoff_endpoints import router as etl_router
 from realestate_analytics.api.etl_monitoring_endpoints import router as monitoring_router
 
+from dotenv import load_dotenv, find_dotenv
+
 # uvicorn main:app --reload --log-level debug
+
+# Get env for CORS middleware configuration
+_ = load_dotenv(find_dotenv())
+if "ALLOW_ORIGINS" in os.environ:
+  allow_origins = os.environ["ALLOW_ORIGINS"].split(',')
+else:
+  raise Exception("ALLOW_ORIGINS environment variable not set in .env file")
 
 # This should be at the top of your main FastAPI application file
 logging.basicConfig(level=logging.DEBUG,
@@ -28,7 +37,7 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
   CORSMiddleware,
-  allow_origins=["http://localhost:3001", "http://localhost:3000"],  # Add your React app's URLs
+  allow_origins=allow_origins,  # Add your React app's URLs in the .env
   allow_credentials=True,
   allow_methods=["*"],
   allow_headers=["*"],
