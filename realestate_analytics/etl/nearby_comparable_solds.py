@@ -730,31 +730,31 @@ if __name__ == '__main__':
    0.26068223623936243]},
  '22073425': {'sold_listing_id': ['on-17-x7029200'],
   'distance_km': [0.17871279268886067]},
-  ... 
+  
 
 }
 """
 
 """ testing compare_comparable_results
-# from realestate_analytics.etl.nearby_comparable_solds import compare_comparable_results
+from realestate_analytics.etl.nearby_comparable_solds import compare_comparable_results
 
-# # Test cases
-# prev_result = {
-#     '21483963': {'sold_listing_id': ['on-17-c7280822'], 'distance_km': [0.39653338615963163]},
-#     '21969076': {'sold_listing_id': ['on-13-1353569'], 'distance_km': [0.45767571332477264]},
-#     '21000001': {'sold_listing_id': ['on-17-c1111111', 'on-17-c2222222'], 'distance_km': [0.1, 0.2]},
-#     '21000002': {'sold_listing_id': ['on-17-c3333333'], 'distance_km': [0.3]},
-#     '21000003': {'sold_listing_id': ['on-17-c4444444'], 'distance_km': [0.4]},
-# }
+''' Test cases '''
+prev_result = {
+    '21483963': {'sold_listing_id': ['on-17-c7280822'], 'distance_km': [0.39653338615963163]},
+    '21969076': {'sold_listing_id': ['on-13-1353569'], 'distance_km': [0.45767571332477264]},
+    '21000001': {'sold_listing_id': ['on-17-c1111111', 'on-17-c2222222'], 'distance_km': [0.1, 0.2]},
+    '21000002': {'sold_listing_id': ['on-17-c3333333'], 'distance_km': [0.3]},
+    '21000003': {'sold_listing_id': ['on-17-c4444444'], 'distance_km': [0.4]},
+}
 
-# current_result = {
-#     '21483963': {'sold_listing_id': ['on-17-c7280822'], 'distance_km': [0.39653338615963163]},  # Unchanged
-#     '21969076': {'sold_listing_id': ['on-13-1353569', 'on-17-new123'], 'distance_km': [0.45767571332477264, 0.5]},  # Changed
-#     '21549819': {'sold_listing_id': ['on-17-c6693166', 'on-17-c6680498'], 'distance_km': [0.1, 0.2]},  # New
-#     '21000001': {'sold_listing_id': ['on-17-c1111111', 'on-17-c2222222'], 'distance_km': [0.1, 0.20000001]},  # Slight change in distance
-#     '21000002': {'sold_listing_id': ['on-17-c3333333', 'on-17-c5555555'], 'distance_km': [0.3, 0.5]},  # Added new sold listing
-#     '21000004': {'sold_listing_id': [], 'distance_km': []},  # New empty listing
-# }
+current_result = {
+    '21483963': {'sold_listing_id': ['on-17-c7280822'], 'distance_km': [0.39653338615963163]},  # Unchanged
+    '21969076': {'sold_listing_id': ['on-13-1353569', 'on-17-new123'], 'distance_km': [0.45767571332477264, 0.5]},  # Changed
+    '21549819': {'sold_listing_id': ['on-17-c6693166', 'on-17-c6680498'], 'distance_km': [0.1, 0.2]},  # New
+    '21000001': {'sold_listing_id': ['on-17-c1111111', 'on-17-c2222222'], 'distance_km': [0.1, 0.20000001]},  # Slight change in distance
+    '21000002': {'sold_listing_id': ['on-17-c3333333', 'on-17-c5555555'], 'distance_km': [0.3, 0.5]},  # Added new sold listing
+    '21000004': {'sold_listing_id': [], 'distance_km': []},  # New empty listing
+}
 
 # diff_result = compare_comparable_results(prev_result, current_result)
 # pprint(diff_result)

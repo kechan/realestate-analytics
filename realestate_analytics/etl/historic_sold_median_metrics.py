@@ -1007,8 +1007,15 @@ if __name__ == '__main__':
     etc. etc.
     {'month': '2024-06', 'value': 44.44},
     {'month': '2024-07', 'value': 50.0},
-    {'month': '2024-08', 'value': 50.0}]
+    {'month': '2024-08', 'value': 50.0}],
+
+    'sold_listing_count': [{'month': '2019-09', 'value': 122},
+    {'month': '2019-10', 'value': 127},
+    {'month': '2019-11', 'value': 95},
+    {'month': '2019-12', 'value': 54}]
    },
+   
+  
 
  'last_updated': '2024-08-08T03:59:24.281335'}
 """

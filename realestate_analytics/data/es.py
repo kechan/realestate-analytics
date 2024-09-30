@@ -39,6 +39,14 @@ def format_listingType(x: List[str]):
     x = x[1:]
   return ', '.join(x)
 
+
+# Custom function to parse datetime with flexible format
+def parse_datetime(dt_string):
+  try:
+    return pd.to_datetime(dt_string, format='%Y-%m-%dT%H:%M:%S.%f')
+  except ValueError:
+    return pd.to_datetime(dt_string, format='%Y-%m-%dT%H:%M:%S')
+            
 class Datastore:
   def __init__(self, host: str, port: int):
     self.logger = logging.getLogger(self.__class__.__name__)
@@ -648,7 +656,8 @@ class Datastore:
 
       # format known datetime column
       if 'addedOn' in listings_df.columns:
-        listings_df.addedOn = pd.to_datetime(listings_df.addedOn)
+        # listings_df.addedOn = pd.to_datetime(listings_df.addedOn)
+        listings_df.addedOn = listings_df.addedOn.apply(parse_datetime)
       if 'lastUpdate' in listings_df.columns:
         listings_df.lastUpdate = pd.to_datetime(listings_df.lastUpdate, format='%y-%m-%d:%H:%M:%S')
 
@@ -812,7 +821,8 @@ class Datastore:
 
       # format known datetime column
       if 'addedOn' in listings_df.columns:
-        listings_df.addedOn = pd.to_datetime(listings_df.addedOn)
+        # listings_df.addedOn = pd.to_datetime(listings_df.addedOn)
+        listings_df.addedOn = listings_df.addedOn.apply(parse_datetime)
       if 'lastUpdate' in listings_df.columns:
         listings_df.lastUpdate = pd.to_datetime(listings_df.lastUpdate, format='%y-%m-%d:%H:%M:%S')
   
