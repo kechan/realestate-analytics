@@ -73,21 +73,20 @@ class BigQueryDatastore:
     if not start_time and not end_time:
       raise ValueError('At least one of start_time or end_time must be provided.')
     
-    time_conditions = []
+    conditions = ["indexStatus = 'deleted'"]
     if start_time:
       start_time_str = start_time.strftime('%Y-%m-%d %H:%M:%S')
-      time_conditions.append(f'timestamp >= TIMESTAMP("{start_time_str}")')
+      conditions.append(f'timestamp >= TIMESTAMP("{start_time_str}")')
     if end_time:
       end_time_str = end_time.strftime('%Y-%m-%d %H:%M:%S')
-      time_conditions.append(f'timestamp < TIMESTAMP("{end_time_str}")')
+      conditions.append(f'timestamp < TIMESTAMP("{end_time_str}")')
 
-    time_where_clause = " AND ".join(time_conditions)
+    where_clause = " AND ".join(conditions)
 
     query = f"""
   SELECT timestamp, jumpId as listingId
   FROM `rlpdotca.RLP_Listings.listing` 
-  WHERE {time_where_clause}
-  AND indexStatus = 'deleted'
+  WHERE {where_clause}
     """
     
     self.logger.debug(f'Executing BQ query: {query}')
@@ -95,7 +94,8 @@ class BigQueryDatastore:
     try:
       results_df = self.query(query)
       if results_df.empty:
-        self.logger.warning(f'No deleted listings found between {start_time} and {end_time}')
+        self.logger.warning(f'No deleted listings found for the given criteria')
+        self.logger.warning(f'Criterias: start_time: {start_time}, end_time: {end_time}')
       return results_df
     except Exception as e:
       self.logger.error(f'Failed to retrieve deleted listings: {e}')

@@ -449,10 +449,10 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     # Modified last_month to simulate a diff month
     # last_month = (datetime.now().replace(day=1) + timedelta(days=1)).strftime('%Y-%m')
 
-    self.logger.info(f"Updating last month's median asking price on ES")
+    self.logger.info(f"Updating last month's ({last_month}) median asking price on ES")
     success_price, failed_price = self.update_last_mth_median_asking_price(last_month)
 
-    self.logger.info(f"Updating last month's new listings count on ES")
+    self.logger.info(f"Updating last month's ({last_month}) new listings count on ES")
     success_listings, failed_listings = self.update_last_mth_new_listings(last_month)
 
     total_success = success_price + success_listings
