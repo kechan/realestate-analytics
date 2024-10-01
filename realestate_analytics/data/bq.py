@@ -45,9 +45,9 @@ class BigQueryDatastore:
     try:
       query_job = self.client.query(query, timeout=timeout)
       return query_job.result().to_dataframe()
-    except exceptions.TimeoutError as e:
-      self.logger.error(f'Timeout error: {e}')
-      raise
+    # except exceptions.TimeoutError as e:      # there doesnt seem to be TimeoutError in google.api_core.exceptions
+    #   self.logger.error(f'Timeout error: {e}')
+    #   raise
     except exceptions.GoogleAPICallError as e:
       self.logger.error(f'API call error: {e}')
       raise
