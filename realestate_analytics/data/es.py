@@ -934,7 +934,7 @@ class Datastore:
             {
               "range": {
                 "lastTransition": {
-                  "gte": "now-30d/d",   # last 30 days
+                  "gte": "now-90d/d",   # last 90 days
                   "lte": "now"
                 }
               }
