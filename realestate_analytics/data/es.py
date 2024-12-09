@@ -16,6 +16,7 @@ from elasticsearch.helpers import scan, bulk
 from realestate_core.common.utils import load_from_pickle, save_to_pickle, join_df
 
 import logging
+from tqdm.auto import tqdm
 
 def derive_property_type(row):
   listing_type = row.get('listingType', '').split(', ')  # Assuming listingType is a comma-separated string
@@ -958,7 +959,7 @@ class Datastore:
     )
 
     def generate_updates():
-      for doc in documents_to_update:
+      for doc in tqdm(documents_to_update, desc="Updating documents"):
         doc_id = doc["_id"]
         _df = sold_listing_df.q("_id == @doc_id")
         if not _df.empty:
