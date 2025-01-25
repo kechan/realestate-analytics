@@ -215,7 +215,7 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
           self.logger.error(f"Failed to get sold listings from {end_time - timedelta(days=365)} to {end_time}")
           raise ValueError("Failed to get sold listings.")
         
-        # get everything up till now    
+        # get every active listings up till now    
         start_time = datetime(1970, 1, 1)     # distant past
         success, self.listing_df = self.datastore.get_current_active_listings(
           use_script_for_last_update=True,      # TODO: remove after dev 
@@ -256,7 +256,7 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
         
         # Get the current ACTIVE listings
         if force_full_load_current:
-          start_time = datetime(1970, 1, 1)     # distant past for full load
+          start_time = datetime(1970, 1, 1)     # distant past for full load of active listings
         else:
           start_time = last_run - timedelta(days=self.DELTA_CURRENT_LISTINGS_LOOKBACK_DAYS)   # load from 3 days before last run to have some margin of safety.
         # end time is same as above
@@ -339,6 +339,8 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
             self.logger.info(f'removed {len_listing_df_before_delete - len_listing_df_after_delete} deleted listings since last run')
           else:
             self.logger.info("No deleted listings found in BigQuery for the specified time range.")
+
+          self.delete_by_checking_es()   # we are piggbacking on this to remove from ES as well, although this isnt about BQ
         else:
           self.logger.info("Skipping check for deleted listings in BigQuery (as per configuration).")
 
@@ -414,7 +416,7 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
       self.cache.set(f'{self.cache_prefix}comparable_sold_listings_result', self.comparable_sold_listings_result)
       self.logger.info(f"{len(self.diff_result)} listings to be updated.")
       
-      # checkpoint the diff results
+      # checkpoint the diff results (this will be deleted when the entire ETL is completed)
       self.cache.set(f"{self.cache_prefix}{self.job_id}_transform_diff_result", self.diff_result)  # save the diff result in case a recovery is needed.
       self._mark_success('transform')
 
@@ -675,7 +677,50 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
   def delete_checkpoints_data(self):
     self.cache.delete(f"{self.cache_prefix}{self.job_id}_transform_diff_result")
 
+ 
+  def delete_by_checking_es(self) -> List[str]:
+    """
+    Check listing status against ES and delete those not found or inactive.
+    This provides a comprehensive cleanup beyond BQ deletions table.
+    Return a list of listing IDs that were deleted.
+    """
+    if not hasattr(self, 'listing_df') or self.listing_df is None:
+      self.logger.warning("No listing_df available for verification")
+      return []
+        
+    listing_ids = list(set(self.listing_df['_id'].tolist()))
+    batch_size = 1000
+    inactive_listings = []
+    
+    for i in range(0, len(listing_ids), batch_size):
+      batch_ids = listing_ids[i:i + batch_size]
+      query = {
+        "query": {
+          "terms": {
+            "_id": batch_ids
+          }
+        }
+      }
+      
+      active_ids = {
+        hit["_id"] for hit in scan(
+          self.datastore.es,
+          index=self.datastore.listing_index_name,
+          query=query,
+          _source=["listingStatus"]
+        ) if hit["_source"]["listingStatus"] == "ACTIVE"
+      }
+      
+      inactive_listings.extend(set(batch_ids) - active_ids)
 
+    if inactive_listings:
+      len_before = len(self.listing_df)
+      self.listing_df = self.listing_df[~self.listing_df['_id'].isin(inactive_listings)]
+      self.listing_df.reset_index(drop=True, inplace=True)
+      self.logger.info(f"Removed {len_before - len(self.listing_df)} listings based on ES verification")
+
+    return inactive_listings
+  
 if __name__ == '__main__':
   job_id = 'nearby_solds_xxx'
 

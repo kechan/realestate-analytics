@@ -327,6 +327,7 @@ class Datastore:
         self.logger.warning(f"Document with ID '{_id}' not found in index '{index}'.")
         return []
 
+    date_format, pertinent_time_field = None, None
     if index == self.sold_listing_index_name:
       date_format = '%Y-%m-%dT%H:%M:%S'
       pertinent_time_field = 'lastTransition'

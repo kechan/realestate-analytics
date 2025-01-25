@@ -219,7 +219,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       self.cache.set(f'{self.cache_prefix}five_years_below_ask_series', self.final_below_ask_series)
       self.cache.set(f'{self.cache_prefix}five_years_sold_listing_count_series', self.final_sold_listing_count_series)
 
-      # checkpoint the diff_*_series
+      # checkpoint the diff_*_series, this will be cleared when the entire ETL process is completed.
       self.diff_price_series.reset_index(drop=True, inplace=True)
       self.diff_dom_series.reset_index(drop=True, inplace=True)
       self.diff_over_ask_series.reset_index(drop=True, inplace=True)

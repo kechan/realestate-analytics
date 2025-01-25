@@ -35,6 +35,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
                 ]
 
     self.LOAD_SUCCESS_THRESHOLD = 0.5
+    self.ENABLE_TRACKING_INDEX = True  # if false, skip updating tracking index
 
     # self.es_store_script_name  = "update_last_month_metrics"
     # self.ensure_stored_script_exists()
@@ -295,6 +296,10 @@ class LastMthMetricsProcessor(BaseETLProcessor):
       if self.delta_listing_df is not None:
         self.logger.info(f"Loaded {len(self.delta_listing_df)} delta listings from cache.")
 
+    if not self.ENABLE_TRACKING_INDEX:
+      self.logger.info("Tracking index is disabled. Skipping update.")
+      return 0, []
+
     if self.delta_listing_df is not None:
       to_be_updated_listing_df = self.delta_listing_df
     else:
@@ -403,29 +408,36 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     self.logger.info(f'Found {len(deleted_listings_df)} deleted listings')
 
     if len(deleted_listings_df) == 0:  # no deleted listings
-      return
+      self.logger.info("No deleted listings found in BQ")
+      soft_deleted_ids = set()
+    else:      
+      deleted_listing_ids = set(deleted_listings_df['listingId'].tolist())
+      existing_listing_ids = set(self.listing_df['_id'])
+      soft_deleted_ids = deleted_listing_ids.intersection(existing_listing_ids)
 
-    # (1) Soft delete from self.listing_df
-    deleted_listing_ids = set(deleted_listings_df['listingId'].tolist())
-    existing_listing_ids = set(self.listing_df['_id'])
-    soft_deleted_ids = deleted_listing_ids.intersection(existing_listing_ids)
-    # idxs_to_remove = self.listing_df.q("_id.isin(@deleted_listing_ids)").index
-    # self.listing_df.drop(index=idxs_to_remove, inplace=True)
-    # self.listing_df.reset_index(drop=True, inplace=True)
+      self.listing_df.loc[self.listing_df['_id'].isin(soft_deleted_ids), 'is_deleted'] = True
+      self.logger.info(f'Soft deleted {len(soft_deleted_ids)} listings in self.listing_df')
 
-    # len_after = len(self.listing_df)
-    # self.logger.info(f'Removed {len_before - len_after} deleted listings from current listings')
+    more_soft_delete_ids = []
+    # more_soft_delete_ids = self.soft_delete_by_checking_es()  #TODO: Uncomment before official run
 
-    self.listing_df.loc[self.listing_df['_id'].isin(soft_deleted_ids), 'is_deleted'] = True
-    self.logger.info(f'Soft deleted {len(soft_deleted_ids)} listings in self.listing_df')
+    # After both BQ and ES verification, get all soft-deleted IDs
+    soft_deleted_ids.update(more_soft_delete_ids)
+
+    # Skip ES tracking index operations if disabled
+    if not self.ENABLE_TRACKING_INDEX:
+      self.logger.info("Tracking index is disabled. Skipping deletion from tracking index.")
+      if self.cache.cache_dir:
+        self._save_to_cache()
+      return 0, []
 
     # (2) Remove from Elasticsearch tracking index
     def generate_actions():
-      for _, row in deleted_listings_df.iterrows():
+      for listing_id in soft_deleted_ids:
         yield {
           "_op_type": "delete",
           "_index": self.datastore.listing_tracking_index_name,
-          "_id": row['listingId']
+          "_id": listing_id
         }
 
     success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
@@ -438,6 +450,59 @@ class LastMthMetricsProcessor(BaseETLProcessor):
       self._save_to_cache()
 
     return success, failed
+
+
+  def soft_delete_by_checking_es(self) -> List[str]:
+    """
+    Check active status of listings by checking against ES.
+    This provides a comprehensive cleanup beyond BQ deletions table.
+
+    Mark those not found or inactive status with is_deleted=True.
+
+    Return a list of unique listing IDs that are to be marked as deleted.
+    """
+    if not hasattr(self, 'listing_df') or self.listing_df is None:
+      self.logger.warning("No listing_df available for verification")
+      return []
+      
+    # Get unique listing IDs excluding those with is_deleted=True
+    listing_ids = list(set(self.listing_df[~self.listing_df['is_deleted']]['_id'].tolist()))
+    
+    # Query ES in batches to avoid large requests
+    batch_size = 1000
+    inactive_listings = []
+    
+    for i in range(0, len(listing_ids), batch_size):
+      batch_ids = listing_ids[i:i + batch_size]
+      
+      # Query for active listings
+      query = {
+        "query": {
+          "terms": {
+            "_id": batch_ids
+          }
+        }
+      }
+      
+      # Get IDs of active listings from ES
+      active_ids = {
+        hit["_id"] for hit in scan(
+          self.datastore.es,
+          index=self.datastore.listing_index_name,
+          query=query,
+          _source=["listingStatus"]
+        ) if hit["_source"]["listingStatus"] == "ACTIVE"
+      }
+      
+      # IDs not found as active are inactive
+      inactive_listings.extend(set(batch_ids) - active_ids)
+
+    # Mark all instances of inactive listings as deleted
+    self.listing_df.loc[self.listing_df._id.isin(inactive_listings), 'is_deleted'] = True
+    
+    self.logger.info(f"Marked {len(inactive_listings)} unique listings as deleted based on ES verification")
+
+    return inactive_listings
 
 
   def update_mkt_trends(self):
