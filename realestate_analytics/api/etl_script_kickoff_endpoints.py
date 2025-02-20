@@ -91,6 +91,15 @@ async def run_last_mth_metrics(
         params = BaseETLJobParams()
     return run_etl_job("last_mth_metrics", config_path, params)
 
+@router.post("/current_mth_metrics")
+async def run_current_mth_metrics(
+  config_path: str = Query(..., description="Path to the configuration file"),
+  params: Optional[BaseETLJobParams] = None
+):
+  if params is None:
+    params = BaseETLJobParams()
+  return run_etl_job("current_mth_metrics", config_path, params)
+
 @router.post("/historic_metrics")
 async def run_historic_metrics(
     config_path: str = Query(..., description="Path to the configuration file"),

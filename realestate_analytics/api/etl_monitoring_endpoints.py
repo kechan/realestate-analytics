@@ -64,6 +64,10 @@ class ETLJobInfo:
         "absorption_rate": {
             "log_prefix": "absorption_rate",
             "class_name": "AbsorptionRateProcessor"
+        },
+        "current_mth_metrics": {
+            "log_prefix": "current_mth_metrics",
+            "class_name": "CurrentMthMetricsProcessor"
         }
     }
 
