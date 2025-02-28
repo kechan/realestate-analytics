@@ -53,8 +53,12 @@ class CurrentMthMetricsProcessor(BaseETLProcessor):
 
     try:
       self.compute_current_metrics()
+
+      # Save the current metrics to "global" cache, this is to enable endpoints to query this.
+      self.cache.set(f"{self.cache_prefix}current_mth_metrics_results", 
+                    self.current_metrics_results)
       
-      # Cache transform results for recovery
+      # Cache transform results for recovery, will be removed by delete_checkpoints_data()
       self.cache.set(f"{self.cache_prefix}{self.job_id}_transform_results", 
                     self.current_metrics_results)
       

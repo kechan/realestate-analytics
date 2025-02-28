@@ -419,7 +419,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
       self.logger.info(f'Soft deleted {len(soft_deleted_ids)} listings in self.listing_df')
 
     more_soft_delete_ids = []
-    # more_soft_delete_ids = self.soft_delete_by_checking_es()  #TODO: Uncomment before official run
+    more_soft_delete_ids = self.soft_delete_by_checking_es()  #TODO: Uncomment before official run (Done), remove this TODO when extra verificaiton is complete
 
     # After both BQ and ES verification, get all soft-deleted IDs
     soft_deleted_ids.update(more_soft_delete_ids)
