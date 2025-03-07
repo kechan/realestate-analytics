@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from realestate_analytics.api.endpoints import (
   historic_sold_metrics, 
   last_mth_metrics, 
-  # current_mth_metrics, 
+  current_mth_metrics, 
   absorption_rate, 
   geos
 )
@@ -14,7 +14,7 @@ from realestate_analytics.api.etl_monitoring_endpoints import router as monitori
 
 from dotenv import load_dotenv, find_dotenv
 
-# uvicorn main:app --reload --log-level debug
+# uvicorn main:app --reload --log-level debug --port 8001
 
 # Get env for CORS middleware configuration
 _ = load_dotenv(find_dotenv())
@@ -58,7 +58,7 @@ app.include_router(monitoring_router, prefix="/monitor", tags=["monitoring"])
 # geo info and metrics related routers
 app.include_router(historic_sold_metrics.router, prefix="/metrics/historic_sold", tags=["historic_sold"])
 app.include_router(last_mth_metrics.router, prefix="/metrics", tags=["last-month"])
-# app.include_router(current_mth_metrics.router, prefix="/metrics", tags=["current-month"])
+app.include_router(current_mth_metrics.router, prefix="/metrics", tags=["current-month"])
 app.include_router(absorption_rate.router, prefix="/metrics", tags=["absorption-rate"])
 app.include_router(geos.router, prefix="/geos", tags=["geos"])
 # app.include_router(geos.router, prefix="/geos/search", tags=["geos"])
