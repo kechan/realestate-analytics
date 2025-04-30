@@ -219,7 +219,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
       self.logger.info(f'Loaded {len(self.delta_listing_df)} listings from {start_time} to {end_time}')
 
     listing_df = self.cache.get(f'{self.cache_prefix}on_current_listing')
-    self.delta_listing_df['is_deleted'] = False  # New delta listings are not deleted
+    self.delta_listing_df['is_deleted'] = False  # New delta listings are not considered deleted.
 
     self.listing_df = pd.concat([listing_df, self.delta_listing_df], ignore_index=True)
 
@@ -403,6 +403,8 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     last_month_end = last_month_end.date()
 
     # len_before = len(self.listing_df)
+
+    # Consult BQ to figure out what has become inactive/deleted during last mth
     self.logger.info(f'Remove deleted listings from {last_month_start} to {last_month_end}')
     deleted_listings_df = self.bq_datastore.get_deleted_listings(start_time=last_month_start, end_time=last_month_end)
     self.logger.info(f'Found {len(deleted_listings_df)} deleted listings')
@@ -418,6 +420,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
       self.listing_df.loc[self.listing_df['_id'].isin(soft_deleted_ids), 'is_deleted'] = True
       self.logger.info(f'Soft deleted {len(soft_deleted_ids)} listings in self.listing_df')
 
+    # Consult ES to figure out what has become inactive/deleted during last mth
     more_soft_delete_ids = []
     more_soft_delete_ids = self.soft_delete_by_checking_es()  #TODO: Uncomment before official run (Done), remove this TODO when extra verificaiton is complete
 
@@ -425,26 +428,26 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     soft_deleted_ids.update(more_soft_delete_ids)
 
     # Skip ES tracking index operations if disabled
-    if not self.ENABLE_TRACKING_INDEX:
+    success = 0
+    failed = []
+
+    if self.ENABLE_TRACKING_INDEX:
+      # (2) Remove from Elasticsearch tracking index
+      def generate_actions():
+        for listing_id in soft_deleted_ids:
+          yield {
+            "_op_type": "delete",
+            "_index": self.datastore.listing_tracking_index_name,
+            "_id": listing_id
+          }
+
+      success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
+      self.logger.info(f"Successfully deleted {success} documents from Elasticsearch")
+      if failed:
+        self.logger.error(f"Failed to delete {len(failed)} documents from Elasticsearch")
+        self.datastore.summarize_delete_failures(failed)
+    else:
       self.logger.info("Tracking index is disabled. Skipping deletion from tracking index.")
-      if self.cache.cache_dir:
-        self._save_to_cache()
-      return 0, []
-
-    # (2) Remove from Elasticsearch tracking index
-    def generate_actions():
-      for listing_id in soft_deleted_ids:
-        yield {
-          "_op_type": "delete",
-          "_index": self.datastore.listing_tracking_index_name,
-          "_id": listing_id
-        }
-
-    success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
-    self.logger.info(f"Successfully deleted {success} documents from Elasticsearch")
-    if failed:
-      self.logger.error(f"Failed to delete {len(failed)} documents from Elasticsearch")
-      self.datastore.summarize_delete_failures(failed)
 
     if self.cache.cache_dir:
       self._save_to_cache()
@@ -721,6 +724,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
   def _archive_results(self):
     if hasattr(self, 'last_mth_metrics_results') and self.last_mth_metrics_results is not None:
+      # Archive the last month's metrics results
       if not self.archiver.archive(self.last_mth_metrics_results, 'last_mth_metrics_results'):
         self.logger.error("Failed to archive last month's metrics results")
         raise ValueError("Fatal error archiving last_mth_metrics_results. This must be successful to proceed.")

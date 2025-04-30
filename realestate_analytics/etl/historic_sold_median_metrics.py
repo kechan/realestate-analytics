@@ -112,11 +112,11 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
           raise ValueError("Failed to retrieve delta sold listings")
         self.logger.info(f'Loaded {len(delta_sold_listing_df)} sold listings from {start_time} to {end_time}')
 
-        # merge delta with whole
+        # Merge delta for sold listings
         self.sold_listing_df = pd.concat([self.sold_listing_df, delta_sold_listing_df], axis=0, ignore_index=True)
         self.sold_listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='first')   # TODO: keep first to preserve hacked guid, undo this later
 
-        # get rid of stuff older than 5 years (but incl. the full 1st month)
+        # Filter out sold listings older than 5 years (but incl. the full 1st month)
         len_sold_listing_df_before_delete = len(self.sold_listing_df)
         five_years_ago_from_now = datetime(end_time.year - 5, end_time.month, 1)
         drop_idxs = self.sold_listing_df.q("lastTransition < @five_years_ago_from_now").index

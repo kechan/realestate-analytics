@@ -293,10 +293,11 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
 
         # Merge delta with whole
 
-        # Merging for sold listings
+        # Merging delta for sold listings
         self.sold_listing_df = pd.concat([self.sold_listing_df, delta_sold_listing_df], axis=0, ignore_index=True)
         self.sold_listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='first')   # TODO: keep first to preserve hacked guid, undo this later
-        # get rid of stuff thats older than a year
+        
+        # Filter out stuff thats older than a year
         len_sold_listing_df_before_delete = len(self.sold_listing_df)
         one_year_ago_from_now = end_time - timedelta(days=365)
         drop_idxs = self.sold_listing_df.q("lastTransition < @one_year_ago_from_now").index
@@ -320,7 +321,7 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
         self.logger.info(f"Dropping {len(inactive_indices)} non active listings")
         self.listing_df.drop(inactive_indices, inplace=True)
 
-        # Remove known deletions from BQ since last run
+        # Remove known deletions from BQ since last run, gauranteed finally by checking ES.
         if self.check_bq_deletions:
           # Note: for the purpose of computing nearby solds, it isnt critical to remove these, 
           # as updating an already deleted listing should be a no op for ES update
@@ -379,7 +380,7 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
 
 
   def transform(self):
-    if self._was_success('transform'):  # load the cache and skip instead
+    if self._was_success('transform'):  # load the cache and skip ahead
       self.logger.info("Transform already successful. Loading checkpoint from cache.")
       diff_result_json = self.cache.get(f"{self.cache_prefix}{self.job_id}_transform_diff_result").replace("'", '"')
       diff_result_json = diff_result_json.replace("'", '"')
@@ -635,6 +636,33 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
   
 
   def _process_listing_profile_partition(self):
+    """
+    Partition the sold listings DataFrame into unique property profiles.
+
+    This method groups the `sold_listing_df` DataFrame by the criteria defined in
+    `self.comparable_criteria` (e.g., property type, number of bedrooms, and number of bathrooms)
+    and calculates the population size for each unique profile. The result is stored in
+    `self.listing_profile_partition`.
+
+    The resulting DataFrame contains:
+    - Columns for each criterion in `self.comparable_criteria`.
+    - A `population` column indicating the number of sold listings in each profile.
+
+    This partitioning is used to optimize the process of finding comparable sold listings
+    by reducing the search space for each current listing.
+
+    Side Effects:
+    - Updates the `self.listing_profile_partition` attribute with the grouped DataFrame.
+
+    Example:
+    If `self.comparable_criteria = ['propertyType', 'bedsInt', 'bathsInt']`, the resulting
+    `self.listing_profile_partition` might look like:
+    
+        propertyType  bedsInt  bathsInt  population
+        Condo         2        2         150
+        Detached      3        2         200
+        Townhouse     3        3         120
+    """
     self.listing_profile_partition = self.sold_listing_df.groupby(self.comparable_criteria).size().reset_index(name='population')
 
 
