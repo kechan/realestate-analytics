@@ -16,6 +16,11 @@ from dotenv import load_dotenv, find_dotenv
 
 from realestate_analytics.api.dependencies import get_cache
 
+from realestate_analytics.api.cache_diagnostics import (
+    CacheKeyInfo, 
+    get_etl_cache_diagnostics,
+)
+
 logger = logging.getLogger(__name__)
 
 # Load environment variables
@@ -304,6 +309,26 @@ async def get_active_job(etl_type: Optional[str] = None):
             return job_status
     
     return None
+
+
+@router.get("/cache/diagnostics/{etl_type}", response_model=List[CacheKeyInfo])
+async def get_cache_diagnostics(etl_type: str):
+    """
+    Cache diagnostics for an ETL type: checks existence and size of cache keys.
+    """
+    logger.info(f"Fetching cache diagnostics for ETL type: {etl_type}")
+
+    if not ETLJobInfo.is_valid_etl_type(etl_type):
+        raise HTTPException(status_code=400, detail=f"Invalid ETL type: {etl_type}")
+
+    cache = get_cache()
+
+    try:
+        return get_etl_cache_diagnostics(etl_type, cache)
+    except Exception as e:
+        logger.error(f"Error fetching cache diagnostics for {etl_type}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get cache diagnostics for {etl_type}: {str(e)}")
+
 
 
 def parse_monitor_line(line: str, job_status: JobStatus):
