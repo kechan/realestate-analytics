@@ -254,11 +254,24 @@ class Datastore:
                   "value": {"type": "float"}
                 }
               },
+              "below_ask_percentage": {
+                "type": "nested",
+                "properties": {
+                  "month": {"type": "date", "format": "yyyy-MM"},
+                  "value": {"type": "float"}
+                }
+              },
               "sold_listing_count": {
                 "type": "nested",
                 "properties": {
                   "month": {"type": "date", "format": "yyyy-MM"},
                   "value": {"type": "integer"}
+                }
+              },
+              "current_metrics": {
+                "properties": {
+                  "median_asking_price": {"type": "float"},
+                  "new_listings": {"type": "integer"}
                 }
               }
             }
