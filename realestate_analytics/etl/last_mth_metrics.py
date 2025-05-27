@@ -35,7 +35,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
                 ]
 
     self.LOAD_SUCCESS_THRESHOLD = 0.5
-    self.ENABLE_TRACKING_INDEX = True  # if false, skip updating tracking index
+    self.ENABLE_TRACKING_INDEX = False  # if false, skip updating tracking index
 
     # self.es_store_script_name  = "update_last_month_metrics"
     # self.ensure_stored_script_exists()
