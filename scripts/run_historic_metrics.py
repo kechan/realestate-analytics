@@ -97,12 +97,15 @@ def main():
     logging.exception(f"Error during .run() for job {job_id}: {e}")
 
   # Update the CSV with the run results
-  update_run_csv(csv_path=hist_runs_csv_path, job_id=job_id, processor=processor)
+  success = update_run_csv(csv_path=hist_runs_csv_path, job_id=job_id, processor=processor)
 
   # Log the end of the run
   logging.info("="*50)
   logging.info(f"Finished run for job {job_id} at {datetime.now().isoformat()}")
   logging.info("="*50)
+
+  if not success:
+    sys.exit(1)
 
 if __name__ == "__main__":
   main()
