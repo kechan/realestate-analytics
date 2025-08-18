@@ -2,11 +2,12 @@ from typing import Dict, List, Union
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import logging
+import logging, gc
 
 from .base_etl import BaseETLProcessor
 from ..data.caching import FileBasedCache
 from ..data.es import Datastore
+from ..utils.constants import VALID_PROVINCES
 from elasticsearch.helpers import bulk, scan
 
 class CurrentMthMetricsProcessor(BaseETLProcessor):
@@ -28,15 +29,31 @@ class CurrentMthMetricsProcessor(BaseETLProcessor):
     self._mark_success('extract')
 
   def _load_from_cache(self):
-    """Load the current listings from LastMthMetricsProcessor's cache."""
-    self.listing_df = self.cache.get('LastMthMetricsProcessor/on_current_listing')
-    
-    if self.listing_df is None:
+    """Load current listings from ALL LastMthMetricsProcessor province caches."""
+    all_listing_dfs = []
+    for prov in VALID_PROVINCES:
+      cache_key = f'LastMthMetricsProcessor/{prov.lower()}_current_listing'
+      listing_df = self.cache.get(cache_key)    
+
+      if listing_df is None or listing_df.empty:
+        self.logger.warning(f"Cache {cache_key} is missing or empty; skipping.")
+        continue
+
+      listing_df = listing_df.sort_values('lastUpdate').drop_duplicates('_id', keep='last')
+      all_listing_dfs.append(listing_df)
+
+    if not all_listing_dfs:
       self.logger.error(
-        "Missing listing_df in LastMthMetricsProcessor cache. "
-        "Ensure LastMthMetricsProcessor has run successfully before this job."
-      )
-      raise ValueError("Missing listing_df in LastMthMetricsProcessor cache.")
+            "No listing data found in any LastMthMetricsProcessor province caches. "
+            "Ensure at least one LastMthMetricsProcessor has run successfully before this job."
+        )
+      raise ValueError("No listing data found in any LastMthMetricsProcessor province caches.")
+        
+    self.listing_df = pd.concat(all_listing_dfs, ignore_index=True)
+    
+
+    self.logger.info(f"Loaded {len(self.listing_df)} current listings from {len(all_listing_dfs)} province caches.")
+    del all_listing_dfs; gc.collect();
     
     # Filter out soft-deleted listings if is_deleted column exists
     if 'is_deleted' in self.listing_df.columns:
@@ -90,8 +107,12 @@ class CurrentMthMetricsProcessor(BaseETLProcessor):
     - Current median asking price
     - Count of new listings in current month
     Grouped by geog_id and propertyType, ensuring all property types are represented
+    
+    OPTIMIZED VERSION: Memory-efficient approach using vectorized operations
     """
-    # First, get complete list of geog_ids from ES market trends index
+    
+    # STEP 1: Get complete list of geog_ids from ES market trends index
+    # Memory impact: ~10-50MB (same as original)
     all_geog_ids = set()
     query = {
       "query": {"match_all": {}},
@@ -105,22 +126,32 @@ class CurrentMthMetricsProcessor(BaseETLProcessor):
     
     self.logger.info(f"Found {len(all_geog_ids)} unique geog_ids in market trends index")
     
-    # Convert addedOn to datetime if it's not already
-    self.listing_df['addedOn'] = pd.to_datetime(self.listing_df['addedOn'])
+    # STEP 2: Prepare listing data - SLIM DOWN before explode (MAJOR MEMORY OPTIMIZATION)
+    # Only keep columns we actually need for metrics calculation
+    cols_needed = ['guid', 'price', 'addedOn', 'propertyType']
+    slim_df = self.listing_df[cols_needed].copy()
+    slim_df['addedOn'] = pd.to_datetime(slim_df['addedOn'])
     
-    # Get current month for filtering new listings
     current_date = self.get_current_datetime()
     current_month = current_date.strftime('%Y-%m')
     
-    # Expand guid column for listings that exist
-    expanded_df = self.listing_df.assign(
-      geog_id=self.listing_df['guid'].str.split(',')
-    ).explode('geog_id')
+    self.logger.info(f"Slimmed DataFrame from {self.listing_df.shape[1]} columns to {len(cols_needed)} columns before explode")
+    
+    # STEP 3: Expand guid column for listings that exist  
+    # Memory impact: 3-5x increase but ONLY on essential columns (much more efficient)
+    expanded_df = (
+      slim_df.assign(geog_id=slim_df['guid'].str.split(','))
+            .explode('geog_id')
+    )
+    del slim_df
+    gc.collect()
+    
+    self.logger.info(f"Expanded to {len(expanded_df)} listing-geog_id combinations")
     
     # Define standard property types
     standard_property_types = ['DETACHED', 'SEMI-DETACHED', 'TOWNHOUSE', 'CONDO']
     
-    # Function to calculate metrics for both specific property types and 'ALL'
+    # Function to calculate metrics (same as original)
     def calculate_metrics(group):
       if group.empty:
         return pd.Series({
@@ -135,37 +166,77 @@ class CurrentMthMetricsProcessor(BaseETLProcessor):
         ).sum()
       })
     
-    # Calculate metrics for specific property types
-    results = expanded_df.groupby(['geog_id', 'propertyType']).apply(
+    # STEP 4: Pre-calculate all metrics using vectorized pandas operations
+    # Memory impact: Much smaller than original (only actual data combinations)
+    self.logger.info("Calculating metrics for specific property types...")
+    specific_metrics = expanded_df.groupby(['geog_id', 'propertyType']).apply(
       calculate_metrics
     ).reset_index()
     
-    # Calculate metrics for 'ALL' property type
-    all_property_types = expanded_df.groupby('geog_id').apply(
+    self.logger.info("Calculating metrics for 'ALL' property type...")
+    all_metrics = expanded_df.groupby('geog_id').apply(
       calculate_metrics
     ).reset_index()
-    all_property_types['propertyType'] = 'ALL'
+    all_metrics['propertyType'] = 'ALL'
     
-    # Create all combinations using the complete set of geog_ids
-    all_combinations = pd.DataFrame([
-      {'geog_id': gid, 'propertyType': pt}
-      for gid in all_geog_ids
-      for pt in standard_property_types + ['ALL']
-    ])
+    # Combine calculated metrics
+    calculated_metrics = pd.concat([specific_metrics, all_metrics], ignore_index=True)
+    self.logger.info(f"Calculated metrics for {len(calculated_metrics)} actual (geog_id, propertyType) pairs")
     
-    # Merge with actual results, ensuring all combinations exist
-    final_results = pd.merge(
-      all_combinations,
-      pd.concat([results, all_property_types], ignore_index=True),
+    # STEP 5: Create complete combinations matrix using vectorized operations
+    # Memory impact: MUCH more efficient than original nested list comprehension
+    
+    # Convert set to sorted list for consistent ordering
+    geog_id_list = sorted(list(all_geog_ids))
+    num_geog_ids = len(geog_id_list)
+    num_prop_types = len(standard_property_types) + 1  # +1 for 'ALL'
+    
+    self.logger.info(f"Creating complete matrix: {num_geog_ids} geog_ids × {num_prop_types} property types = {num_geog_ids * num_prop_types} total combinations")
+    
+    # VECTORIZED APPROACH: Create arrays using numpy (much faster than loops)
+    # Each geog_id repeated 5 times: [geog1, geog1, geog1, geog1, geog1, geog2, geog2, ...]
+    geog_id_array = np.repeat(geog_id_list, num_prop_types)
+    
+    # Property types tiled: [DETACHED, SEMI, TOWN, CONDO, ALL, DETACHED, SEMI, ...]  
+    prop_type_array = np.tile(standard_property_types + ['ALL'], num_geog_ids)
+    
+    # Create base DataFrame with default values (FAST - vectorized DataFrame creation)
+    complete_combinations = pd.DataFrame({
+      'geog_id': geog_id_array,
+      'propertyType': prop_type_array,
+      'median_asking_price': None,  # Default value for missing data
+      'new_listings': 0             # Default value for missing data
+    })
+    
+    self.logger.info(f"Created complete combinations matrix with {len(complete_combinations)} rows")
+    
+    # STEP 6: Merge with calculated metrics (EFFICIENT - pandas optimized merge)
+    # This replaces the massive memory-bomb merge from original code
+    self.logger.info("Merging calculated metrics with complete combinations...")
+    
+    final_results = complete_combinations.merge(
+      calculated_metrics[['geog_id', 'propertyType', 'median_asking_price', 'new_listings']],
       on=['geog_id', 'propertyType'],
-      how='left'
+      how='left',
+      suffixes=('_default', '_calculated')
     )
     
-    # Fill missing values appropriately
+    # STEP 7: Fill in actual values where they exist, keep defaults where they don't
+    # Use calculated values when available, otherwise keep defaults (None, 0)
+    final_results['median_asking_price'] = final_results['median_asking_price_calculated'].combine_first(
+      final_results['median_asking_price_default']
+    )
+    final_results['new_listings'] = final_results['new_listings_calculated'].fillna(
+      final_results['new_listings_default']
+    ).astype(int)
+    
+    # Clean up - keep only the final columns
+    final_results = final_results[['geog_id', 'propertyType', 'median_asking_price', 'new_listings']]
+    
+    # STEP 8: Final processing (same as original)
     final_results['median_asking_price'] = final_results['median_asking_price'].map(
       lambda x: None if pd.isna(x) else float(x)
     )
-    final_results['new_listings'] = final_results['new_listings'].fillna(0).astype(int)
     
     self.logger.info(
       f'Calculated current metrics for {len(final_results)} '
@@ -355,3 +426,4 @@ class CurrentMthMetricsProcessor(BaseETLProcessor):
       raise_on_error=False,
       raise_on_exception=False
     )
+  

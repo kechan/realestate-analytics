@@ -62,6 +62,8 @@ class FileBasedCache:
       expiry_path.unlink()  # Remove expiry file if no expiry is set
 
     if suffix == '_df':
+      if value.empty:
+        value = value.reset_index(drop=True)  # Reset index for empty DataFrame
       value.to_feather(cache_path)
     else:
       if isinstance(value, datetime):

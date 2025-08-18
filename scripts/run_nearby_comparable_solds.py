@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import pandas as pd
 
+from realestate_analytics.utils.constants import VALID_PROVINCES
+
 from realestate_analytics.etl.run_utils import load_config, get_next_job_id, update_run_csv
 
 from realestate_analytics.etl.nearby_comparable_solds import NearbyComparableSoldsProcessor
@@ -67,6 +69,10 @@ def main():
   parser.add_argument("--es_host", help="Elasticsearch host")
   parser.add_argument("--es_port", type=int, help="Elasticsearch port")
   parser.add_argument("--force_full_load", action="store_true", help="Force a full load instead of incremental")
+  parser.add_argument("--prov_code", 
+                      default="ON", 
+                      choices=VALID_PROVINCES,
+                      help="Province code (e.g., ON, BC, AB), ON is default")
   parser.add_argument("--log_level", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Logging level")
 
   #TODO: Remove this after dev
@@ -113,6 +119,7 @@ def main():
   # Log the start of the run
   logging.info("="*50)
   logging.info(f"Starting new run for job {job_id} at {datetime.now().isoformat()}")
+  logging.info(f"Province: {args.prov_code}")
   logging.info("="*50)
 
   # Initialize datastores
@@ -131,7 +138,8 @@ def main():
     job_id=job_id,
     datastore=datastore,
     bq_datastore=bq_datastore,
-    check_bq_deletions=check_bq_deletions
+    check_bq_deletions=check_bq_deletions,
+    prov_code=args.prov_code
   )
 
   if args.sim_failure_at_pre_transform:

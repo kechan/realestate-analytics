@@ -212,7 +212,7 @@ class Datastore:
           "geo_level": {"type": "integer"},
           "metrics": {
             "properties": {
-              "median_price": {
+              "median_sold_price": {
                 "type": "nested",
                 "properties": {
                   "month": {"type": "date", "format": "yyyy-MM"},
@@ -272,6 +272,13 @@ class Datastore:
                 "properties": {
                   "median_asking_price": {"type": "float"},
                   "new_listings": {"type": "integer"}
+                }
+              },
+              "mth_end_snapshot_listing_count": {
+                "type": "nested",
+                "properties": {
+                  "month": {"type": "date", "format": "yyyy-MM"},
+                  "value": {"type": "integer"}
                 }
               }
             }
@@ -513,6 +520,81 @@ class Datastore:
       self.logger.error(f"Error converting sold listings to DataFrame: {e}")
       return False, pd.DataFrame()
 
+  def get_ims_sold_listings(self, start_time: datetime = None, end_time: datetime = None, 
+                           date_field: str = "lastTransition", selects: List[str] = None, 
+                           prov_code: str = None) -> Tuple[bool, pd.DataFrame]:
+    """
+    Query sold listings from the new IMS (Integrated MLS System) dataset.
+    
+    TODO: PLACEHOLDER METHOD - Replace with actual IMS implementation when ES index is ready
+    
+    This method will query the new IMS ES index for sold listings across all Canadian provinces.
+    The IMS dataset uses different field mappings compared to the current rlp_archive_current index:
+    - Primary Key: MLSNumber (instead of ES document ID)
+    - Property Type: Derived from (Type, SubType, Style) instead of (searchCategoryType, listingType)
+    - Field Mappings: WrittenDate → lastTransition, SoldPrice → soldPrice, etc.
+    - Geographic Coverage: All Canadian provinces (not just GTA)
+    - Data Lag: Sold listings can arrive up to 1 year after transaction date
+    
+    Parameters:
+    - start_time (datetime, optional): The start of the time range for the search. Defaults to one year ago.
+    - end_time (datetime, optional): The end of the time range for the search. Defaults to None (current time).
+    - date_field (str, optional): The field to use for date filtering. Defaults to "lastTransition" 
+                                 (mapped from IMS "WrittenDate" field).
+    - selects (List[str], optional): List of fields to retrieve. If None, all fields are retrieved.
+                                    Note: Field names should match the current interface for compatibility.
+    - prov_code (str, optional): Province code to filter listings (e.g., 'ON', 'BC', 'AB'). 
+                                If None, returns data for all provinces.
+    
+    Returns:
+    Tuple[bool, pd.DataFrame]: A tuple containing:
+        - A boolean indicating success (True) or failure (False)
+        - A DataFrame representing the sold listings with same column structure as get_sold_listings()
+        
+    TODO Implementation Notes:
+    - When IMS ES index is ready, replace this stub with actual Elasticsearch query
+    - Implement field mapping from IMS schema to current interface (e.g., WrittenDate → lastTransition)
+    - Add province filtering using prov_code parameter for performance
+    - Implement new property type derivation logic using (Type, SubType, Style) fields
+    - Handle MLSNumber as primary key instead of ES document ID
+    - Add guid field mapping (depends on Boss's geographic mapping work)
+    - Consider performance optimization for province-specific queries
+    - Maintain same return format as get_sold_listings() for compatibility
+    """
+    
+    # Apply same default as get_sold_listings
+    if start_time is None:
+      start_time = datetime.now() - timedelta(days=365)  # one year ago
+    
+    self.logger.info(f"Fetching IMS sold listings from {start_time} to {end_time if end_time else 'unspecified'}{f' for province {prov_code}' if prov_code else ''}")
+    start_process_time = time.time()
+    
+    # PLACEHOLDER IMPLEMENTATION - Remove when actual IMS implementation is ready
+    self.logger.info("PLACEHOLDER: get_ims_sold_listings called - returning empty dataset")
+    self.logger.info(f"Parameters: start_time={start_time}, end_time={end_time}, date_field={date_field}, prov_code={prov_code}")
+    self.logger.info("TODO: Replace this stub with actual IMS ES index query when index is available")
+    
+    # Return same as get_sold_listings when no results found
+    self.logger.info("No IMS sold listings found (placeholder)")
+
+    if selects:
+      columns = selects
+      empty_df = pd.DataFrame(columns=columns)
+
+      # Ensure datetime columns have correct dtype
+      if 'lastTransition' in empty_df.columns:
+          empty_df['lastTransition'] = pd.to_datetime(empty_df['lastTransition'])
+      
+      # Add _id, propertyType columns (added by get_sold_listings processing)
+      if '_id' not in empty_df.columns:
+          empty_df['_id'] = None
+      if 'propertyType' not in empty_df.columns:
+          empty_df['propertyType'] = None    
+    
+      self.logger.info(f"Returning empty DataFrame with {len(empty_df.columns)} columns for province: {prov_code or 'ALL'}")  # Use empty_df.columns for accurate count
+      return True, empty_df
+    
+    return True, pd.DataFrame()
 
   def get_current_active_listings(self, selects: List[str], prov_code: str=None,
                                   addedOn_start_time: datetime=None, addedOn_end_time: datetime=None,

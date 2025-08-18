@@ -17,8 +17,11 @@ import logging, sys, pytz
 
 
 class LastMthMetricsProcessor(BaseETLProcessor):
-  def __init__(self, job_id: str, datastore: Datastore, bq_datastore: BigQueryDatastore = None):
-    super().__init__(job_id=job_id, datastore=datastore, bq_datastore=bq_datastore)
+  def __init__(self, job_id: str, datastore: Datastore, 
+               bq_datastore: BigQueryDatastore = None,
+               prov_code: str = 'ON'
+               ):
+    super().__init__(job_id=job_id, datastore=datastore, bq_datastore=bq_datastore, prov_code=prov_code)
     
     self.listing_df = None
     self.delta_listing_df = None
@@ -110,13 +113,13 @@ class LastMthMetricsProcessor(BaseETLProcessor):
   def transform(self):
     if self._was_success('transform'):
       self.logger.info("Transform stage already completed. Loading checkpoints from cache.")
-      self.delta_listing_df = self.cache.get(f'{self.cache_prefix}{self.job_id}_delta_on_current_listing')
+      self.delta_listing_df = self.cache.get(f'{self.cache_prefix}{self.job_id}_delta_{self.prov_code.lower()}_current_listing')
       return
 
     # there's no transform needed
     if self.delta_listing_df is None:
       self.logger.info("No transform needed. Just loading checkpoints from cache.")
-      self.delta_listing_df = self.cache.get(f'{self.cache_prefix}{self.job_id}_delta_on_current_listing')
+      self.delta_listing_df = self.cache.get(f'{self.cache_prefix}{self.job_id}_delta_{self.prov_code.lower()}_current_listing')
     
     self._mark_success('transform')
 
@@ -166,7 +169,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
       updated_end_time=end_time,
 
       selects=self.listing_selects,
-      prov_code='ON'                
+      prov_code=self.prov_code
     )
     
     if not success:
@@ -182,8 +185,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     self.cache.set(key=self.last_run_key, value=end_time)
 
     # checkpoint such that listing_df can be picked on on rerun 
-    self.cache.set(key=f'{self.cache_prefix}{self.job_id}_delta_on_current_listing', value=self.listing_df)
-
+    self.cache.set(key=f'{self.cache_prefix}{self.job_id}_delta_{self.prov_code.lower()}_current_listing', value=self.listing_df)
 
     
   def _delta_extract_from_datastore(self, last_run: datetime):
@@ -203,7 +205,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
       updated_end_time=end_time,
                 
       selects=self.listing_selects,
-      prov_code='ON'                
+      prov_code=self.prov_code                
     )
     
     if not success:
@@ -218,7 +220,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     else:
       self.logger.info(f'Loaded {len(self.delta_listing_df)} listings from {start_time} to {end_time}')
 
-    listing_df = self.cache.get(f'{self.cache_prefix}on_current_listing')
+    listing_df = self.cache.get(f'{self.cache_prefix}{self.prov_code.lower()}_current_listing')
     self.delta_listing_df['is_deleted'] = False  # New delta listings are not considered deleted.
 
     self.listing_df = pd.concat([listing_df, self.delta_listing_df], ignore_index=True)
@@ -228,7 +230,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     self.cache.set(key=self.last_run_key, value=end_time)
 
     # checkpoint the delta cache, such that this can be picked on on rerun 
-    self.cache.set(key=f'{self.cache_prefix}{self.job_id}_delta_on_current_listing', value=self.delta_listing_df)
+    self.cache.set(key=f'{self.cache_prefix}{self.job_id}_delta_{self.prov_code.lower()}_current_listing', value=self.delta_listing_df)
 
 
   def end_of_mth_run(self):
@@ -268,7 +270,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
       if not self._was_success('update_mkt_trends'):
         if self.last_mth_metrics_results is None:
           # load from archive
-          self.last_mth_metrics_results = self.archiver.retrieve('last_mth_metrics_results')
+          self.last_mth_metrics_results = self.archiver.retrieve(f'{self.prov_code.lower()}_last_mth_metrics_results')
           self.logger.info("Loaded last month's metrics results from archive.")
 
         success, failed = self.update_mkt_trends()
@@ -292,7 +294,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
   def update_es_tracking_index(self):
 
     if self.delta_listing_df is None:
-      self.delta_listing_df = self.cache.get(f'{self.cache_prefix}{self.job_id}_delta_on_current_listing')
+      self.delta_listing_df = self.cache.get(f'{self.cache_prefix}{self.job_id}_delta_{self.prov_code.lower()}_current_listing')
       if self.delta_listing_df is not None:
         self.logger.info(f"Loaded {len(self.delta_listing_df)} delta listings from cache.")
 
@@ -707,7 +709,12 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     super()._load_from_cache()
 
     # regard less of first_load, we will always load from the same cache
-    self.listing_df = self.cache.get(f'{self.cache_prefix}on_current_listing')
+    self.listing_df = self.cache.get(f'{self.cache_prefix}{self.prov_code.lower()}_current_listing')
+
+    if 'is_deleted' in self.listing_df.columns:
+      self.listing_df = self.listing_df[~self.listing_df['is_deleted']]
+      self.listing_df.reset_index(drop=True, inplace=True)
+
     self.logger.info(f"Loaded {len(self.listing_df)} listings from cache.")
 
 
@@ -718,26 +725,27 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     # before saving to cache
     self.listing_df.reset_index(drop=True, inplace=True)   
 
-    self.cache.set(f'{self.cache_prefix}on_current_listing', self.listing_df)
+    self.cache.set(f'{self.cache_prefix}{self.prov_code.lower()}_current_listing', self.listing_df)
     self.logger.info(f"Saved {len(self.listing_df)} listings to cache.")
 
 
   def _archive_results(self):
     if hasattr(self, 'last_mth_metrics_results') and self.last_mth_metrics_results is not None:
       # Archive the last month's metrics results
-      if not self.archiver.archive(self.last_mth_metrics_results, 'last_mth_metrics_results'):
+      if not self.archiver.archive(self.last_mth_metrics_results, f'{self.prov_code.lower()}_last_mth_metrics_results'):
         self.logger.error("Failed to archive last month's metrics results")
-        raise ValueError("Fatal error archiving last_mth_metrics_results. This must be successful to proceed.")
+        raise ValueError(f"Fatal error archiving {self.prov_code.lower()}_last_mth_metrics_results. This must be successful to proceed.")
       else:
         self.logger.info("Successfully archived last month's metrics results")
     else:
-      self.logger.error("Fatal error: last_mth_metrics_results not found or is None. Unable to archive.")
-      raise ValueError("Fatal error: last_mth_metrics_results not found or is None")
+      self.logger.error(f"Fatal error: {self.prov_code.lower()}_last_mth_metrics_results not found or is None. Unable to archive.")
+      raise ValueError(f"Fatal error: {self.prov_code.lower()}_last_mth_metrics_results not found or is None")
 
 
   def cleanup(self):
     super().cleanup()
-    self.cache.delete(f'{self.cache_prefix}on_current_listing')
+    cache_key = f'{self.cache_prefix}{self.prov_code.lower()}_current_listing'
+    self.cache.delete(cache_key)
 
     # reset instance variables
     self.listing_df = None
@@ -748,7 +756,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
 
   def delete_checkpoints_data(self):
-    self.cache.delete(f'{self.cache_prefix}{self.job_id}_delta_on_current_listing')
+    self.cache.delete(f'{self.cache_prefix}{self.job_id}_delta_{self.prov_code.lower()}_current_listing')
 
   def pre_end_of_mth_run(self):
     if getattr(self, 'simulate_failure_at', None) == 'end_of_mth_run':

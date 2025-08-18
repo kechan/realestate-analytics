@@ -627,6 +627,21 @@ class GeoCollection:
 
   def assign_guids_to_listing_df(self, df: pd.DataFrame, filter: Callable = None, cutoff_timestamp: pd.Timestamp = None):
     """
+    Assigns geographic unique identifiers (GUIDs) to listings in a DataFrame based on latitude and longitude.
+    This method computes and assigns a GUID for each listing in the provided DataFrame. The GUID is constructed
+    as a comma-separated string of geographic region identifiers, ordered from the finest to the coarsest level
+    of granularity, for regions containing the listing's coordinates. Overlapping regions at each level are also considered.
+    Parameters:
+      df (pd.DataFrame): The DataFrame containing listing data. Must include 'lat' and 'lng' columns.
+      filter (Callable, optional): A function to filter the DataFrame rows to process. If None, all rows are processed.
+      cutoff_timestamp (pd.Timestamp, optional): If provided, only listings with 'lastTransition' earlier than this timestamp are updated.
+    Notes:
+      - Listings with missing latitude or longitude are skipped.
+      - Existing GUIDs are replaced only if they are None and the cutoff condition is met.
+      - Computed GUIDs are assigned to both 'guid' and 'computed_guid' columns in the DataFrame.
+      - If no geographic regions contain the point, GUID is set to None.
+      None: The DataFrame is modified in place.
+    
     Compute, construct and assign guid for listing df
     """
     assert 'lat' in df.columns and 'lng' in df.columns, "Latitude and longitude columns are required in the DataFrame"

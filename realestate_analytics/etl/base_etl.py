@@ -15,18 +15,21 @@ import logging
 class BaseETLProcessor(ABC):
   def __init__(self, job_id: str, 
                datastore: Datastore,                
-               bq_datastore: BigQueryDatastore = None
+               bq_datastore: BigQueryDatastore = None,
+               prov_code: str = 'ON'
                ):
     self.logger = logging.getLogger(self.__class__.__name__)
 
     self.job_id = job_id
     self.datastore = datastore
     self.bq_datastore = bq_datastore
+    self.prov_code = prov_code.upper()
+
     if not self.check_dependencies():
       raise Exception("Failed to establish connection to required datastores")
 
     self.cache_prefix = f"{self.__class__.__name__}/"
-    self.last_run_key = f"{self.cache_prefix}last_run"
+    self.last_run_key = f"{self.cache_prefix}{self.prov_code.lower()}_last_run"
 
     self.cache_dir = None
     self.archive_dir = None

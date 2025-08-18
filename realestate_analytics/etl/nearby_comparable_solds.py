@@ -94,10 +94,16 @@ def compare_comparable_results(prev_result: Dict[str, Dict[str, List]],
   return diff_result
 
 class NearbyComparableSoldsProcessor(BaseETLProcessor):
-  def __init__(self, job_id: str, datastore: Datastore, bq_datastore: BigQueryDatastore = None, check_bq_deletions = False):
-    super().__init__(job_id=job_id, datastore=datastore, bq_datastore=bq_datastore)
+  def __init__(self, job_id: str, datastore: Datastore, bq_datastore: BigQueryDatastore = None, 
+               check_bq_deletions = False, prov_code: str = 'ON'):
+    super().__init__(job_id=job_id, datastore=datastore, bq_datastore=bq_datastore, prov_code=prov_code)
 
     self.check_bq_deletions = check_bq_deletions
+
+    if self.prov_code == 'ON':
+      self.logger.info(f"Initialized for Ontario (full comparable solds processing)")
+    else:
+      self.logger.info(f"Initialized for {self.prov_code} (partial processing - current listings cache only)")
 
     self.sold_listing_df = None
     self.listing_df = None    
@@ -150,6 +156,8 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
 
     self.LOAD_SUCCESS_THRESHOLD = 0.5  # minimum success rate for upsert to ES to be considered successful
     self.DISTANCE_ROUNDING_DECIMALS = 1
+
+    self.SMALL_TERRITORIES = ['NT', 'NU', 'YT']   # interprete 0 returned listing as ok (not an error)
 
 
   def extract(self, from_cache=False):
@@ -205,16 +213,22 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
       if last_run is None:   # first run
         end_time = self.get_current_datetime()
 
-        # get the sold listings from the last year till now
-        success, self.sold_listing_df = self.datastore.get_sold_listings(
-          start_time=end_time - timedelta(days=365),
-          end_time=end_time,
-          selects=self.sold_listing_selects
-        )
-        if not success:
-          self.logger.error(f"Failed to get sold listings from {end_time - timedelta(days=365)} to {end_time}")
-          raise ValueError("Failed to get sold listings.")
-        
+        # Extract sold listings ONLY for ON
+        if self.prov_code == 'ON':
+
+          # get the sold listings from the last year till now
+          success, self.sold_listing_df = self.datastore.get_sold_listings(
+            start_time=end_time - timedelta(days=365),
+            end_time=end_time,
+            selects=self.sold_listing_selects
+          )
+          if not success:
+            self.logger.error(f"Failed to get sold listings from {end_time - timedelta(days=365)} to {end_time}")
+            raise ValueError("Failed to get sold listings.")
+        else:
+          self.sold_listing_df = None
+          self.logger.info(f"Partial processing mode for {self.prov_code} - skipping sold listings extraction.")
+
         # get every active listings up till now    
         start_time = datetime(1970, 1, 1)     # distant past
         success, self.listing_df = self.datastore.get_current_active_listings(
@@ -224,35 +238,50 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
           addedOn_end_time=end_time,
           updated_end_time=end_time,
           selects=self.current_listing_selects,
-          prov_code='ON',
+          prov_code=self.prov_code,
           active=True
         )
         if not success:
-          self.logger.error(f"failed to get current listings from {start_time} to {end_time}")
-          raise ValueError("Failed to get current listings.")
+          if self.prov_code in self.SMALL_TERRITORIES and len(self.listing_df) == 0:            
+            self.logger.warning(f"No current listings found for {self.prov_code}. This maybe expected for small territories.")
+            self.listing_df = pd.DataFrame(columns=self.current_listing_selects + ['_id', 'propertyType'])
+            self.listing_df.reset_index(drop=True, inplace=True)
+            success = True   # treat this as a success for small territories
+          else:
+            self.logger.error(f"failed to get current listings from {start_time} to {end_time} for {self.prov_code}")
+            raise ValueError("Failed to get current listings.")
+        
+        self.logger.info(f"Loaded {len(self.listing_df)} current listings for {self.prov_code}.")
+
 
       else:    # incremental/delta load 
         # Load existing data from cache
-        self.sold_listing_df = self.cache.get(f'{self.cache_prefix}one_year_sold_listing')
-        self.listing_df = self.cache.get(f'{self.cache_prefix}on_listing')
+        if self.prov_code == 'ON':
+          self.sold_listing_df = self.cache.get(f'{self.cache_prefix}one_year_sold_listing')
+        else:
+          self.sold_listing_df = None
 
-        if self.sold_listing_df is None or self.listing_df is None:
+        self.listing_df = self.cache.get(f'{self.cache_prefix}{self.prov_code.lower()}_listing')
+
+        if (self.prov_code == 'ON' and self.sold_listing_df is None) or self.listing_df is None:
           self.logger.error("Cache is inconsistent. Missing prior sold_listing_df or listing_df.")
           raise ValueError("Cache is inconsistent. Missing prior sold_listing_df or listing_df.")
 
         # get the sold listings from last run till now
-        start_time = last_run - timedelta(days=self.DELTA_SOLD_LISTINGS_LOOKBACK_DAYS)   # load from 21 days before last run to have bigger margin of safety.
         end_time = self.get_current_datetime()
-        
-        success, delta_sold_listing_df = self.datastore.get_sold_listings(
-          start_time=start_time,
-          end_time=end_time,
-          selects=self.sold_listing_selects
-        )
-        if not success:
-          self.logger.error(f"Failed to retrieve delta sold listings from {start_time} to {end_time}")
-          raise ValueError("Failed to retrieve delta sold listings")
-        self.logger.info(f'Loaded {len(delta_sold_listing_df)} sold listings from {start_time} to {end_time}')
+        if self.prov_code == 'ON':
+          start_time = last_run - timedelta(days=self.DELTA_SOLD_LISTINGS_LOOKBACK_DAYS)   # load from 21 days before last run to have bigger margin of safety.
+          
+          success, delta_sold_listing_df = self.datastore.get_sold_listings(
+            start_time=start_time,
+            end_time=end_time,
+            selects=self.sold_listing_selects
+          )
+          if not success:
+            self.logger.error(f"Failed to retrieve delta sold listings from {start_time} to {end_time}")
+            raise ValueError("Failed to retrieve delta sold listings")
+            
+          self.logger.info(f'Loaded {len(delta_sold_listing_df)} sold listings from {start_time} to {end_time}')
         
         # Get the current ACTIVE listings
         if force_full_load_current:
@@ -267,12 +296,19 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
           updated_start_time=start_time,
           updated_end_time=end_time,
           selects=self.current_listing_selects,
-          prov_code='ON',
+          prov_code=self.prov_code,
           active=True
           )
         if not success:
-          self.logger.error(f"Failed to retrieve delta current active listings from {start_time} to {end_time}")
-          raise ValueError("Failed to retrieve delta current active listings")
+          if self.prov_code in self.SMALL_TERRITORIES and len(delta_listing_df) == 0:              
+            self.logger.warning(f"No delta sold listings found for {self.prov_code}. This maybe expected for small territories.")
+            delta_listing_df = pd.DataFrame(columns=self.current_listing_selects + ['_id', 'propertyType'])
+            delta_listing_df.reset_index(drop=True, inplace=True)
+            success = True   # treat this as a success for small territories
+          else:
+            self.logger.error(f"Failed to retrieve delta current active listings from {start_time} to {end_time}")
+            raise ValueError("Failed to retrieve delta current active listings")
+
         self.logger.info(f'Loaded {len(delta_listing_df)} current active listings from {start_time} to {end_time}')
 
         # Get the current NON ACTIVE listings from last run till now
@@ -283,28 +319,35 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
           updated_start_time=start_time,
           updated_end_time=end_time,
           selects=self.current_listing_selects,
-          prov_code='ON',
+          prov_code=self.prov_code,
           active=False
         )
         if not success:
-          self.logger.error(f"Failed to retrieve delta current non active listings from {start_time} to {end_time}")
-          raise ValueError("Failed to retrieve delta current non active listings")
+          if self.prov_code in self.SMALL_TERRITORIES and len(delta_inactive_listing_df) == 0:              
+            self.logger.warning(f"No delta sold listings found for {self.prov_code}. This maybe expected for small territories.")
+            delta_inactive_listing_df = pd.DataFrame(columns=self.current_listing_selects + ['_id', 'propertyType'])
+            delta_inactive_listing_df.reset_index(drop=True, inplace=True)
+            success = True   # treat this as a success for small territories
+          else:
+            self.logger.error(f"Failed to retrieve delta current non active listings from {start_time} to {end_time}")
+            raise ValueError("Failed to retrieve delta current non active listings")
         self.logger.info(f'Loaded {len(delta_inactive_listing_df)} current non active listings from {start_time} to {end_time}')
 
         # Merge delta with whole
 
-        # Merging delta for sold listings
-        self.sold_listing_df = pd.concat([self.sold_listing_df, delta_sold_listing_df], axis=0, ignore_index=True)
-        self.sold_listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='first')   # TODO: keep first to preserve hacked guid, undo this later
-        
-        # Filter out stuff thats older than a year
-        len_sold_listing_df_before_delete = len(self.sold_listing_df)
-        one_year_ago_from_now = end_time - timedelta(days=365)
-        drop_idxs = self.sold_listing_df.q("lastTransition < @one_year_ago_from_now").index
-        self.sold_listing_df.drop(index=drop_idxs, inplace=True)
-        self.sold_listing_df.reset_index(drop=True, inplace=True)
-        len_sold_listing_df_after_delete = len(self.sold_listing_df)
-        self.logger.info(f'removed {len_sold_listing_df_before_delete - len_sold_listing_df_after_delete} sold listings older than a year')
+        if self.prov_code == 'ON':
+          # Merging delta for sold listings
+          self.sold_listing_df = pd.concat([self.sold_listing_df, delta_sold_listing_df], axis=0, ignore_index=True)
+          self.sold_listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='first')   # TODO: keep first to preserve hacked guid, undo this later
+          
+          # Filter out stuff thats older than a year
+          len_sold_listing_df_before_delete = len(self.sold_listing_df)
+          one_year_ago_from_now = end_time - timedelta(days=365)
+          drop_idxs = self.sold_listing_df.q("lastTransition < @one_year_ago_from_now").index
+          self.sold_listing_df.drop(index=drop_idxs, inplace=True)
+          self.sold_listing_df.reset_index(drop=True, inplace=True)
+          len_sold_listing_df_after_delete = len(self.sold_listing_df)
+          self.logger.info(f'removed {len_sold_listing_df_before_delete - len_sold_listing_df_after_delete} sold listings older than a year')
 
         # Merging for active listings
         if force_full_load_current:
@@ -360,65 +403,98 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
   def _load_from_cache(self):
     super()._load_from_cache()
     
-    self.sold_listing_df = self.cache.get(f'{self.cache_prefix}one_year_sold_listing')
-    self.listing_df = self.cache.get(f"{self.cache_prefix}on_listing")
+    if self.prov_code == 'ON':
+      self.sold_listing_df = self.cache.get(f'{self.cache_prefix}one_year_sold_listing')
+    else:
+      self.sold_listing_df = None
 
-    if self.sold_listing_df is None or self.listing_df is None:
+    self.listing_df = self.cache.get(f"{self.cache_prefix}{self.prov_code.lower()}_listing")
+
+    if (self.prov_code == 'ON' and self.sold_listing_df is None) or self.listing_df is None:
       self.logger.error("Missing sold_listing_df or listing_df in cache.")
       raise ValueError("Missing sold_listing_df or listing_df in cache.")
 
-    self.logger.info(f"Loaded {len(self.sold_listing_df)} sold listings and {len(self.listing_df)} current listings from cache.")
+    # Logging
+    if self.prov_code == 'ON':
+      self.logger.info(f"Loaded {len(self.sold_listing_df)} sold listings and {len(self.listing_df)} current listings from cache.")
+    else:
+      self.logger.info(f"Loaded {len(self.listing_df)} current listings from cache for {self.prov_code} (partial processing mode).")
 
 
   def _save_to_cache(self):
     super()._save_to_cache()
     
-    self.cache.set(f'{self.cache_prefix}one_year_sold_listing', self.sold_listing_df)
-    self.cache.set(f'{self.cache_prefix}on_listing', self.listing_df)
+    if self.prov_code == 'ON':
+      sold_cache_key = f'{self.cache_prefix}one_year_sold_listing'
+      listing_cache_key = f'{self.cache_prefix}on_listing'
+    else:
+      # Other provinces use province-specific keys (sold listings not cached for non-ON)
+      listing_cache_key = f'{self.cache_prefix}{self.prov_code.lower()}_listing'
 
-    self.logger.info(f"Saved {len(self.sold_listing_df)} sold listings and {len(self.listing_df)} current listings to cache.")
+    # Save sold listings cache only for Ontario
+    if self.prov_code == 'ON' and self.sold_listing_df is not None:
+      self.cache.set(sold_cache_key, self.sold_listing_df)
+      self.logger.info(f"Saved {len(self.sold_listing_df)} sold listings to cache.")
+
+    # Save current listings cache for all provinces
+    if self.listing_df is not None:
+      self.cache.set(listing_cache_key, self.listing_df)
+      self.logger.info(f"Saved {len(self.listing_df)} current listings to cache.")
+
+    # self.logger.info(f"Saved {len(self.sold_listing_df)} sold listings and {len(self.listing_df)} current listings to cache.")
 
 
   def transform(self):
     if self._was_success('transform'):  # load the cache and skip ahead
       self.logger.info("Transform already successful. Loading checkpoint from cache.")
-      diff_result_json = self.cache.get(f"{self.cache_prefix}{self.job_id}_transform_diff_result").replace("'", '"')
-      diff_result_json = diff_result_json.replace("'", '"')
-      self.diff_result = json.loads(diff_result_json)
+      if self.prov_code == 'ON':
+        diff_result_json = self.cache.get(f"{self.cache_prefix}{self.job_id}_transform_diff_result").replace("'", '"')
+        diff_result_json = diff_result_json.replace("'", '"')
+        self.diff_result = json.loads(diff_result_json)
+      else:
+        # Non-Ontario: No transform processing needed
+        self.logger.info(f"Virtual processing mode for {self.prov_code} - no transform processing needed.")
       return
 
     try:
-      self._process_listing_profile_partition()
-      self.comparable_sold_listings_result, _ = self.get_sold_listings()
+      if self.prov_code == 'ON':
+        self._process_listing_profile_partition()
+        self.comparable_sold_listings_result, _ = self.get_sold_listings()
 
-      # optimize such that we dont update on things that didnt change from last run.
-      # Retrieve previous result from cache
-      # prev_result = eval(self.cache.get(f'{self.cache_prefix}comparable_sold_listings_result')) # it deserializes back to dict
-      prev_result_json = self.cache.get(f'{self.cache_prefix}comparable_sold_listings_result')
-      if prev_result_json:
-        prev_result_json = prev_result_json.replace("'", '"')
-        self.logger.info("Found previous comparable_sold_listings_result in cache. Deserializing...")
-        try:
-          prev_result = json.loads(prev_result_json)   # Deserialize JSON safely
-          self.logger.info("Successfully deserialized comparable_sold_listings_result.")
-        except json.JSONDecodeError:        
+        # optimize such that we dont update on things that didnt change from last run.
+        # Retrieve previous result from cache
+        # prev_result = eval(self.cache.get(f'{self.cache_prefix}comparable_sold_listings_result')) # it deserializes back to dict
+        prev_result_json = self.cache.get(f'{self.cache_prefix}comparable_sold_listings_result')
+        if prev_result_json:
+          prev_result_json = prev_result_json.replace("'", '"')
+          self.logger.info("Found previous comparable_sold_listings_result in cache. Deserializing...")
+          try:
+            prev_result = json.loads(prev_result_json)   # Deserialize JSON safely
+            self.logger.info("Successfully deserialized comparable_sold_listings_result.")
+          except json.JSONDecodeError:        
+            prev_result = None
+            self.logger.error("Failed to deserialize comparable_sold_listings_result. Setting to None. Please investigate")
+        else:
           prev_result = None
-          self.logger.error("Failed to deserialize comparable_sold_listings_result. Setting to None. Please investigate")
-      else:
-        prev_result = None
-        self.logger.info("No previous comparable_sold_listings_result found in cache.")
+          self.logger.info("No previous comparable_sold_listings_result found in cache.")
 
-      if prev_result is not None:    
-        self.diff_result = compare_comparable_results(prev_result, self.comparable_sold_listings_result)
+        if prev_result is not None:    
+          self.diff_result = compare_comparable_results(prev_result, self.comparable_sold_listings_result)
+        else:
+          self.diff_result = self.comparable_sold_listings_result
+        
+        # Cache the full current result for next time
+        self.cache.set(f'{self.cache_prefix}comparable_sold_listings_result', self.comparable_sold_listings_result)
+        self.logger.info(f"{len(self.diff_result)} listings to be updated.")
+        
+        # checkpoint the diff results (this will be deleted when the entire ETL is completed)
+        self.cache.set(f"{self.cache_prefix}{self.job_id}_transform_diff_result", self.diff_result)  # save the diff result in case a recovery is needed.
       else:
-        self.diff_result = self.comparable_sold_listings_result
-      
-      # Cache the full current result for next time
-      self.cache.set(f'{self.cache_prefix}comparable_sold_listings_result', self.comparable_sold_listings_result)
-      self.logger.info(f"{len(self.diff_result)} listings to be updated.")
-      
-      # checkpoint the diff results (this will be deleted when the entire ETL is completed)
-      self.cache.set(f"{self.cache_prefix}{self.job_id}_transform_diff_result", self.diff_result)  # save the diff result in case a recovery is needed.
+        # Non-Ontario: Partial processing - no sold listing processing needed
+        self.logger.info(f"Partial processing mode for {self.prov_code} - skipping sold listing processing.")
+        self.diff_result = {}
+        self.comparable_sold_listings_result = {}
+
       self._mark_success('transform')
 
     except Exception as e:
@@ -431,14 +507,19 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
       self.logger.info("Load already successful.")
       return 0, []  # nothing to do 
 
-    success, failed = self.update_datastore(self.diff_result)
-    total_attempts = success + len(failed)
+    if self.prov_code == 'ON':
+      success, failed = self.update_datastore(self.diff_result)
+      total_attempts = success + len(failed)
 
-    if total_attempts != 0 and (success / total_attempts) < self.LOAD_SUCCESS_THRESHOLD:
-      self.logger.error(f"Less than {self.LOAD_SUCCESS_THRESHOLD*100}% success rate. Only {success} out of {total_attempts} documents updated.")
+      if total_attempts != 0 and (success / total_attempts) < self.LOAD_SUCCESS_THRESHOLD:
+        self.logger.error(f"Less than {self.LOAD_SUCCESS_THRESHOLD*100}% success rate. Only {success} out of {total_attempts} documents updated.")
 
-      self.datastore.summarize_update_failures(failed)
+        self.datastore.summarize_update_failures(failed)
+      else:
+        self._mark_success('load')
     else:
+      self.logger.info(f"Partial processing mode for {self.prov_code} - skipping load to datastore.")
+      success, failed = 0, []
       self._mark_success('load')
 
     return success, failed
@@ -448,10 +529,12 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
     super().cleanup()
     
     # remove resident cache data
-    self.cache.delete(f'{self.cache_prefix}one_year_sold_listing')
-    self.cache.delete(f'{self.cache_prefix}on_listing')
-    self.cache.delete(f'{self.cache_prefix}comparable_sold_listings_result')
+    if self.prov_code == 'ON':      
+      self.cache.delete(f'{self.cache_prefix}one_year_sold_listing')
+      self.cache.delete(f'{self.cache_prefix}comparable_sold_listings_result')
 
+    self.cache.delete(f'{self.cache_prefix}{self.prov_code.lower()}_listing')
+    
     self.delete_checkpoints_data()
 
     # Reset instance variables

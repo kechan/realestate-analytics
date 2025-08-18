@@ -19,8 +19,10 @@ from realestate_core.common.utils import load_from_pickle, save_to_pickle, join_
 
 
 class SoldMedianMetricsProcessor(BaseETLProcessor):
-  def __init__(self, job_id: str, datastore: Datastore):
-    super().__init__(job_id=job_id, datastore=datastore)
+  def __init__(self, job_id: str, datastore: Datastore, prov_code: str = 'ON'):
+    super().__init__(job_id=job_id, datastore=datastore, prov_code=prov_code)
+
+    self.logger.info(f'Province: {self.prov_code}')
 
     self.sold_listing_df = None
     self.geo_entry_df = None
@@ -52,8 +54,8 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     ]
 
     # The number of days to look back for sold and current listings in the delta load
-    # this creates a margin of safety for not missing anything.
-    self.DELTA_SOLD_LISTINGS_LOOKBACK_DAYS = 21
+    # IMS dataset: sold listings can arrive up to 1 year late, so we need longer lookback
+    self.DELTA_SOLD_LISTINGS_LOOKBACK_DAYS = 365
 
     self.geo_levels = [10, 20, 30, 40]
 
@@ -82,34 +84,38 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
         end_time = self.get_current_datetime()
         start_time = datetime(end_time.year - 5, end_time.month, 1)
 
-        success, self.sold_listing_df = self.datastore.get_sold_listings(
+        success, self.sold_listing_df = self.datastore.get_ims_sold_listings(
           start_time = start_time,
           end_time = end_time,
-          selects=self.sold_listing_selects
+          selects=self.sold_listing_selects,
+          prov_code = self.prov_code
         )
         if not success:
-          self.logger.error(f"Failed to retrieve sold listings from {start_time} to {end_time}")
-          raise ValueError("Failed to retrieve sold listings")
+          self.logger.error(f"Failed to retrieve sold listings for {self.prov_code} from {start_time} to {end_time}")
+          raise ValueError(f"Failed to retrieve sold listings for {self.prov_code}")
 
       else:   # inc/delta load
         # Load existing data from cache
-        self.sold_listing_df = self.cache.get(f'{self.cache_prefix}five_years_sold_listing')
+        cache_key = f'{self.cache_prefix}{self.prov_code.lower()}_five_years_sold_listing'
+        self.sold_listing_df = self.cache.get(cache_key)
         if self.sold_listing_df is None:
-          self.logger.error("Cache is inconsistent. Missing prior sold_listing_df.")
-          raise ValueError("Cache is inconsistent. Missing prior sold_listing_df.")
+          self.logger.error(f"Cache is inconsistent. Missing prior sold_listing_df with key: {cache_key}")
+          raise ValueError(f"Cache is inconsistent. Missing prior sold_listing_df with key: {cache_key}")
         
         # get the sold listings from last run till now
         start_time = last_run - timedelta(days=self.DELTA_SOLD_LISTINGS_LOOKBACK_DAYS)    # load from 21 days before last run to have bigger margin of safety.
         end_time = self.get_current_datetime()
 
-        success, delta_sold_listing_df = self.datastore.get_sold_listings(
+        success, delta_sold_listing_df = self.datastore.get_ims_sold_listings(
           start_time=start_time,
           end_time=end_time,
-          selects=self.sold_listing_selects
+          selects=self.sold_listing_selects,
+          prov_code=self.prov_code
         )
         if not success:
-          self.logger.error(f"Failed to retrieve delta sold listings from {start_time} to {end_time}")
-          raise ValueError("Failed to retrieve delta sold listings")
+          self.logger.error(f"Failed to retrieve delta sold listings for {self.prov_code} from {start_time} to {end_time}")
+          raise ValueError(f"Failed to retrieve delta sold listings for {self.prov_code}")
+        
         self.logger.info(f'Loaded {len(delta_sold_listing_df)} sold listings from {start_time} to {end_time}')
 
         # Merge delta for sold listings
@@ -138,7 +144,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
   def _load_from_cache(self):
     super()._load_from_cache() 
 
-    self.sold_listing_df = self.cache.get(f'{self.cache_prefix}five_years_sold_listing')
+    self.sold_listing_df = self.cache.get(f'{self.cache_prefix}{self.prov_code.lower()}_five_years_sold_listing')
 
     self.geo_entry_df = self.cache.get('all_geo_entry')
     self.geo_entry_df.drop_duplicates(subset=['MLS', 'CITY', 'PROV_STATE'], keep='last', inplace=True)
@@ -159,7 +165,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     else:
       cache_df = self.sold_listing_df
     
-    self.cache.set(f'{self.cache_prefix}five_years_sold_listing', cache_df)
+    self.cache.set(f'{self.cache_prefix}{self.prov_code.lower()}_five_years_sold_listing', cache_df)
 
     # self.cache.set(f'{self.cache_prefix}five_years_sold_listing', self.sold_listing_df)
     self.logger.info(f"Saved {len(self.sold_listing_df)} sold listings to cache.")
@@ -183,11 +189,12 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       # self.compute_5_year_metrics_old()
 
       # optimize such that we don't update on things that didnt change from last run
-      prev_price_series = self.cache.get(f'{self.cache_prefix}five_years_price_series')
-      prev_dom_series = self.cache.get(f'{self.cache_prefix}five_years_dom_series')
-      prev_over_ask_series = self.cache.get(f'{self.cache_prefix}five_years_over_ask_series')
-      prev_below_ask_series = self.cache.get(f'{self.cache_prefix}five_years_below_ask_series')
-      prev_sold_listing_count_series = self.cache.get(f'{self.cache_prefix}five_years_sold_listing_count_series')
+      prov_prefix = f'{self.cache_prefix}{self.prov_code.lower()}_'
+      prev_price_series = self.cache.get(f'{prov_prefix}five_years_price_series')
+      prev_dom_series = self.cache.get(f'{prov_prefix}five_years_dom_series')
+      prev_over_ask_series = self.cache.get(f'{prov_prefix}five_years_over_ask_series')
+      prev_below_ask_series = self.cache.get(f'{prov_prefix}five_years_below_ask_series')
+      prev_sold_listing_count_series = self.cache.get(f'{prov_prefix}five_years_sold_listing_count_series')
 
       if (prev_price_series is None or prev_dom_series is None or 
           prev_over_ask_series is None or prev_below_ask_series is None or prev_sold_listing_count_series is None):
@@ -213,11 +220,12 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
                          )
 
       # Cache the current data for the next run
-      self.cache.set(f'{self.cache_prefix}five_years_price_series', self.final_price_series)
-      self.cache.set(f'{self.cache_prefix}five_years_dom_series', self.final_dom_series)
-      self.cache.set(f'{self.cache_prefix}five_years_over_ask_series', self.final_over_ask_series)
-      self.cache.set(f'{self.cache_prefix}five_years_below_ask_series', self.final_below_ask_series)
-      self.cache.set(f'{self.cache_prefix}five_years_sold_listing_count_series', self.final_sold_listing_count_series)
+      prov_prefix = f'{self.cache_prefix}{self.prov_code.lower()}_'
+      self.cache.set(f'{prov_prefix}five_years_price_series', self.final_price_series)
+      self.cache.set(f'{prov_prefix}five_years_dom_series', self.final_dom_series)
+      self.cache.set(f'{prov_prefix}five_years_over_ask_series', self.final_over_ask_series)
+      self.cache.set(f'{prov_prefix}five_years_below_ask_series', self.final_below_ask_series)
+      self.cache.set(f'{prov_prefix}five_years_sold_listing_count_series', self.final_sold_listing_count_series)
 
       # checkpoint the diff_*_series, this will be cleared when the entire ETL process is completed.
       self.diff_price_series.reset_index(drop=True, inplace=True)
@@ -359,12 +367,12 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
   def cleanup(self, remove_es_metrics=False):
     super().cleanup()
     
-    cache_keys = ['five_years_sold_listing',
-                  'five_years_dom_series',
-                  'five_years_price_series',
-                  'five_years_over_ask_series',
-                  'five_years_below_ask_series',
-                  'five_years_sold_listing_count_series',
+    cache_keys = [f'{self.prov_code.lower()}_five_years_sold_listing',
+                  f'{self.prov_code.lower()}_five_years_dom_series',
+                  f'{self.prov_code.lower()}_five_years_price_series',
+                  f'{self.prov_code.lower()}_five_years_over_ask_series',
+                  f'{self.prov_code.lower()}_five_years_below_ask_series',
+                  f'{self.prov_code.lower()}_five_years_sold_listing_count_series',
                   ]
     
     for key in cache_keys:
@@ -524,7 +532,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       # Process price series
       for _, row in self.diff_price_series.iterrows():
         new_metrics = {
-          "median_price": []
+          "median_sold_price": []
         }
 
         for col in self.diff_price_series.columns:
@@ -532,7 +540,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
             month = col
             value = row[col]
             if pd.notna(value):
-              new_metrics["median_price"].append({
+              new_metrics["median_sold_price"].append({
                 "month": month,
                 "value": float(value)
               })
@@ -549,7 +557,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
             if (ctx._source.metrics == null) {
               ctx._source.metrics = new HashMap();
             }
-            ctx._source.metrics.median_price = params.new_metrics.median_price;
+            ctx._source.metrics.median_sold_price = params.new_metrics.median_sold_price;
             ctx._source.geog_id = params.geog_id;
             ctx._source.propertyType = params.propertyType;
             ctx._source.geo_level = params.geo_level;
@@ -820,7 +828,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
           "script": {
             "source": """
               if (ctx._source.metrics != null) {
-                ctx._source.metrics.remove('median_price');
+                ctx._source.metrics.remove('median_sold_price');
                 ctx._source.metrics.remove('median_dom');
                 ctx._source.metrics.remove('over_ask_percentage');
                 ctx._source.metrics.remove('below_ask_percentage');
@@ -969,7 +977,7 @@ if __name__ == '__main__':
  'geo_level': 30,
  'metrics': {
  
-  'median_price': [{'month': '2023-01', 'value': 1789000.0},
+  'median_sold_price': [{'month': '2023-01', 'value': 1789000.0},
    {'month': '2023-02', 'value': 1320000.0},
    {'month': '2023-03', 'value': 1352500.0},
    {'month': '2023-04', 'value': 1550000.0},
