@@ -27,6 +27,7 @@ class BaseETLJobParams(BaseModel):
     es_host: Optional[str] = None
     es_port: Optional[int] = None
     log_level: Optional[str] = None
+    prov_code: Optional[str] = "ON"  # Default to Ontario, can be overridden
 
 class FullLoadETLJobParams(BaseETLJobParams):
     force_full_load: Optional[bool] = False
@@ -47,6 +48,10 @@ def run_etl_job(script_name: str, config_path: str, params: BaseETLJobParams, fo
         cmd.extend(["--es_port", str(params.es_port)])
     if params.log_level:
         cmd.extend(["--log_level", params.log_level])
+
+    if script_name != "current_mth_metrics" and params.prov_code:
+        cmd.extend(["--prov_code", params.prov_code])
+
     if force_full_load:
         cmd.append("--force_full_load")
 
@@ -60,7 +65,9 @@ def run_etl_job(script_name: str, config_path: str, params: BaseETLJobParams, fo
             start_new_session=True
         )
 
-        return {"message": f"{script_name} job started", "pid": process.pid}
+        prov_info = f" for province {params.prov_code}" if script_name != "current_mth_metrics" and params.prov_code else ""
+
+        return {"message": f"{script_name} job started{prov_info}", "pid": process.pid}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start {script_name} job: {str(e)}")
 

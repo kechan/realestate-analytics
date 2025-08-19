@@ -8,8 +8,9 @@ import json
 import calendar
 import re
 from pathlib import Path
-from typing import Union
-
+from typing import Union, Iterable, Tuple, Optional
+from datetime import datetime
+from elasticsearch.helpers import bulk
 
 class MonthEndListingSnapshotArchiveReader:
   """
@@ -102,6 +103,314 @@ class MonthEndListingSnapshotArchiveReader:
     df['year-month'] = df['year-month'].apply(get_month_end)
     print(f"Converted to end-of-month datetime. Range: {df['year-month'].min()} to {df['year-month'].max()}")
 
+class LastMthMetricsArchiveReader:
+  """
+  Reader/loader for archived last-month metrics (median price & new listings),
+  with an ES upsert helper that updates only the two series.
+
+  Archive file patterns supported:
+    - last_mth_metrics_results_YYYYMMDD_df.txt
+    - on_last_mth_metrics_results_YYYYMMDD_df.txt
+
+  Optional companion dtypes JSON is ignored (TSV is small), but you can add support
+  similar to MonthEndListingSnapshotArchiveReader if needed.
+
+  Output DataFrame columns (wide → tidy):
+    [year-month, geog_id, property_type, median_price, new_listings_count, archive_date]
+
+  ES write behavior:
+    - Upsert only metrics.last_mth_new_listings and metrics.last_mth_median_asking_price
+      via painless script, preserving other metric arrays in the same document.
+    - _id format follows: f"{geog_id}_{property_type}"
+    - geo_level is derived from geog_id like g30_xxx → 30
+
+  Example:
+    >>> reader = LastMthMetricsArchiveReader("/path/to/archive", es_datastore)
+    >>> df = reader.read()
+    >>> ok, failed = reader.upload_to_es(df)
+  """
+
+  def __init__(self, archive_dir: Union[str, Path], datastore=None):
+    self.archive_dir = Path(archive_dir)
+    if not self.archive_dir.exists():
+      raise ValueError(f"Archive directory does not exist: {self.archive_dir}")
+    self.datastore = datastore  # optional here; required for upload_to_es()
+
+  # -------- Public API
+
+  def read(self) -> pd.DataFrame:
+    """
+    Recover and tidy all historical last-month metrics from archive files.
+
+    Returns:
+      DataFrame with columns:
+        year-month (str 'YYYY-MM'),
+        geog_id (str),
+        property_type (str),
+        median_price (float or NaN),
+        new_listings_count (float or int),
+        archive_date (pd.Timestamp)
+      De-duplicated so that if multiple archives exist for a given month & key,
+      the latest archive wins.
+    """
+    files = self._discover_archive_files()
+    if not files:
+      print("No last_mth_metrics_results archive files found")
+      return pd.DataFrame(columns=[
+        'year-month', 'geog_id', 'property_type', 'median_price',
+        'new_listings_count', 'archive_date'
+      ])
+
+    # Load newest-first so we can drop_duplicates(keep='first')
+    files.sort(key=lambda x: x['archive_date'], reverse=True)
+
+    frames = []
+    for info in files:
+      df = self._read_one_df(info['file_path'])
+      if df is None or df.empty:
+        continue
+      df = df.rename(columns={'propertyType': 'property_type'})
+      df['year-month'] = info['metrics_month']
+      df['archive_date'] = pd.to_datetime(info['archive_date'])
+      frames.append(df[['year-month', 'geog_id', 'property_type',
+                        'median_price', 'new_listings_count', 'archive_date']])
+
+    if not frames:
+      print("No valid archive files could be processed")
+      return pd.DataFrame(columns=[
+        'year-month', 'geog_id', 'property_type', 'median_price',
+        'new_listings_count', 'archive_date'
+      ])
+
+    combined = pd.concat(frames, ignore_index=True)
+
+    # ensure numeric types where possible
+    combined['median_price'] = pd.to_numeric(combined['median_price'], errors='coerce')
+    combined['new_listings_count'] = pd.to_numeric(combined['new_listings_count'], errors='coerce')
+
+    # latest archive per (year-month, geog_id, property_type) wins
+    combined = (combined
+      .sort_values(['year-month', 'geog_id', 'property_type', 'archive_date'], ascending=False)
+      .drop_duplicates(['year-month', 'geog_id', 'property_type'], keep='first')
+      .sort_values(['year-month', 'geog_id', 'property_type'])
+      .reset_index(drop=True))
+
+    print(f"Recovered {len(combined)} records across {combined['year-month'].nunique()} months")
+    if not combined.empty:
+      print(f"Month range: {combined['year-month'].min()} to {combined['year-month'].max()}")
+      print(f"Unique geog_ids: {combined['geog_id'].nunique()}")
+      print(f"Property types: {sorted(combined['property_type'].dropna().unique())}")
+
+    return combined
+
+  def to_documents(self, recovered_df: pd.DataFrame) -> list:
+    """
+    Build ES-ready doc payloads with series arrays grouped by (geog_id, property_type).
+    Intended for use with upload_to_es().
+
+    Returns:
+      List[dict] each with keys: _index, _id, geog_id, propertyType, geo_level, metrics, last_updated
+    """
+    if recovered_df.empty:
+      return []
+
+    now_iso = datetime.now().isoformat()
+    docs = []
+    grouped = recovered_df.groupby(['geog_id', 'property_type'], dropna=False)
+
+    for (geog_id, property_type), g in grouped:
+      if not isinstance(geog_id, str) or '_' not in geog_id:
+        # skip malformed geog_id
+        continue
+      try:
+        geo_level = int(geog_id.split('_')[0][1:])
+      except Exception:
+        # conservative skip to avoid poisoning writes
+        continue
+
+      # sort by month as strings YYYY-MM (lexicographic ok)
+      g = g.sort_values('year-month')
+
+      # build series
+      s_new = []
+      s_med = []
+      for _, row in g.iterrows():
+        ym = row['year-month']
+        # new listings
+        if pd.notna(row['new_listings_count']):
+          # cast to int safely
+          val = pd.to_numeric(row['new_listings_count'], errors='coerce')
+          if pd.notna(val):
+            s_new.append({'month': ym, 'value': int(val)})
+        # median price
+        if pd.notna(row['median_price']):
+          valp = pd.to_numeric(row['median_price'], errors='coerce')
+          if pd.notna(valp):
+            s_med.append({'month': ym, 'value': float(valp)})
+
+      doc_id = f"{geog_id}_{property_type}"
+      docs.append({
+        '_id': doc_id,
+        '_index': self._get_index_name(),
+        'geog_id': geog_id,
+        'propertyType': property_type,
+        'geo_level': geo_level,
+        'metrics': {
+          'last_mth_new_listings': s_new,
+          'last_mth_median_asking_price': s_med
+        },
+        'last_updated': now_iso
+      })
+
+    print(f"Prepared {len(docs)} documents for ES")
+    return docs
+
+  # artifact: upload_to_es_method_only.py
+  def upload_to_es(self, recovered_df: pd.DataFrame, chunk_size: int = 200) -> Tuple[int, list]:
+    """
+    Upsert only the two last-month series into ES with a scoped painless script.
+    Behavior:
+      - If the doc exists: REMOVE the two nodes and reinsert with the provided full arrays.
+        (Other fields/metric arrays remain intact.)
+      - If the doc does not exist: create it with an upsert that includes only the fields
+        we explicitly set here (geog_id, propertyType, geo_level, metrics.{two_series}, last_updated).
+
+    Args:
+      recovered_df: tidy DataFrame from read()
+      chunk_size: bulk API chunk size
+
+    Returns:
+      (success_count, failed_ops_list)
+    """
+    if self.datastore is None:
+      raise ValueError("datastore (with .es and .mkt_trends_index_name) is required for upload_to_es()")
+
+    documents = self.to_documents(recovered_df)
+    if not documents:
+      return 0, []
+
+    # Script wipes the two arrays, then sets them to the new complete lists.
+    # Leaves any other fields/metrics untouched.
+    script = """
+      if (ctx._source.metrics == null) { ctx._source.metrics = [:]; }
+      else {
+        ctx._source.metrics.remove('last_mth_new_listings');
+        ctx._source.metrics.remove('last_mth_median_asking_price');
+      }
+      ctx._source.metrics.last_mth_new_listings = params.newlistings;
+      ctx._source.metrics.last_mth_median_asking_price = params.medianprice;
+
+      // Keep doc-level identity fields in sync (safe no-ops if same)
+      ctx._source.geog_id = params.geog_id;
+      ctx._source.propertyType = params.propertyType;
+      ctx._source.geo_level = params.geo_level;
+      ctx._source.last_updated = params.last_updated;
+    """
+
+    def actions():
+      for d in documents:
+        yield {
+          '_op_type': 'update',
+          '_index': d['_index'],
+          '_id': d['_id'],
+          'script': {
+            'source': script,
+            'lang': 'painless',
+            'params': {
+              'newlistings': d['metrics']['last_mth_new_listings'],
+              'medianprice': d['metrics']['last_mth_median_asking_price'],
+              'geog_id': d['geog_id'],
+              'propertyType': d['propertyType'],
+              'geo_level': d['geo_level'],
+              'last_updated': d['last_updated'],
+            }
+          },
+          # If the doc doesn't exist, create *only* the fields we are responsible for.
+          'upsert': {
+            'geog_id': d['geog_id'],
+            'propertyType': d['propertyType'],
+            'geo_level': d['geo_level'],
+            'metrics': {
+              'last_mth_new_listings': d['metrics']['last_mth_new_listings'],
+              'last_mth_median_asking_price': d['metrics']['last_mth_median_asking_price'],
+            },
+            'last_updated': d['last_updated'],
+          }
+        }
+
+    success, failed = bulk(
+      self.datastore.es,
+      actions(),
+      raise_on_error=False,
+      raise_on_exception=False,
+      chunk_size=chunk_size
+    )
+    print(f"Bulk upserted {success} docs; failures: {len(failed) if failed else 0}")
+    if failed:
+      for f in failed[:5]:
+        print(f"  Failure sample: {f}")
+    return success, failed or []
+
+  # -------- Internals
+
+  def _discover_archive_files(self) -> list:
+    """
+    Find all matching last_mth_metrics_results files and compute the target metrics month
+    from the archive date (archive for Aug N implies metrics for July).
+    """
+    pattern = r'^(on_)?last_mth_metrics_results_(\d{8})_df\.txt$'
+    files = []
+    for fp in self.archive_dir.glob('*last_mth_metrics_results*_df.txt'):
+      m = re.match(pattern, fp.name)
+      if not m:
+        continue
+      date_str = m.group(2)
+      try:
+        archive_date = datetime.strptime(date_str, '%Y%m%d')
+      except ValueError:
+        continue
+      # metrics correspond to previous month of the archive's month
+      first_of_month = archive_date.replace(day=1)
+      prev_month_last_day = first_of_month - pd.Timedelta(days=1)
+      metrics_month = prev_month_last_day.strftime('%Y-%m')
+      files.append({
+        'file_path': fp,
+        'archive_date': archive_date,
+        'metrics_month': metrics_month
+      })
+    print(f"Discovered {len(files)} last_mth_metrics_results files")
+    return files
+
+  def _read_one_df(self, file_path: Path) -> Optional[pd.DataFrame]:
+    """
+    Read a TSV archived dataframe and validate expected columns.
+    """
+    try:
+      df = pd.read_csv(file_path, sep='\t')
+    except Exception as e:
+      print(f"Error reading {file_path.name}: {e}")
+      return None
+
+    expected = {'geog_id', 'propertyType', 'median_price', 'new_listings_count'}
+    missing = expected - set(df.columns)
+    if missing:
+      print(f"Skipping {file_path.name} due to missing columns: {missing}")
+      return None
+    return df
+
+  def _get_index_name(self) -> str:
+    """
+    Resolve index/alias name from datastore; raise if missing.
+    """
+    if self.datastore is None or not getattr(self.datastore, 'mkt_trends_index_name', None):
+      raise ValueError("datastore.mkt_trends_index_name is required")
+    return self.datastore.mkt_trends_index_name
+
 # Example usage:
 # reader = MonthEndListingSnapshotArchiveReader("/path/to/archive")
 # df = reader.read()
+
+
+# reader = LastMthMetricsArchiveReader(archive_dir)
+# df = reader.read()
+# success, failed = reader.upload_to_es(df, datastore)

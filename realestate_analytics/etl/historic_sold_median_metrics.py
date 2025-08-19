@@ -103,7 +103,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
           raise ValueError(f"Cache is inconsistent. Missing prior sold_listing_df with key: {cache_key}")
         
         # get the sold listings from last run till now
-        start_time = last_run - timedelta(days=self.DELTA_SOLD_LISTINGS_LOOKBACK_DAYS)    # load from 21 days before last run to have bigger margin of safety.
+        start_time = last_run - timedelta(days=self.DELTA_SOLD_LISTINGS_LOOKBACK_DAYS)    # load from 365 days before last run to have bigger margin of safety.
         end_time = self.get_current_datetime()
 
         success, delta_sold_listing_df = self.datastore.get_ims_sold_listings(
