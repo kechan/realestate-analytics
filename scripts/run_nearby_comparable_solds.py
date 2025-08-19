@@ -9,7 +9,7 @@ import pandas as pd
 
 from realestate_analytics.utils.constants import VALID_PROVINCES
 
-from realestate_analytics.etl.run_utils import load_config, get_next_job_id, update_run_csv
+from realestate_analytics.etl.run_utils import load_config, get_next_job_id, update_run_csv, is_last_run_successful
 
 from realestate_analytics.etl.nearby_comparable_solds import NearbyComparableSoldsProcessor
 from realestate_analytics.data.es import Datastore
@@ -96,6 +96,16 @@ def main():
 
   # nearby_solds_run.csv keeps historical run results, which for simplicity be always in the same directory as this script
   hist_runs_csv_path = get_script_dir() / "nearby_solds_run.csv"
+
+  #  Check if the last run was successful before proceeding
+  if not is_last_run_successful(hist_runs_csv_path):
+    print("="*50)
+    print("PREVIOUS ETL RUN FAILED - HALTING EXECUTION")
+    print(f"The last run in {hist_runs_csv_path} shows a failure.")
+    print("Please investigate the failure before running again.")
+    print("No new NearbyComparableSoldsProcessor job will be started.")
+    print("="*50)
+    sys.exit(1)
 
   # Set up job ID and logging
   job_id = get_next_job_id(hist_runs_csv_path, job_prefix=JOB_ID_PREFIX)

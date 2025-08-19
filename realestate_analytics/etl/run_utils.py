@@ -66,17 +66,17 @@ def load_config(config_path: Path) -> Dict[str, Any]:
 def get_next_job_id(csv_path: Path, job_prefix: str) -> str:
   """
   Determines the next job ID based on the last entry in the historical runs CSV file.
-
-  This function reads a CSV file specified by `csv_path`. If the file does not exist or is empty,
-  it returns a default job ID "nearby_solds_1". Otherwise, it checks the last entry in the file:
-  - If the last job's `all_status` is False, indicating a failure, it returns the same job ID to retry.
-  - If the last job was successful, it increments the job number by 1 and returns the new job ID.
+  
+  This function always increments the job number by 1, regardless of the success/failure
+  status of the previous job. The retry logic is now handled separately by checking
+  if the previous job failed before starting a new run.
 
   Parameters:
   - csv_path (Path): The path to the CSV file containing job records.
+  - job_prefix (str): The prefix for the job ID (e.g., "nearby_solds").
 
   Returns:
-  - str: The next job ID to be used.
+  - str: The next job ID to be used (always incremented).
   """
   if not csv_path.exists():
     return f"{job_prefix}_1"
@@ -90,10 +90,33 @@ def get_next_job_id(csv_path: Path, job_prefix: str) -> str:
   last_job_id = last_job['job_id']
   last_number = int(last_job_id.split('_')[-1])
   
-  if last_job['all'] == False:
-    return last_job_id  # Rerun the failed job
-  else:
-    return f"{job_prefix}_{last_number + 1}"
+  # Always increment the job number
+  return f"{job_prefix}_{last_number + 1}"
+
+def is_last_run_successful(csv_path: Path) -> bool:
+  """
+  Check if the last ETL run was successful by examining the CSV file.
+  
+  This function reads the CSV file and checks the 'all' status of the most recent entry.
+  If the file doesn't exist or is empty, it's considered successful (first run scenario).
+
+  Parameters:
+  - csv_path (Path): The path to the CSV file containing job records.
+
+  Returns:
+  - bool: True if the last run was successful or if no previous runs exist, False otherwise.
+  """
+  if not csv_path.exists():
+    return True  # No previous runs, consider as successful
+  
+  df = pd.read_csv(csv_path)
+  
+  if df.empty:
+    return True  # No previous runs, consider as successful
+  
+  last_job = df.iloc[-1]
+  return bool(last_job['all'])  # Convert to bool in case it's stored as string
+
 
 def update_run_csv(csv_path: Path, job_id: str, processor: BaseETLProcessor) -> bool:
   """

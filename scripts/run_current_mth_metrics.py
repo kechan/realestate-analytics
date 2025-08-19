@@ -4,7 +4,7 @@ import sys, logging
 from datetime import datetime
 from pathlib import Path
 
-from realestate_analytics.etl.run_utils import load_config, get_next_job_id, update_run_csv
+from realestate_analytics.etl.run_utils import load_config, get_next_job_id, update_run_csv, is_last_run_successful
 from realestate_analytics.etl.current_mth_metrics import CurrentMthMetricsProcessor
 from realestate_analytics.data.es import Datastore
 
@@ -50,6 +50,16 @@ def main():
 
   # current_mth_metrics_run.csv keeps historical run results
   hist_runs_csv_path = get_script_dir() / "current_mth_metrics_run.csv"
+
+  # Check if the last run was successful before proceeding
+  if not is_last_run_successful(hist_runs_csv_path):
+    print("="*50)
+    print("PREVIOUS ETL RUN FAILED - HALTING EXECUTION")
+    print(f"The last run in {hist_runs_csv_path} shows a failure.")
+    print("Please investigate the failure before running again.")
+    print("No new CurrentMthMetricsProcessor job will be started.")
+    print("="*50)
+    sys.exit(1)
 
   # Set up job ID and logging
   job_id = get_next_job_id(hist_runs_csv_path, job_prefix=JOB_ID_PREFIX)

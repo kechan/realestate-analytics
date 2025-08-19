@@ -323,11 +323,12 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
           active=False
         )
         if not success:
-          if self.prov_code in self.SMALL_TERRITORIES and len(delta_inactive_listing_df) == 0:              
-            self.logger.warning(f"No delta sold listings found for {self.prov_code}. This maybe expected for small territories.")
+          # Check if the failure is due to no data (common scenario) rather than a real error
+          if len(delta_inactive_listing_df) == 0:              
+            self.logger.warning(f"No delta non-active listings found for {self.prov_code} from {start_time} to {end_time}. This is common and expected.")
             delta_inactive_listing_df = pd.DataFrame(columns=self.current_listing_selects + ['_id', 'propertyType'])
             delta_inactive_listing_df.reset_index(drop=True, inplace=True)
-            success = True   # treat this as a success for small territories
+            success = True   # treat this as a success - no deactivations is normal
           else:
             self.logger.error(f"Failed to retrieve delta current non active listings from {start_time} to {end_time}")
             raise ValueError("Failed to retrieve delta current non active listings")
