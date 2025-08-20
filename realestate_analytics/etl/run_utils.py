@@ -167,11 +167,11 @@ def update_run_csv(csv_path: Path, job_id: str, processor: BaseETLProcessor) -> 
 
   # Send email alert if all_status is False
   # TODO: Test this only on PROD env, uncomment before deployment
-  # if not all_status:
-  #   try:
-  #     send_etl_failure_alert(job_id, stage_statuses)
-  #   except Exception as e:
-  #     logging.error(f"Error occurred while attempting to send failure alert: {str(e)}")
+  if not all_status:
+    try:
+      send_etl_failure_alert(job_id, stage_statuses)
+    except Exception as e:
+      logging.error(f"Error occurred while attempting to send failure alert: {str(e)}")
 
   return all_status
 
