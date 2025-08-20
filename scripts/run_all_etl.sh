@@ -22,6 +22,10 @@ done
 # $PYTHON_PATH $SCRIPT_PATH/run_historic_metrics.py --config $CONFIG_PATH/prod_config.yaml --sim_failure_at_pre_transform
 # $PYTHON_PATH $SCRIPT_PATH/run_historic_metrics.py --config $CONFIG_PATH/uat_config.yaml
 
+# ───────────────────────────────────────────────────────────────
+# Historic Metrics: per-province runs
+# ───────────────────────────────────────────────────────────────
+
 for PROV in ON BC AB SK MB QC NB NS PE NL YT NT NU; do
   echo "=== Historic Metrics: $PROV ==="
   $PYTHON_PATH $SCRIPT_PATH/run_historic_metrics.py \

@@ -372,6 +372,7 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
           # But this is also used in Absorption Rate ETL, so we need to ensure it is at least done at the end of month snapshot
           # The responsiblity of this schedule should on the run script that invoke this class.
           self.logger.info("Checking for deleted listings in BigQuery since last run... and removed them from current listings.")
+          # TODO: BUG, last_run shouldnt be used, it should be the last time check_bq_deletions was True and this ran.
           deleted_listings_df = self.bq_datastore.get_deleted_listings(start_time=last_run, end_time=end_time)
           if len(deleted_listings_df) > 0:
             len_listing_df_before_delete = len(self.listing_df)
