@@ -146,9 +146,10 @@ class AbsorptionRateProcessor(BaseETLProcessor):
                     (absorption_success + len(absorption_failed) > 0 and 
                     absorption_success / (absorption_success + len(absorption_failed)) >= self.LOAD_SUCCESS_THRESHOLD)
     
+    snapshot_total = snapshot_success + len(snapshot_failed)
     snapshot_ok = (not hasattr(self, 'month_end_snapshot_data')) or \
-                  (snapshot_success + len(snapshot_failed) > 0 and 
-                  snapshot_success / (snapshot_success + len(snapshot_failed)) >= self.LOAD_SUCCESS_THRESHOLD)
+              (snapshot_total == 0) or \
+              (snapshot_success / snapshot_total >= self.LOAD_SUCCESS_THRESHOLD)
 
     if absorption_ok and snapshot_ok:
       self._mark_success('load')

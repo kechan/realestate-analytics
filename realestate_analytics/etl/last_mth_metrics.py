@@ -275,7 +275,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
         success, failed = self.update_mkt_trends()
         total_attempts = success + len(failed)
-        if success / total_attempts < 0.5:
+        if total_attempts != 0 and success / total_attempts < 0.5:
           self.logger.error(f"Less than 50% success rate. Only {success} out of {total_attempts} documents updated.")
           raise ValueError("Failed to update market trends index. This must be successful to proceed.")
         else:
@@ -367,12 +367,17 @@ class LastMthMetricsProcessor(BaseETLProcessor):
             'new_listings_count': (group['addedOn'].dt.to_period('M').astype(str) == last_month).sum()
         })
 
-    # Calculate metrics for specific property types
-    results = expanded_df.groupby(['geog_id', 'propertyType']).apply(calculate_metrics).reset_index()
+    if expanded_df.empty:
+      # Create empty results with expected columns
+      results = pd.DataFrame(columns=['geog_id', 'propertyType', 'median_price', 'new_listings_count'])
+      all_property_types = pd.DataFrame(columns=['geog_id', 'propertyType', 'median_price', 'new_listings_count'])
+    else:
+      # Calculate metrics for specific property types
+      results = expanded_df.groupby(['geog_id', 'propertyType']).apply(calculate_metrics).reset_index()
 
-    # Calculate metrics for 'ALL' property type
-    all_property_types = expanded_df.groupby('geog_id').apply(calculate_metrics).reset_index()
-    all_property_types['propertyType'] = 'ALL'
+      # Calculate metrics for 'ALL' property type
+      all_property_types = expanded_df.groupby('geog_id').apply(calculate_metrics).reset_index()
+      all_property_types['propertyType'] = 'ALL'
 
     # Combine results
     final_results = pd.concat([results, all_property_types], ignore_index=True)

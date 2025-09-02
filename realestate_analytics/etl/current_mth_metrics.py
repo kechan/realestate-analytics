@@ -168,16 +168,22 @@ class CurrentMthMetricsProcessor(BaseETLProcessor):
     
     # STEP 4: Pre-calculate all metrics using vectorized pandas operations
     # Memory impact: Much smaller than original (only actual data combinations)
-    self.logger.info("Calculating metrics for specific property types...")
-    specific_metrics = expanded_df.groupby(['geog_id', 'propertyType']).apply(
-      calculate_metrics
-    ).reset_index()
-    
-    self.logger.info("Calculating metrics for 'ALL' property type...")
-    all_metrics = expanded_df.groupby('geog_id').apply(
-      calculate_metrics
-    ).reset_index()
-    all_metrics['propertyType'] = 'ALL'
+    if expanded_df.empty:
+      # Create empty results with expected columns
+      specific_metrics = pd.DataFrame(columns=['geog_id', 'propertyType', 'median_asking_price', 'new_listings'])
+      all_metrics = pd.DataFrame(columns=['geog_id', 'median_asking_price', 'new_listings'])
+      all_metrics['propertyType'] = 'ALL'
+    else:
+      self.logger.info("Calculating metrics for specific property types...")
+      specific_metrics = expanded_df.groupby(['geog_id', 'propertyType']).apply(
+        calculate_metrics
+      ).reset_index()
+      
+      self.logger.info("Calculating metrics for 'ALL' property type...")
+      all_metrics = expanded_df.groupby('geog_id').apply(
+        calculate_metrics
+      ).reset_index()
+      all_metrics['propertyType'] = 'ALL'
     
     # Combine calculated metrics
     calculated_metrics = pd.concat([specific_metrics, all_metrics], ignore_index=True)
