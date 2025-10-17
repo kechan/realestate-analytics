@@ -149,7 +149,8 @@ class LastMthMetricsArchiveReader:
         property_type (str),
         median_price (float or NaN),
         new_listings_count (float or int),
-        archive_date (pd.Timestamp)
+        archive_date (pd.Timestamp),
+        province (str or None)
       De-duplicated so that if multiple archives exist for a given month & key,
       the latest archive wins.
     """
@@ -158,7 +159,7 @@ class LastMthMetricsArchiveReader:
       print("No last_mth_metrics_results archive files found")
       return pd.DataFrame(columns=[
         'year-month', 'geog_id', 'property_type', 'median_price',
-        'new_listings_count', 'archive_date'
+        'new_listings_count', 'archive_date', 'province'
       ])
 
     # Load newest-first so we can drop_duplicates(keep='first')
@@ -172,14 +173,15 @@ class LastMthMetricsArchiveReader:
       df = df.rename(columns={'propertyType': 'property_type'})
       df['year-month'] = info['metrics_month']
       df['archive_date'] = pd.to_datetime(info['archive_date'])
+      df['province'] = info['province']
       frames.append(df[['year-month', 'geog_id', 'property_type',
-                        'median_price', 'new_listings_count', 'archive_date']])
+                        'median_price', 'new_listings_count', 'archive_date', 'province']])
 
     if not frames:
       print("No valid archive files could be processed")
       return pd.DataFrame(columns=[
         'year-month', 'geog_id', 'property_type', 'median_price',
-        'new_listings_count', 'archive_date'
+        'new_listings_count', 'archive_date', 'province'
       ])
 
     combined = pd.concat(frames, ignore_index=True)
@@ -357,13 +359,19 @@ class LastMthMetricsArchiveReader:
     """
     Find all matching last_mth_metrics_results files and compute the target metrics month
     from the archive date (archive for Aug N implies metrics for July).
+
+    Supports both old and new file naming conventions:
+    - Old: last_mth_metrics_results_YYYYMMDD_df.txt (no prefix)
+    - Old: on_last_mth_metrics_results_YYYYMMDD_df.txt (ON prefix)
+    - New: <prov>_last_mth_metrics_results_YYYYMMDD_df.txt (any 2-letter province code)
     """
-    pattern = r'^(on_)?last_mth_metrics_results_(\d{8})_df\.txt$'
+    pattern = r'^([a-z]{2}_)?last_mth_metrics_results_(\d{8})_df\.txt$'
     files = []
     for fp in self.archive_dir.glob('*last_mth_metrics_results*_df.txt'):
       m = re.match(pattern, fp.name)
       if not m:
         continue
+      prov_prefix = m.group(1)
       date_str = m.group(2)
       try:
         archive_date = datetime.strptime(date_str, '%Y%m%d')
@@ -373,10 +381,15 @@ class LastMthMetricsArchiveReader:
       first_of_month = archive_date.replace(day=1)
       prev_month_last_day = first_of_month - pd.Timedelta(days=1)
       metrics_month = prev_month_last_day.strftime('%Y-%m')
+
+      # Extract province code (strip underscore if present)
+      prov_code = prov_prefix.rstrip('_').upper() if prov_prefix else None
+
       files.append({
         'file_path': fp,
         'archive_date': archive_date,
-        'metrics_month': metrics_month
+        'metrics_month': metrics_month,
+        'province': prov_code
       })
     print(f"Discovered {len(files)} last_mth_metrics_results files")
     return files
