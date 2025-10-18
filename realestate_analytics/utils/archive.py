@@ -190,11 +190,11 @@ class LastMthMetricsArchiveReader:
     combined['median_price'] = pd.to_numeric(combined['median_price'], errors='coerce')
     combined['new_listings_count'] = pd.to_numeric(combined['new_listings_count'], errors='coerce')
 
-    # latest archive per (year-month, geog_id, property_type) wins
+    # latest archive per (year-month, geog_id, property_type, province) wins
     combined = (combined
-      .sort_values(['year-month', 'geog_id', 'property_type', 'archive_date'], ascending=False)
-      .drop_duplicates(['year-month', 'geog_id', 'property_type'], keep='first')
-      .sort_values(['year-month', 'geog_id', 'property_type'])
+      .sort_values(['year-month', 'geog_id', 'property_type', 'province', 'archive_date'], ascending=False)
+      .drop_duplicates(['year-month', 'geog_id', 'property_type', 'province'], keep='first')
+      .sort_values(['year-month', 'geog_id', 'property_type', 'province'])
       .reset_index(drop=True))
 
     print(f"Recovered {len(combined)} records across {combined['year-month'].nunique()} months")
