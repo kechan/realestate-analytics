@@ -3,13 +3,13 @@ import pandas as pd
 from datetime import datetime, date, timedelta
 
 from pathlib import Path
-import logging
 
 from ..etl.base_etl import BaseETLProcessor
 from ..data.caching import FileBasedCache
 from ..data.es import Datastore
 from ..data.bq import BigQueryDatastore
 from ..data.archive import Archiver
+from ..utils.validators import ProvinceGeogIdValidator
 from elasticsearch.helpers import scan, bulk
 from elasticsearch.exceptions import NotFoundError, ConnectionError, RequestError, TransportError
 
@@ -22,6 +22,11 @@ class LastMthMetricsProcessor(BaseETLProcessor):
                prov_code: str = 'ON'
                ):
     super().__init__(job_id=job_id, datastore=datastore, bq_datastore=bq_datastore, prov_code=prov_code)
+
+    self.geog_id_validator = ProvinceGeogIdValidator(
+      archive_dir=self.archiver.archive_dir,
+      prov_code=self.prov_code
+    )
     
     self.listing_df = None
     self.delta_listing_df = None
@@ -359,6 +364,28 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
     # Expand guid column
     expanded_df = self.listing_df.assign(geog_id=self.listing_df['guid'].str.split(',')).explode('geog_id')
+
+    # Filter out cross-province geog_ids to prevent contamination
+    if not self.geog_id_validator.bypass_mode:
+      before_count = len(expanded_df)
+      expanded_df = expanded_df[expanded_df['geog_id'].isin(self.geog_id_validator.valid_geog_ids)].reset_index(drop=True)
+      after_count = len(expanded_df)
+
+      contaminated_count = before_count - after_count
+      if contaminated_count > 0:
+        contamination_pct = 100 * contaminated_count / before_count
+        self.logger.warning(
+            f"[CONTAMINATION] Filtered {contaminated_count} cross-province geog_ids "
+            f"({contamination_pct:.2f}%) for province {self.prov_code}"
+        )
+      else:
+        self.logger.info(f"No cross-province contamination detected for {self.prov_code}")
+    else:
+      self.logger.warning(
+          f"[VALIDATION BYPASS] Skipping geog_id validation for {self.prov_code} - "
+          f"validator is in bypass mode. Contamination checks are NOT active."
+      )
+
 
     # Function to calculate metrics for both specific property types and 'ALL'
     def calculate_metrics(group):
