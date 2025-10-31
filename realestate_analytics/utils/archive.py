@@ -37,10 +37,14 @@ class MonthEndListingSnapshotArchiveReader:
   def read(self) -> pd.DataFrame:
     """
     Read and load all current listing counts from the archive.
-    
+
     Returns:
-      DataFrame with columns [year-month, geog_id, propertyType, current_count]
-      where year-month is converted to end-of-month datetime
+      DataFrame with columns [year-month, geog_id, propertyType, current_count, province]
+      where year-month is converted to end-of-month datetime.
+
+      The province column is extracted from file naming:
+      - New files: <prov>_current_listing_counts_... → province code (e.g., 'ON', 'BC')
+      - Old files: current_listing_counts_... → 'ON' (default)
     """
     df = self._load_current_listing_counts()
     if not df.empty:
@@ -48,48 +52,66 @@ class MonthEndListingSnapshotArchiveReader:
     return df
   
   def _load_current_listing_counts(self) -> pd.DataFrame:
-    """Load current listing counts files from archive directory."""
-    df_files = list(self.archive_dir.glob("current_listing_counts_*_df.txt"))
+    """
+    Load current listing counts files from archive directory.
+
+    Supports both old and new file naming conventions:
+    - Old: current_listing_counts_YYYY-MM_YYYYMMDD_df.txt (no prefix, for ON)
+    - New: <prov>_current_listing_counts_YYYY-MM_YYYYMMDD_df.txt (any 2-letter province code)
+    """
+    df_files = list(self.archive_dir.glob("*current_listing_counts_*_df.txt"))
     print(f"Found {len(df_files)} DataFrame files")
-    
+
     if not df_files:
       return pd.DataFrame(columns=['year-month', 'geog_id', 'propertyType', 'current_count'])
-    
+
     all_data = []
-    pattern = r"current_listing_counts_(\d{4}-\d{2})_(\d{8})_df\.txt"
-    
+    # Pattern matches both old (no prefix) and new (with province prefix) formats
+    pattern = r"^([a-z]{2}_)?current_listing_counts_(\d{4}-\d{2})_(\d{8})_df\.txt$"
+
     for df_file in df_files:
-      match = re.search(pattern, df_file.name)
+      match = re.match(pattern, df_file.name)
       if not match:
         continue
-        
-      year_month, timestamp = match.groups()
-      
+
+      prov_prefix = match.group(1)
+      year_month = match.group(2)
+      timestamp = match.group(3)
+
+      # Extract province code (strip underscore if present)
+      # Old files without prefix are assumed to be ON
+      prov_code = prov_prefix.rstrip('_').upper() if prov_prefix else 'ON'
+
       try:
-        # Load dtypes if available
-        dtypes_file = self.archive_dir / f"current_listing_counts_{year_month}_{timestamp}_dtypes.json"
+        # Load dtypes if available - try with province prefix first, then without
+        if prov_prefix:
+          dtypes_file = self.archive_dir / f"{prov_prefix}current_listing_counts_{year_month}_{timestamp}_dtypes.json"
+        else:
+          dtypes_file = self.archive_dir / f"current_listing_counts_{year_month}_{timestamp}_dtypes.json"
+
         dtypes = None
         if dtypes_file.exists():
           with open(dtypes_file, 'r') as f:
             dtypes = json.load(f)
-        
+
         df = pd.read_csv(df_file, sep='\t', dtype=dtypes)
         df['year-month'] = year_month
-        
+        df['province'] = prov_code
+
         if 'current_count' in df.columns:
-          df = df[['year-month', 'geog_id', 'propertyType', 'current_count']]
+          df = df[['year-month', 'geog_id', 'propertyType', 'current_count', 'province']]
           all_data.append(df)
-          print(f"Loaded {len(df)} records from {year_month}")
-          
+          print(f"Loaded {len(df)} records from {year_month} ({prov_code})")
+
       except Exception as e:
         print(f"Error processing {df_file.name}: {e}")
-    
+
     if not all_data:
-      return pd.DataFrame(columns=['year-month', 'geog_id', 'propertyType', 'current_count'])
-    
+      return pd.DataFrame(columns=['year-month', 'geog_id', 'propertyType', 'current_count', 'province'])
+
     result_df = pd.concat(all_data, ignore_index=True)
-    result_df = result_df.sort_values(['year-month', 'geog_id', 'propertyType']).reset_index(drop=True)
-    
+    result_df = result_df.sort_values(['year-month', 'geog_id', 'propertyType', 'province']).reset_index(drop=True)
+
     print(f"Successfully loaded {len(result_df)} total records from {len(all_data)} files")
     return result_df
   
