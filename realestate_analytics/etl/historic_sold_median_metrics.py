@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 from .base_etl import BaseETLProcessor
 from ..data.caching import FileBasedCache
 from ..data.es import Datastore
+from ..utils.validators import ProvinceGeogIdValidator
 from elasticsearch.helpers import scan, bulk
 
 import realestate_core.common.class_extensions
@@ -23,6 +24,11 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     super().__init__(job_id=job_id, datastore=datastore, prov_code=prov_code)
 
     self.logger.info(f'Province: {self.prov_code}')
+
+    self.geog_id_validator = ProvinceGeogIdValidator(
+      archive_dir=self.archiver.archive_dir,
+      prov_code=self.prov_code
+    )
 
     self.sold_listing_df = None
     self.geo_entry_df = None
@@ -257,7 +263,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
   def _expand_batch(self, batch_df):
     # Step 1: Select only the relevant columns early to reduce memory usage
-    batch_df = batch_df[['_id', 'propertyType', 'soldPrice', 'daysOnMarket', 
+    batch_df = batch_df[['_id', 'propertyType', 'soldPrice', 'daysOnMarket',
                          'lastTransition', 'price', 'guid']].copy()
 
     # Step 2: Split the 'guid' column into lists
@@ -265,6 +271,27 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
     # Step 3: Explode the 'geog_id' list into separate rows
     expanded_df = batch_df.explode('geog_id')
+
+    # Filter out cross-province geog_ids to prevent contamination
+    if not self.geog_id_validator.bypass_mode:
+      before_count = len(expanded_df)
+      expanded_df = expanded_df[expanded_df['geog_id'].isin(self.geog_id_validator.valid_geog_ids)].reset_index(drop=True)
+      after_count = len(expanded_df)
+
+      contaminated_count = before_count - after_count
+      if contaminated_count > 0:
+        contamination_pct = 100 * contaminated_count / before_count
+        self.logger.warning(
+          f"[CONTAMINATION] Filtered {contaminated_count} cross-province geog_ids "
+          f"({contamination_pct:.2f}%) for province {self.prov_code}"
+        )
+      else:
+        self.logger.info(f"No cross-province contamination detected for {self.prov_code}")
+    else:
+      self.logger.warning(
+        f"[VALIDATION BYPASS] Skipping geog_id validation for {self.prov_code} - "
+        f"validator is in bypass mode. Contamination checks are NOT active."
+      )
 
     # Step 4: Calculate 'sold_over_ask' and 'sold_below_ask' in a vectorized way
     expanded_df['sold_over_ask'] = expanded_df['soldPrice'] > expanded_df['price']

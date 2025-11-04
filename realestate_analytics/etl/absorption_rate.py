@@ -9,6 +9,7 @@ from .base_etl import BaseETLProcessor
 from ..data.caching import FileBasedCache
 from ..data.es import Datastore
 from ..data.archive import Archiver
+from ..utils.validators import ProvinceGeogIdValidator
 from elasticsearch.helpers import scan, bulk
 
 import realestate_core.common.class_extensions
@@ -22,6 +23,11 @@ class AbsorptionRateProcessor(BaseETLProcessor):
 
     self.logger.info(f'Province: {self.prov_code}')
     self.logger.info("Last run is expectedly None since we don't do any extract from ES for this ETL job.")
+
+    self.geog_id_validator = ProvinceGeogIdValidator(
+      archive_dir=self.archiver.archive_dir,
+      prov_code=self.prov_code
+    )
 
     # Raw data loaded from cache
     self.sold_listing_df = None                 # 5-year sold listings from SoldMedianMetricsProcessor (IMS data)
@@ -192,8 +198,30 @@ class AbsorptionRateProcessor(BaseETLProcessor):
       # Create snapshot for archival
       def expand_guid(df):
         return df.assign(geog_id=df['guid'].str.split(',')).explode('geog_id')
-      
+
       expanded_current = expand_guid(self.listing_df)
+
+      # Filter out cross-province geog_ids to prevent contamination
+      if not self.geog_id_validator.bypass_mode:
+        before_count = len(expanded_current)
+        expanded_current = expanded_current[expanded_current['geog_id'].isin(self.geog_id_validator.valid_geog_ids)].reset_index(drop=True)
+        after_count = len(expanded_current)
+
+        contaminated_count = before_count - after_count
+        if contaminated_count > 0:
+          contamination_pct = 100 * contaminated_count / before_count
+          self.logger.warning(
+            f"[CONTAMINATION] Filtered {contaminated_count} cross-province geog_ids "
+            f"({contamination_pct:.2f}%) for province {self.prov_code} in month-end snapshot"
+          )
+        else:
+          self.logger.info(f"No cross-province contamination detected for {self.prov_code} in month-end snapshot")
+      else:
+        self.logger.warning(
+          f"[VALIDATION BYPASS] Skipping geog_id validation for {self.prov_code} month-end snapshot - "
+          f"validator is in bypass mode. Contamination checks are NOT active."
+        )
+
       current_counts = expanded_current.groupby(['geog_id', 'propertyType']).size().reset_index(name='current_count')
       
       # Archive the snapshot
