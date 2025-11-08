@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import List, Dict, Any, Tuple, Union
 
 import os, json, time, traceback, re
@@ -47,7 +48,183 @@ def parse_datetime(dt_string):
     return pd.to_datetime(dt_string, format='%Y-%m-%dT%H:%M:%S.%f')
   except ValueError:
     return pd.to_datetime(dt_string, format='%Y-%m-%dT%H:%M:%S')
-            
+
+
+def validate_ims_columns(ims_df: pd.DataFrame) -> tuple[bool, list]:
+  """
+  Validate that IMS dataframe has all required columns for mapping.
+
+  Args:
+    ims_df: DataFrame with IMS column names
+
+  Returns:
+    Tuple of (is_valid, missing_columns)
+
+  Example:
+    >>> ims_df = pd.DataFrame({'WrittenDate': [...], 'SoldPrice': [...]})
+    >>> is_valid, missing = validate_ims_columns(ims_df)
+    >>> if not is_valid:
+    ...     print(f"Missing columns: {missing}")
+  """
+
+  required_cols = [
+    'WrittenDate',
+    'SoldPrice',
+    'ListPrice',
+    'Latitude',
+    'Longitude',
+    'DaysOnMarket',
+    'MLSNumber',
+    'MLSID',
+    'City',
+    'Community',
+    'Province',
+    'Bedrooms',
+    'Baths',
+    # Property type fields needed for derivation
+    'Type',
+    'SubType',
+    'Style',
+  ]
+
+  missing = [col for col in required_cols if col not in ims_df.columns]
+
+  return len(missing) == 0, missing
+
+
+def rename_ims_to_canonical(ims_df: pd.DataFrame,
+                            keep_bonus_cols: bool = False) -> pd.DataFrame:
+  """
+  Rename IMS dataset columns to canonical sold listing column names.
+
+  This function handles the column name transformation from IMS format to
+  the standardized format used in sold_listing_df. It also fixes dtype
+  mismatches to match legacy expectations.
+
+  Args:
+    ims_df: DataFrame with IMS column names (modified in-place for memory efficiency)
+    keep_bonus_cols: If True, keep additional IMS columns not in canonical format.
+                    If False, drop them after creating canonical columns (recommended for large datasets).
+
+  Returns:
+    DataFrame with canonical column names and correct dtypes
+
+  Canonical columns expected (excluding property type fields):
+    lng, provState, city, transitions, daysOnMarket, bedsInt, baths, mls,
+    neighbourhood, price, soldPrice, listingStatus, guid, lastTransition,
+    beds, lat, bathsInt, _id, lastUpdate, computed_guid
+
+  Property type fields (handled separately):
+    listingType, searchCategoryType, propertyType
+
+  Notes:
+    - _id is constructed as {province}-{MLSID}-{MLSNumber} (lowercase)
+    - guid field is not in IMS data (Boss working on mapping)
+    - listingStatus hardcoded as "SOLD" for all IMS records
+    - transitions and lastUpdate set as None (not used downstream)
+    - beds/baths are string versions of bedsInt/bathsInt (legacy compatibility)
+    - daysOnMarket converted to float64 (allows averaging and NaN values)
+    - searchCategoryType remains None (NOT used in IMS ETL logic)
+    - Property type fields will be added by separate derivation logic
+    - For memory efficiency with large datasets, this function modifies the input DataFrame
+      and returns a view with only canonical columns when keep_bonus_cols=False
+
+  Example:
+    >>> ims_df = pd.DataFrame({
+    ...     'WrittenDate': ['2024-01-15'],
+    ...     'SoldPrice': [500000],
+    ...     'ListPrice': [495000],
+    ...     'MLSNumber': ['12345'],
+    ...     'MLSID': [1],
+    ...     'Province': ['ON']
+    ... })
+    >>> canonical_df = rename_ims_to_canonical(ims_df, keep_bonus_cols=False)
+    >>> print(canonical_df['_id'].iloc[0])  # 'on-1-12345'
+  """
+
+  # Step 1: Direct column renames (IMS name → canonical name)
+  # Using inplace=True to modify the DataFrame directly without creating a copy
+  rename_mapping = {
+    'WrittenDate': 'lastTransition',
+    'SoldPrice': 'soldPrice',
+    'ListPrice': 'price',
+    'Latitude': 'lat',
+    'Longitude': 'lng',
+    'DaysOnMarket': 'daysOnMarket',
+    'MLSNumber': 'mls',
+    'City': 'city',
+    'Community': 'neighbourhood',
+    'Province': 'provState',
+    'Bedrooms': 'bedsInt',  # IMS Bedrooms are numeric → bedsInt
+    'Baths': 'bathsInt',    # IMS Baths are numeric → bathsInt
+  }
+
+  ims_df.rename(columns=rename_mapping, inplace=True)
+
+  # Step 2: Create beds and baths as string versions of bedsInt/bathsInt
+  # These match legacy format (object dtype) but IMS doesn't have "1+1" format
+  # Not used in ETL logic, but kept for schema consistency with legacy
+  if 'bedsInt' in ims_df.columns:
+    ims_df['beds'] = ims_df['bedsInt'].astype(str)
+  if 'bathsInt' in ims_df.columns:
+    ims_df['baths'] = ims_df['bathsInt'].astype(str)
+
+  # Step 2.5: Fix dtype mismatches
+  # daysOnMarket must be float64 (not int64) to allow averaging and NaN values
+  if 'daysOnMarket' in ims_df.columns:
+    ims_df['daysOnMarket'] = ims_df['daysOnMarket'].astype(float)
+
+  # Step 3: Construct primary key _id = {province}-{MLSID}-{MLSNumber}
+  if all(col in ims_df.columns for col in ['provState', 'MLSID', 'mls']):
+    ims_df['_id'] = ims_df['provState'].str.lower() + '-' + ims_df['MLSID'].astype(str) + '-' + ims_df['mls'].str.lower()
+  else:
+    ims_df['_id'] = None
+
+  # Step 4: Add missing fields with default values
+
+  # listingStatus - all IMS records are sold
+  ims_df['listingStatus'] = 'SOLD'
+
+  # guid - not available yet (Boss working on geographic mapping)
+  ims_df['guid'] = None
+  ims_df['computed_guid'] = None
+
+  # transitions - not used downstream, set as None
+  ims_df['transitions'] = None
+
+  # lastUpdate - not critical, set as None
+  ims_df['lastUpdate'] = None
+
+  # Step 5: Property type fields (will be populated by derivation logic later)
+  # These are placeholders - actual values computed by property type mapper
+  ims_df['listingType'] = None  # Legacy field, not directly in IMS
+  ims_df['searchCategoryType'] = None  # Legacy field, NOT USED in IMS ETL logic
+  # ims_df['propertyType'] = None  # Will be derived from Type/SubType/Style/Province
+
+  # Note: searchCategoryType is only used in legacy derive_property_type() function.
+  # For IMS, propertyType is derived directly from (Type, SubType, Style, Province).
+  # searchCategoryType can remain None and is NOT referenced in any IMS ETL logic.
+
+  # Step 6: Drop bonus/extra IMS columns to save memory
+  # This is the ONLY step that creates a new DataFrame - selecting columns returns a view/copy
+  if not keep_bonus_cols:
+    # Define canonical columns we want to keep
+    canonical_cols = [
+      '_id', 'mls', 'lastTransition', 'soldPrice', 'price', 'daysOnMarket',
+      'lat', 'lng', 'city', 'neighbourhood', 'provState',
+      'beds', 'bedsInt', 'baths', 'bathsInt',
+      'listingStatus', 'guid', 'computed_guid', 'transitions', 'lastUpdate',
+      'listingType', 'searchCategoryType', 'propertyType'
+    ]
+
+    # Keep only canonical columns that exist in the dataframe
+    # This creates a new DataFrame with only the columns we need, dropping all IMS-specific columns
+    cols_to_keep = [col for col in canonical_cols if col in ims_df.columns]
+    return ims_df[cols_to_keep]
+
+  return ims_df
+
+
 class Datastore:
   def __init__(self, host: str, port: int):
     self.logger = logging.getLogger(self.__class__.__name__)
@@ -103,10 +280,39 @@ class Datastore:
     if self.cache_dir:
       self.cache_dir = Path(self.cache_dir)
       self.cache = FileBasedCache(cache_dir=self.cache_dir)
+
+      # Load IMS property type mapping if exists
+      ims_property_type_mapping_path = self.cache_dir / 'ims_property_type_mapping_v2_df'
+      if ims_property_type_mapping_path.exists():
+        ims_property_mapping_df = pd.read_feather(ims_property_type_mapping_path)
+
+        # Create cascading lookup dictionaries
+        self.property_type_lookup_4 = ims_property_mapping_df.set_index(['Type', 'SubType', 'Style', 'Province'])['Inferred'].to_dict()
+        self.property_type_lookup_3 = ims_property_mapping_df.groupby(['Type', 'SubType', 'Style'])['Inferred'].first().to_dict()
+        self.property_type_lookup_2 = ims_property_mapping_df.groupby(['Type', 'SubType'])['Inferred'].first().to_dict()
+        self.property_type_lookup_1 = ims_property_mapping_df.groupby(['Type'])['Inferred'].first().to_dict()
+
+        self.ims_property_mapping_df = ims_property_mapping_df
+
+        self.logger.info("IMS property type mapping loaded successfully")
+      else:
+        self.logger.warning(f"IMS property type mapping file not found in {ims_property_type_mapping_path}.")
+        self.ims_property_mapping_df = pd.DataFrame()
+
+        self.property_type_lookup_4 = {}
+        self.property_type_lookup_3 = {}
+        self.property_type_lookup_2 = {}
+        self.property_type_lookup_1 = {}
+        
     else:
-      self.logger.warning('ANALYTICS_CACHE_DIR not set in .env file, not instantiating cache, may cause unexpected errors.')    
-    
-    # map from property type to the listingType and searchCategoryType encoding.
+      self.logger.warning('ANALYTICS_CACHE_DIR not set in .env file, not instantiating cache, may cause unexpected errors.')
+      self.ims_property_mapping_df = pd.DataFrame()
+      self.property_type_lookup_4 = {}
+      self.property_type_lookup_3 = {}
+      self.property_type_lookup_2 = {}
+      self.property_type_lookup_1 = {}
+
+    # map from property type to the listingType and searchCategoryType encoding (the rlp_archive_current index)
     # for used in ES querying.
     self.property_type_query_mappings = [
       # CONDO
@@ -573,28 +779,48 @@ class Datastore:
     self.logger.info("PLACEHOLDER: get_ims_sold_listings called - returning empty dataset")
     self.logger.info(f"Parameters: start_time={start_time}, end_time={end_time}, date_field={date_field}, prov_code={prov_code}")
     self.logger.info("TODO: Replace this stub with actual IMS ES index query when index is available")
-    
-    # Return same as get_sold_listings when no results found
-    self.logger.info("No IMS sold listings found (placeholder)")
 
-    if selects:
-      columns = selects
-      empty_df = pd.DataFrame(columns=columns)
+    # Return empty dataframe for placeholder
+    raw_ims_data_df = pd.DataFrame()
 
-      # Ensure datetime columns have correct dtype
-      if 'lastTransition' in empty_df.columns:
-          empty_df['lastTransition'] = pd.to_datetime(empty_df['lastTransition'])
-      
-      # Add _id, propertyType columns (added by get_sold_listings processing)
-      if '_id' not in empty_df.columns:
-          empty_df['_id'] = None
-      if 'propertyType' not in empty_df.columns:
-          empty_df['propertyType'] = None    
+    if raw_ims_data_df.empty:
+      self.logger.info("No IMS sold listings found (placeholder)")
+      if selects:
+        # Create empty DataFrame with requested columns
+        empty_df = pd.DataFrame(columns=selects)
+
+        # Ensure datetime columns have correct dtype
+        if 'lastTransition' in empty_df.columns:
+            empty_df['lastTransition'] = pd.to_datetime(empty_df['lastTransition'])
+
+        # Add _id, propertyType columns if not already in selects (these are added by processing logic)
+        if '_id' not in empty_df.columns:
+            empty_df['_id'] = None
+        if 'propertyType' not in empty_df.columns:
+            empty_df['propertyType'] = None
+
+        self.logger.info(f"Returning empty DataFrame with {len(empty_df.columns)} columns for province: {prov_code or 'ALL'}")
+        return True, empty_df
+      else:
+        # No selects specified, return completely empty DataFrame
+        self.logger.info(f"Returning empty DataFrame for province: {prov_code or 'ALL'}")
+        return True, pd.DataFrame()
     
-      self.logger.info(f"Returning empty DataFrame with {len(empty_df.columns)} columns for province: {prov_code or 'ALL'}")  # Use empty_df.columns for accurate count
-      return True, empty_df
-    
-    return True, pd.DataFrame()
+    is_valid, missing = validate_ims_columns(raw_ims_data_df)
+    if not is_valid:
+      self.logger.error(f"IMS sold listings data is missing required columns: {missing}")
+      return False, pd.DataFrame()
+
+    # When actual data exists, apply property type mapping and transformation
+    raw_ims_data_df['propertyType'] = raw_ims_data_df.apply(self._lookup_property_type, axis=1)
+
+    # Transform to canonical format
+    canonical_df = rename_ims_to_canonical(raw_ims_data_df, keep_bonus_cols=False)
+
+    process_time = time.time() - start_process_time
+    self.logger.info(f"Completed fetching IMS sold listings in {process_time:.2f} seconds")
+    return True, canonical_df
+
 
   def get_current_active_listings(self, selects: List[str], prov_code: str=None,
                                   addedOn_start_time: datetime=None, addedOn_end_time: datetime=None,
@@ -1193,6 +1419,27 @@ class Datastore:
         self.es.clear_scroll(scroll_id=scroll_id)
       except Exception as e:
         self.logger.error(f"Error removing scroll ID: {e}")
+
+
+  def _lookup_property_type(self, row):
+    """
+    Cascading lookup for property type: try 4-tuple, then 3-tuple, then 2-tuple, then 1-tuple.
+
+    Handles None/NaN values gracefully by safely extracting values using .get() method.
+    """
+    type_val = row.get('Type')
+    subtype_val = row.get('SubType')
+    style_val = row.get('Style')
+    province_val = row.get('Province')
+
+    return (
+      self.property_type_lookup_4.get((type_val, subtype_val, style_val, province_val)) or
+      self.property_type_lookup_3.get((type_val, subtype_val, style_val)) or
+      self.property_type_lookup_2.get((type_val, subtype_val)) or
+      self.property_type_lookup_1.get(type_val) or
+      'UNKNOWN'
+    )
+
 
   def close(self):
     if self.es:
