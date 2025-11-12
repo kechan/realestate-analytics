@@ -40,11 +40,13 @@ class AbsorptionRateProcessor(BaseETLProcessor):
 
     # Absorption rates time series for ground truth diffing
     self.absorption_rates_ts_df = None          # Absorption rates pivot: index=(geog_id, propertyType), columns=year-month, values=absorption_rate
+    self.months_of_inventory_ts_df = None       # Months of inventory pivot: index=(geog_id, propertyType), columns=year-month, values=months_of_inventory
 
     # self.absorption_rates = None   # old
 
     self.LOAD_SUCCESS_THRESHOLD = 0.5
     self.ABSORPTION_RATE_ROUND_DIGITS = 4
+    self.MONTHS_OF_INVENTORY_ROUND_DIGITS = 2
 
   def extract(self, from_cache=True):
     # ignore the from_cache flag, always load from cache
@@ -75,13 +77,18 @@ class AbsorptionRateProcessor(BaseETLProcessor):
       old_absorption_rates_ts_df = None
       if old_absorption_rates_flat is not None and not old_absorption_rates_flat.empty:
         old_absorption_rates_ts_df = old_absorption_rates_flat.set_index(['geog_id', 'propertyType'])
-      
+
+      # **NEW**: Load previous months_of_inventory for comparison
+      old_months_of_inventory_flat = self.cache.get(f'{self.cache_prefix}{self.prov_code.lower()}_months_of_inventory_time_series')
+      old_months_of_inventory_ts_df = None
+      if old_months_of_inventory_flat is not None and not old_months_of_inventory_flat.empty:
+        old_months_of_inventory_ts_df = old_months_of_inventory_flat.set_index(['geog_id', 'propertyType'])
 
       # Step 2: Compute from scratch using latest sold/current listings
       self._prepare_sold_data()
       self._create_sold_counts_time_series()
       self._prepare_current_counts_time_series()
-      self._calculate_absorption_rates_time_series()  # produces self.absorption_rates_ts_df
+      self._calculate_absorption_rates_time_series()  # produces self.absorption_rates_ts_df and self.months_of_inventory_ts_df
 
       # Step 2.5: Handle month-end snapshot if needed
       self._handle_month_end_snapshot()
@@ -95,15 +102,24 @@ class AbsorptionRateProcessor(BaseETLProcessor):
         self.cache.set(checkpoint_key, self.changes_df)
 
       # Step 5: Cache the latest absorption_rates_ts_df (ground truth), overwriting the previous old
-      if hasattr(self, 'absorption_rates_ts_df') and self.absorption_rates_ts_df is not None:        
+      if hasattr(self, 'absorption_rates_ts_df') and self.absorption_rates_ts_df is not None:
         absorption_rates_flat = self.absorption_rates_ts_df.reset_index()           # Reset index for feather compatibility
         self.cache.set(f'{self.cache_prefix}{self.prov_code.lower()}_absorption_rates_time_series', absorption_rates_flat)
         self.logger.info("Successfully cached absorption rates time series.")
-        self._mark_success('transform')
       else:
         self.logger.error("absorption_rates_ts_df not found or is None.")
         raise ValueError("absorption_rates_ts_df not found or is None.")
-      
+
+      # Step 5b: Cache the latest months_of_inventory_ts_df (ground truth), overwriting the previous old
+      if hasattr(self, 'months_of_inventory_ts_df') and self.months_of_inventory_ts_df is not None:
+        months_of_inventory_flat = self.months_of_inventory_ts_df.reset_index()
+        self.cache.set(f'{self.cache_prefix}{self.prov_code.lower()}_months_of_inventory_time_series', months_of_inventory_flat)
+        self.logger.info("Successfully cached months of inventory time series.")
+        self._mark_success('transform')
+      else:
+        self.logger.error("months_of_inventory_ts_df not found or is None.")
+        raise ValueError("months_of_inventory_ts_df not found or is None.")
+
     except Exception as e:
       self.logger.error(f"Unexpected error in transform: {e}")
       raise
@@ -403,43 +419,62 @@ class AbsorptionRateProcessor(BaseETLProcessor):
 
  
   def update_mkt_trends_ts_index(self):
-    """Update ES by replacing entire absorption_rate time series for changed geog_id/propertyType combinations"""
-    
+    """Update ES by replacing entire absorption_rate and months_of_inventory time series for changed geog_id/propertyType combinations"""
+
     def generate_actions():
       current_date = self.get_current_datetime()
-      
+
       # Process each changed geog_id/propertyType combination
       for _, change in self.changes_df.iterrows():
         geog_id = change['geog_id']
         propertyType = change['propertyType']
-        
+
         property_type = propertyType if propertyType != 'ALL' else None
         composite_id = f"{geog_id}_{property_type or 'ALL'}"
-        
-        # JOIN: Get the complete time series for this combination from absorption_rates_ts_df
+
+        # Get the complete absorption_rate time series for this combination
+        absorption_rate_array = []
         if hasattr(self, 'absorption_rates_ts_df') and not self.absorption_rates_ts_df.empty:
           try:
             time_series_row = self.absorption_rates_ts_df.loc[(geog_id, propertyType)]
-            
+
             # Convert to list of month/value objects, filtering out NaN values
-            absorption_rate_array = []
             for month, value in time_series_row.items():
               if pd.notna(value):
                 absorption_rate_array.append({
                   'month': month,
                   'value': round(float(value), self.ABSORPTION_RATE_ROUND_DIGITS)
                 })
-            
+
             # Sort by month to ensure chronological order
             absorption_rate_array.sort(key=lambda x: x['month'])
-            
+
           except KeyError:
             # This combination was removed in new data
             absorption_rate_array = []
-        else:
-          absorption_rate_array = []
-        
-        # Create ES update operation that replaces entire absorption_rate array
+
+        # Get the complete months_of_inventory time series for this combination
+        months_of_inventory_array = []
+        if hasattr(self, 'months_of_inventory_ts_df') and not self.months_of_inventory_ts_df.empty:
+          try:
+            time_series_row = self.months_of_inventory_ts_df.loc[(geog_id, propertyType)]
+
+            # Convert to list of month/value objects, filtering out NaN values
+            for month, value in time_series_row.items():
+              if pd.notna(value):
+                months_of_inventory_array.append({
+                  'month': month,
+                  'value': round(float(value), self.MONTHS_OF_INVENTORY_ROUND_DIGITS)
+                })
+
+            # Sort by month to ensure chronological order
+            months_of_inventory_array.sort(key=lambda x: x['month'])
+
+          except KeyError:
+            # This combination was removed in new data
+            months_of_inventory_array = []
+
+        # Create ES update operation that replaces both absorption_rate and months_of_inventory arrays
         yield {
           "_op_type": "update",
           "_index": self.datastore.mkt_trends_index_name,
@@ -450,10 +485,13 @@ class AbsorptionRateProcessor(BaseETLProcessor):
             if (ctx._source.metrics == null) {
               ctx._source.metrics = new HashMap();
             }
-            
+
             // Replace entire absorption_rate array with new time series
             ctx._source.metrics.absorption_rate = params.absorption_rate_array;
-            
+
+            // Replace entire months_of_inventory array with new time series
+            ctx._source.metrics.months_of_inventory = params.months_of_inventory_array;
+
             // Update document metadata
             ctx._source.geog_id = params.geog_id;
             ctx._source.propertyType = params.propertyType;
@@ -462,6 +500,7 @@ class AbsorptionRateProcessor(BaseETLProcessor):
             """,
             "params": {
               "absorption_rate_array": absorption_rate_array,
+              "months_of_inventory_array": months_of_inventory_array,
               "geog_id": geog_id,
               "propertyType": property_type or "ALL",
               "geo_level": int(geog_id.split('_')[0][1:]),
@@ -473,7 +512,7 @@ class AbsorptionRateProcessor(BaseETLProcessor):
     # Perform bulk update
     success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
 
-    self.logger.info(f"Absorption rate update: Successfully updated {success} documents for {len(self.changes_df)} changed combinations")
+    self.logger.info(f"Updated {success} documents with absorption_rate and months_of_inventory for {len(self.changes_df)} changed combinations")
     if failed:
       self.logger.error(f"Failed to update {len(failed)} documents")
       self.datastore.summarize_update_failures(failed)
@@ -743,11 +782,13 @@ class AbsorptionRateProcessor(BaseETLProcessor):
     if self.sold_counts_ts_df.empty:
       self.logger.warning("No sold counts data - cannot calculate absorption rates")
       self.absorption_rates_ts_df = pd.DataFrame()
+      self.months_of_inventory_ts_df = pd.DataFrame()
       return
     
     if self.current_counts_ts_pivot.empty:
       self.logger.warning("No current counts time series - cannot calculate absorption rates")
       self.absorption_rates_ts_df = pd.DataFrame()
+      self.months_of_inventory_ts_df = pd.DataFrame()
       return
     
     # Find intersection: should be much closer now since we pre-filtered sold data
@@ -761,6 +802,7 @@ class AbsorptionRateProcessor(BaseETLProcessor):
     if len(common_columns) == 0:
       self.logger.warning("No common months between sold data and current count snapshots")
       self.absorption_rates_ts_df = pd.DataFrame()
+      self.months_of_inventory_ts_df = pd.DataFrame()
       return
     
     # Should have much better alignment now
@@ -769,12 +811,17 @@ class AbsorptionRateProcessor(BaseETLProcessor):
     
     # Calculate absorption rates (element-wise division)
     self.absorption_rates_ts_df = sold_aligned / current_aligned
+
+    # Calculate months of inventory (inverse of absorption rate)
+    self.months_of_inventory_ts_df = current_aligned / sold_aligned
     
     # Handle division by zero and infinity
     self.absorption_rates_ts_df = self.absorption_rates_ts_df.replace([np.inf, -np.inf], np.nan)
+    self.months_of_inventory_ts_df = self.months_of_inventory_ts_df.replace([np.inf, -np.inf], np.nan)
     
     self.logger.info(f"Calculated absorption rates time series: {self.absorption_rates_ts_df.shape}")
-    self.logger.info(f"Months with absorption rates: {list(self.absorption_rates_ts_df.columns)}")
+    self.logger.info(f"Calculated months of inventory time series: {self.months_of_inventory_ts_df.shape}")
+    self.logger.info(f"Months with absorption rates: {list(self.absorption_rates_ts_df.columns)}")    
     
     # Should have fewer or no missing months now
     missing_snapshots = self.sold_counts_ts_df.columns.difference(common_columns)

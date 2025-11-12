@@ -439,6 +439,13 @@ class Datastore:
                   "value": {"type": "float"}
                 }
               },
+              "months_of_inventory": {
+                "type": "nested",
+                "properties": {
+                  "month": {"type": "date", "format": "yyyy-MM"},
+                  "value": {"type": "float"}
+                }
+              },
               "last_mth_median_asking_price": {
                 "type": "nested",
                 "properties": {
