@@ -146,7 +146,12 @@ All ETL processors inherit from `BaseETLProcessor` (abstract base class) which i
 2. **SoldMedianMetricsProcessor**: Calculate 5-year trends (median price, DOM, over/under ask)
 3. **LastMthMetricsProcessor**: Monthly metrics with end-of-month special processing
 4. **CurrentMthMetricsProcessor**: Real-time current month metrics (all provinces, no province filtering)
-5. **AbsorptionRateProcessor**: Calculate market absorption rates
+5. **AbsorptionRateProcessor**: Calculate market absorption rates and months of inventory
+   - **Absorption Rate**: Ratio of sold listings to active inventory (sold/current)
+   - **Months of Inventory**: Inverse metric representing time to clear inventory (current/sold)
+   - Both metrics stored as time series in `rlp_mkt_trends_current` ES index
+   - Handles edge cases: zero sales → absorption_rate=0.0 included, MOI=NaN skipped; zero inventory → absorption_rate=NaN skipped, MOI=0.0 included
+   - Asymmetric arrays supported (different month counts between metrics)
 
 ### Key Design Patterns
 - **Configuration-driven**: Uses YAML config files (prod_config.yaml, uat_config.yaml, config.yaml)
