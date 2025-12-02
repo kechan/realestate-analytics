@@ -9,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from .caching import FileBasedCache
+from realestate_analytics.utils.ims import IMSPropertyTypeMapper
 
 from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import NotFoundError, ConnectionError, RequestError, TransportError
@@ -281,36 +282,14 @@ class Datastore:
       self.cache_dir = Path(self.cache_dir)
       self.cache = FileBasedCache(cache_dir=self.cache_dir)
 
-      # Load IMS property type mapping if exists
-      ims_property_type_mapping_path = self.cache_dir / 'ims_property_type_mapping_v2_df'
-      if ims_property_type_mapping_path.exists():
-        ims_property_mapping_df = pd.read_feather(ims_property_type_mapping_path)
+      # Initialize IMS Property Type Mapper
+      ims_property_type_mapping_path = self.cache_dir / 'ims_property_type_mapping_v4_df'
+      self.ims_mapper = IMSPropertyTypeMapper(cached_mapping_path=ims_property_type_mapping_path)
+      self.logger.info("IMS Property Type Mapper initialized successfully")
 
-        # Create cascading lookup dictionaries
-        self.property_type_lookup_4 = ims_property_mapping_df.set_index(['Type', 'SubType', 'Style', 'Province'])['Inferred'].to_dict()
-        self.property_type_lookup_3 = ims_property_mapping_df.groupby(['Type', 'SubType', 'Style'])['Inferred'].first().to_dict()
-        self.property_type_lookup_2 = ims_property_mapping_df.groupby(['Type', 'SubType'])['Inferred'].first().to_dict()
-        self.property_type_lookup_1 = ims_property_mapping_df.groupby(['Type'])['Inferred'].first().to_dict()
-
-        self.ims_property_mapping_df = ims_property_mapping_df
-
-        self.logger.info("IMS property type mapping loaded successfully")
-      else:
-        self.logger.warning(f"IMS property type mapping file not found in {ims_property_type_mapping_path}.")
-        self.ims_property_mapping_df = pd.DataFrame()
-
-        self.property_type_lookup_4 = {}
-        self.property_type_lookup_3 = {}
-        self.property_type_lookup_2 = {}
-        self.property_type_lookup_1 = {}
-        
     else:
       self.logger.warning('ANALYTICS_CACHE_DIR not set in .env file, not instantiating cache, may cause unexpected errors.')
-      self.ims_property_mapping_df = pd.DataFrame()
-      self.property_type_lookup_4 = {}
-      self.property_type_lookup_3 = {}
-      self.property_type_lookup_2 = {}
-      self.property_type_lookup_1 = {}
+      self.ims_mapper = None
 
     # map from property type to the listingType and searchCategoryType encoding (the rlp_archive_current index)
     # for used in ES querying.
@@ -775,13 +754,21 @@ class Datastore:
     - Maintain same return format as get_sold_listings() for compatibility
     """
     
+    # Validate IMS mapper availability early (before any data processing)
+    if not self.ims_mapper:
+      raise RuntimeError(
+        "IMS Property Type Mapper not initialized. "
+        "IMS sold listings require ANALYTICS_CACHE_DIR to be set in .env and cache directory to exist. "
+        "This method cannot operate without the property type mapper."
+      )
+
     # Apply same default as get_sold_listings
     if start_time is None:
       start_time = datetime.now() - timedelta(days=365)  # one year ago
-    
+
     self.logger.info(f"Fetching IMS sold listings from {start_time} to {end_time if end_time else 'unspecified'}{f' for province {prov_code}' if prov_code else ''}")
     start_process_time = time.time()
-    
+
     # PLACEHOLDER IMPLEMENTATION - Remove when actual IMS implementation is ready
     self.logger.info("PLACEHOLDER: get_ims_sold_listings called - returning empty dataset")
     self.logger.info(f"Parameters: start_time={start_time}, end_time={end_time}, date_field={date_field}, prov_code={prov_code}")
@@ -819,7 +806,19 @@ class Datastore:
       return False, pd.DataFrame()
 
     # When actual data exists, apply property type mapping and transformation
-    raw_ims_data_df['propertyType'] = raw_ims_data_df.apply(self._lookup_property_type, axis=1)
+    # Load data into mapper and generate mappings (updates cache with new combinations)
+    self.ims_mapper.load_dataframe(raw_ims_data_df)
+    self.ims_mapper.generate_full_mapping_dataframe()
+
+    # Apply mappings using vectorized operations (uses updated cache)
+    self.ims_mapper.apply_property_types()
+
+    # Apply AB duplex override (vectorized boolean indexing)
+    ab_duplex_mask = (
+      (raw_ims_data_df['Province'] == 'AB') &
+      ((raw_ims_data_df['SubType'] == 'Duplex') | (raw_ims_data_df['SubType'] == 'Full Duplex'))
+    )
+    raw_ims_data_df.loc[ab_duplex_mask, 'propertyType'] = 'SEMI-DETACHED'
 
     # Transform to canonical format
     canonical_df = rename_ims_to_canonical(raw_ims_data_df, keep_bonus_cols=False)
@@ -1428,24 +1427,6 @@ class Datastore:
         self.logger.error(f"Error removing scroll ID: {e}")
 
 
-  def _lookup_property_type(self, row):
-    """
-    Cascading lookup for property type: try 4-tuple, then 3-tuple, then 2-tuple, then 1-tuple.
-
-    Handles None/NaN values gracefully by safely extracting values using .get() method.
-    """
-    type_val = row.get('Type')
-    subtype_val = row.get('SubType')
-    style_val = row.get('Style')
-    province_val = row.get('Province')
-
-    return (
-      self.property_type_lookup_4.get((type_val, subtype_val, style_val, province_val)) or
-      self.property_type_lookup_3.get((type_val, subtype_val, style_val)) or
-      self.property_type_lookup_2.get((type_val, subtype_val)) or
-      self.property_type_lookup_1.get(type_val) or
-      'UNKNOWN'
-    )
 
 
   def close(self):
