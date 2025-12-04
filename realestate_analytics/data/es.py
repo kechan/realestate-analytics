@@ -679,8 +679,8 @@ class Datastore:
       self._safe_remove_scroll_id(scroll_id)
 
     if not sources:
-      self.logger.info("No sold listings found")
-      return False, pd.DataFrame()
+      self.logger.warning("No sold listings found - this is highly unexpected and should be investigated ASAP")
+      return True, pd.DataFrame()
     
     self.logger.info(f"Fetched {len(sources)} sold listings")
 
