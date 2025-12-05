@@ -214,3 +214,54 @@ def send_etl_failure_alert(job_id: str, stage_statuses: Dict[str, bool]):
     send_email_alert(subject, html_content, sender_email, receiver_emails, email_password)
   except Exception as e:
     logging.error(f"Failed to send ETL email alert: {str(e)}")
+
+
+def send_zero_sold_listings_alert(job_id: str, prov_code: str, start_time, end_time):
+  """
+  Send email alert when zero sold listings are found (highly unexpected scenario).
+
+  This is a warning alert (not a failure) - the ETL continues successfully but
+  devops is notified to investigate potential data issues.
+
+  Args:
+      job_id: The ETL job identifier
+      prov_code: Province code (e.g., 'ON', 'BC')
+      start_time: Start of the query time range
+      end_time: End of the query time range
+  """
+  try:
+    _ = load_dotenv(find_dotenv())
+    sender_email = os.getenv('ANALYTICS_ETL_SENDER_EMAIL')
+    receiver_emails = os.getenv('ANALYTICS_ETL_RECEIVER_EMAILS', '').split(',')
+    email_password = os.getenv('ANALYTICS_ETL_EMAIL_PASSWORD')
+
+    if not sender_email or not email_password or not receiver_emails:
+      logging.warning("Email credentials not configured. Zero sold listings alert not sent.")
+      return
+
+    subject = f"⚠️ URGENT: Zero Sold Listings Detected - {job_id}"
+    html_content = f"""
+    <html>
+      <body>
+        <h2 style="color:orange">⚠️ Zero Sold Listings Alert</h2>
+        <p><strong>Job ID:</strong> {job_id}</p>
+        <p><strong>Province:</strong> {prov_code}</p>
+        <p><strong>Time Range:</strong> {start_time} to {end_time}</p>
+        <p><strong>Status:</strong> <span style="color:orange">WARNING</span> (ETL continues, but investigation needed)</p>
+        <p>No sold listings were found in the specified time range. This is highly unexpected and should be investigated immediately.</p>
+        <h3>Possible Causes:</h3>
+        <ul>
+          <li>Data ingestion pipeline failure</li>
+          <li>Elasticsearch index issues</li>
+          <li>Query filter problems</li>
+          <li>Legitimately quiet period (rare)</li>
+        </ul>
+        <p><strong>Action Required:</strong> Check ES index health and data ingestion status ASAP.</p>
+      </body>
+    </html>
+    """
+
+    send_email_alert(subject, html_content, sender_email, receiver_emails, email_password)
+    logging.info("Zero sold listings alert email sent successfully")
+  except Exception as e:
+    logging.error(f"Failed to send zero sold listings alert: {e}")

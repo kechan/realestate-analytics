@@ -282,7 +282,12 @@ class NearbyComparableSoldsProcessor(BaseETLProcessor):
             raise ValueError("Failed to retrieve delta sold listings")
             
           self.logger.info(f'Loaded {len(delta_sold_listing_df)} sold listings from {start_time} to {end_time}')
-        
+
+          # Send email alert if zero sold listings found (highly unexpected)
+          if len(delta_sold_listing_df) == 0:
+            from .run_utils import send_zero_sold_listings_alert
+            send_zero_sold_listings_alert(self.job_id, self.prov_code, start_time, end_time)
+
         # Get the current ACTIVE listings
         if force_full_load_current:
           start_time = datetime(1970, 1, 1)     # distant past for full load of active listings
