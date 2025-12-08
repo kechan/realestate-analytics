@@ -76,6 +76,7 @@ python scripts/run_current_mth_metrics.py --config scripts/prod_config.yaml
   - `constants.py`: Project constants (VALID_PROVINCES, etc.)
   - `geo.py`: Geographic utility functions
   - `archive.py`: Archive-related utilities
+  - `ims.py`: IMS Property Type Mapper for classifying IMS sold listings
 
 - **realestate_analytics/visualization/**: Visualization tools
   - `geo_viz.py`: Geographic visualizations
@@ -222,6 +223,126 @@ ANALYTICS_ETL_EMAIL_PASSWORD=your-email-password
    - Data retrieved from Elasticsearch
    - Optional caching via dependency injection
    - GeoCollection provides geographic context
+
+### IMS Data Processing (Integrated MLS System)
+
+The IMS (Integrated MLS System) dataset provides sold listings across all Canadian provinces with different field mappings than the legacy RLP system. Processing IMS data requires specialized property type classification and data transformation.
+
+#### IMSPropertyTypeMapper
+
+**Purpose**: Classifies IMS property types from (Type, SubType, Style) combinations into canonical categories: CONDO, SEMI-DETACHED, TOWNHOUSE, DETACHED, MOBILE_MINI, LAND_VACANT, COMMERCIAL, OTHER, or UNCLEAR.
+
+**Location**: `realestate_analytics/utils/ims.py`
+
+**Key Features**:
+- **Cache-first strategy**: Loads cached mappings from `{ANALYTICS_CACHE_DIR}/ims_property_type_mapping_v4_df` (feather format)
+- **Vectorized operations**: Replaces slow row-by-row apply() with pandas vectorized lookups for performance
+- **UNCLEAR logging**: Automatically logs ambiguous property type combinations to CSV for manual review
+- **Regression protection**: Prevents accidental changes to previously correct mappings when improving classification logic
+- **Provincial overrides**: Base mapper handles generic classification; provincial exceptions (e.g., AB duplex → SEMI-DETACHED) applied separately in es.py
+
+**Usage Pattern**:
+```python
+# Initialized automatically in Datastore.__init__()
+ims_mapper = IMSPropertyTypeMapper(cached_mapping_path=cache_dir / 'ims_property_type_mapping_v4_df')
+
+# Load IMS data and generate/update mappings
+ims_mapper.load_dataframe(raw_ims_df)
+ims_mapper.generate_full_mapping_dataframe()  # Updates cache with new combinations
+
+# Apply mappings using vectorized operations
+ims_mapper.apply_property_types()  # Adds 'propertyType' column to raw_ims_df
+
+# Apply provincial overrides (example: AB duplex)
+raw_ims_df.loc[ab_duplex_mask, 'propertyType'] = 'SEMI-DETACHED'
+```
+
+**UNCLEAR Mappings Review**:
+- **File**: `{ANALYTICS_CACHE_DIR}/unclear_mappings.csv`
+- **Columns**: Type, SubType, Style, Count, City, Province
+- **Sorting**: By Count (descending) - most common combinations first
+- **Behavior**:
+  - Automatically updated when `generate_full_mapping_dataframe()` runs
+  - Merges with existing CSV (deduplicates, keeps higher counts)
+  - Never shrinks - accumulates UNCLEAR items over time for review
+- **Purpose**: Manual review to improve classification rules or add edge cases
+
+**Development Workflow**:
+1. Improve `suggest_mapping()` logic in `ims.py`
+2. Use `refresh_unclear_mappings()` to re-evaluate UNCLEAR items
+3. Validate no regressions occurred to non-UNCLEAR mappings
+4. Review changes and save updated cache with `save_mapping()`
+
+**Cache Format**:
+- **Format**: Feather (pandas fast binary format)
+- **Version**: v4 (current)
+- **Columns**: Type, SubType, Style, Count, Inferred
+- **Uniqueness**: (Type, SubType, Style) combinations are unique
+- **Preservation**: Cache never shrinks - all historical combinations preserved even if not in current data
+
+#### IMS Data Preprocessing
+
+**Entry Point**: `Datastore.get_ims_sold_listings()` in `realestate_analytics/data/es.py`
+
+**Preprocessing Steps**:
+
+1. **Validation**: `validate_ims_columns(raw_ims_df)` checks for required columns:
+   - Date/Price: WrittenDate, SoldPrice, ListPrice
+   - Location: Latitude, Longitude, City, Community, Province
+   - Identifiers: MLSNumber, MLSID
+   - Metrics: DaysOnMarket, Bedrooms, Baths
+   - Property Type Fields: Type, SubType, Style
+
+2. **Property Type Classification**:
+   ```python
+   ims_mapper.load_dataframe(raw_ims_df)
+   ims_mapper.generate_full_mapping_dataframe()  # Updates cache + logs UNCLEAR to CSV
+   ims_mapper.apply_property_types()  # Adds propertyType column
+   ```
+
+3. **Provincial Overrides** (applied after base classification):
+   ```python
+   # Alberta duplex exception: Duplex/Full Duplex → SEMI-DETACHED (not OTHER)
+   ab_duplex_mask = (
+     (raw_ims_df['Province'] == 'AB') &
+     ((raw_ims_df['SubType'] == 'Duplex') | (raw_ims_df['SubType'] == 'Full Duplex'))
+   )
+   raw_ims_df.loc[ab_duplex_mask, 'propertyType'] = 'SEMI-DETACHED'
+   ```
+
+4. **Field Mapping**: `rename_ims_to_canonical(raw_ims_df)` transforms IMS schema to canonical format:
+   - **IMS → Canonical mappings**:
+     - WrittenDate → lastTransition
+     - SoldPrice → soldPrice
+     - ListPrice → price
+     - Latitude → lat, Longitude → lng
+     - DaysOnMarket → daysOnMarket (converted to float64)
+     - MLSNumber → mls
+     - City → city, Community → neighbourhood
+     - Province → provState
+     - Bedrooms → bedsInt, Baths → bathsInt
+
+   - **Constructed fields**:
+     - `_id`: Constructed as `{province}-{MLSID}-{MLSNumber}` (lowercase)
+     - `beds`, `baths`: String versions of bedsInt/bathsInt for legacy compatibility
+     - `listingStatus`: Hardcoded as "SOLD" for all IMS records
+
+   - **Missing/Placeholder fields**:
+     - `guid`, `computed_guid`: Not available (Boss working on geographic mapping)
+     - `transitions`, `lastUpdate`: Set as None (not used downstream)
+     - `listingType`: None (legacy field, not in IMS)
+     - `searchCategoryType`: None (NOT used in IMS ETL logic - only for legacy RLP)
+
+5. **Output**: Returns canonical DataFrame compatible with existing ETL processors
+
+**Key Differences from Legacy RLP**:
+- **Primary Key**: MLSNumber (instead of ES document ID)
+- **Property Type**: Derived from (Type, SubType, Style, Province) instead of (searchCategoryType, listingType)
+- **Geographic Coverage**: All Canadian provinces (not just GTA)
+- **Data Lag**: Sold listings can arrive up to 1 year after transaction date
+- **Field Names**: Requires preprocessing to match canonical schema
+
+**Current Status**: `get_ims_sold_listings()` is a PLACEHOLDER - returns empty DataFrame until IMS ES index is available. All preprocessing logic is implemented and ready for activation.
 
 ### Testing Framework
 - Uses Python's built-in `unittest` framework
