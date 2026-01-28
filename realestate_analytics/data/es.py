@@ -110,23 +110,22 @@ def rename_ims_to_canonical(ims_df: pd.DataFrame,
   Returns:
     DataFrame with canonical column names and correct dtypes
 
-  Canonical columns expected (excluding property type fields):
+  Canonical columns expected:
     lng, provState, city, transitions, daysOnMarket, bedsInt, baths, mls,
     neighbourhood, price, soldPrice, listingStatus, guid, lastTransition,
-    beds, lat, bathsInt, _id, lastUpdate, computed_guid
-
-  Property type fields (handled separately):
+    beds, lat, bathsInt, _id, lastUpdate,
     listingType, searchCategoryType, propertyType
 
   Notes:
-    - _id is constructed as {province}-{MLSID}-{MLSNumber} (lowercase)
-    - guid field is not in IMS data (Boss working on mapping)
+    - _id is constructed as {province}-{mlsid}-{mlsnumber}-{year} (lowercase, 4 parts)
+    - guid field is populated during bulk import via MultiPassGUIDResolver
     - listingStatus hardcoded as "SOLD" for all IMS records
     - transitions and lastUpdate set as None (not used downstream)
     - beds/baths are string versions of bedsInt/bathsInt (legacy compatibility)
     - daysOnMarket converted to float64 (allows averaging and NaN values)
-    - searchCategoryType remains None (NOT used in IMS ETL logic)
-    - Property type fields will be added by separate derivation logic
+    - listingType set as None (legacy field, not in IMS)
+    - searchCategoryType set as None (NOT used in IMS ETL logic)
+    - propertyType should already exist in input (populated during bulk import via ims_mapper)
     - For memory efficiency with large datasets, this function modifies the input DataFrame
       and returns a view with only canonical columns when keep_bonus_cols=False
 
@@ -140,8 +139,24 @@ def rename_ims_to_canonical(ims_df: pd.DataFrame,
     ...     'Province': ['ON']
     ... })
     >>> canonical_df = rename_ims_to_canonical(ims_df, keep_bonus_cols=False)
-    >>> print(canonical_df['_id'].iloc[0])  # 'on-1-12345'
+    >>> print(canonical_df['_id'].iloc[0])  # 'on-1-12345-2024'
   """
+
+  # Step 0: Preserve ES _id if already present; otherwise construct from IMS fields
+  if '_id' not in ims_df.columns:
+    if all(col in ims_df.columns for col in ['Province', 'MLSID', 'MLSNumber', 'WrittenDate']):
+      # Extract year from WrittenDate (YYYY-MM-DD format)
+      written_date_str = ims_df['WrittenDate'].astype(str)
+      year = written_date_str.str[:4]  # Extract YYYY
+
+      ims_df['_id'] = (
+        ims_df['Province'].str.lower() + '-' +
+        ims_df['MLSID'].astype(str).str.lower() + '-' +
+        ims_df['MLSNumber'].astype(str).str.lower() + '-' +
+        year.fillna('unknown')
+      )
+    else:
+      ims_df['_id'] = None
 
   # Step 1: Direct column renames (IMS name → canonical name)
   # Using inplace=True to modify the DataFrame directly without creating a copy
@@ -175,35 +190,32 @@ def rename_ims_to_canonical(ims_df: pd.DataFrame,
   if 'daysOnMarket' in ims_df.columns:
     ims_df['daysOnMarket'] = ims_df['daysOnMarket'].astype(float)
 
-  # Step 3: Construct primary key _id = {province}-{MLSID}-{MLSNumber}
-  if all(col in ims_df.columns for col in ['provState', 'MLSID', 'mls']):
-    ims_df['_id'] = ims_df['provState'].str.lower() + '-' + ims_df['MLSID'].astype(str) + '-' + ims_df['mls'].str.lower()
-  else:
-    ims_df['_id'] = None
-
-  # Step 4: Add missing fields with default values
+  # Step 3: Add missing fields with default values
 
   # listingStatus - all IMS records are sold
   ims_df['listingStatus'] = 'SOLD'
 
-  # guid - not available yet (Boss working on geographic mapping)
-  ims_df['guid'] = None
-  ims_df['computed_guid'] = None
+  # guid - preserve from ES (populated during bulk import via MultiPassGUIDResolver)
+  # Only set to None if missing from input
+  if 'guid' not in ims_df.columns:
+    ims_df['guid'] = None
 
   # transitions - not used downstream, set as None
-  ims_df['transitions'] = None
+  if 'transitions' not in ims_df.columns:
+    ims_df['transitions'] = None
 
   # lastUpdate - not critical, set as None
-  ims_df['lastUpdate'] = None
+  if 'lastUpdate' not in ims_df.columns:
+    ims_df['lastUpdate'] = None
 
-  # Step 5: Property type fields (will be populated by derivation logic later)
-  # These are placeholders - actual values computed by property type mapper
+  # Step 5: Property type fields
+  # propertyType should already exist in ims_df (populated during bulk import via ims_mapper)
+  # If not present, it will be None (but this indicates missing preprocessing)
   ims_df['listingType'] = None  # Legacy field, not directly in IMS
   ims_df['searchCategoryType'] = None  # Legacy field, NOT USED in IMS ETL logic
-  # ims_df['propertyType'] = None  # Will be derived from Type/SubType/Style/Province
 
   # Note: searchCategoryType is only used in legacy derive_property_type() function.
-  # For IMS, propertyType is derived directly from (Type, SubType, Style, Province).
+  # For IMS, propertyType is already populated in ES index during bulk import.
   # searchCategoryType can remain None and is NOT referenced in any IMS ETL logic.
 
   # Step 6: Drop bonus/extra IMS columns to save memory
@@ -218,10 +230,11 @@ def rename_ims_to_canonical(ims_df: pd.DataFrame,
       'listingType', 'searchCategoryType', 'propertyType'
     ]
 
-    # Keep only canonical columns that exist in the dataframe
-    # This creates a new DataFrame with only the columns we need, dropping all IMS-specific columns
-    cols_to_keep = [col for col in canonical_cols if col in ims_df.columns]
-    return ims_df[cols_to_keep]
+    # Drop non-canonical columns in-place to avoid returning a view/slice
+    cols_to_drop = [col for col in ims_df.columns if col not in canonical_cols]
+    if cols_to_drop:
+      ims_df.drop(columns=cols_to_drop, inplace=True)
+    return ims_df
 
   return ims_df
 
@@ -250,6 +263,10 @@ class Datastore:
     # used in SoldMedianMetricsProcessor
     self.mkt_trends_index_name = "rlp_mkt_trends_current"
 
+    # for IMS (Integrated MLS System) sold listings across all Canadian provinces
+    # stores raw IMS data with computed propertyType field
+    self.ims_sold_listing_index_name = 'rlp_ims_sold_listing_current'
+
     if not self.ping():
       self.logger.error(f"Unable to connect to ES at {host}:{port}")
       # raise Exception("Unable to connect to Elasticsearch.")
@@ -271,6 +288,11 @@ class Datastore:
       except NotFoundError:
         self.logger.warning(f"Index '{self.mkt_trends_index_name}' not found.")
 
+      try:
+        self.ims_sold_listing_index_mapping = self.get_mapping(index=self.ims_sold_listing_index_name)
+      except NotFoundError:
+        self.logger.warning(f"Index '{self.ims_sold_listing_index_name}' not found.")
+
     except ConnectionError as e:
       self.logger.error(f"Error connecting to ES at {host}:{port} mappings not retrieved.")
 
@@ -283,13 +305,16 @@ class Datastore:
       self.cache = FileBasedCache(cache_dir=self.cache_dir)
 
       # Initialize IMS Property Type Mapper
-      ims_property_type_mapping_path = self.cache_dir / 'ims_property_type_mapping_v4_df'
-      self.ims_mapper = IMSPropertyTypeMapper(cached_mapping_path=ims_property_type_mapping_path)
+      self.ims_property_type_mapping_path = self.cache_dir / 'ims_property_type_mapping_v4_df'
+      self.ims_mapper = IMSPropertyTypeMapper(cached_mapping_path=self.ims_property_type_mapping_path)
       self.logger.info("IMS Property Type Mapper initialized successfully")
 
     else:
       self.logger.warning('ANALYTICS_CACHE_DIR not set in .env file, not instantiating cache, may cause unexpected errors.')
       self.ims_mapper = None
+
+    # Initialize GeoCollection for GUID resolution (lazy-loaded)
+    self.geo_collection = None  # Loaded on-demand by bulk_import_ims_sold_listings()
 
     # map from property type to the listingType and searchCategoryType encoding (the rlp_archive_current index)
     # for used in ES querying.
@@ -348,6 +373,43 @@ class Datastore:
         elif 'uat' in name.lower():
           return 'UAT'
     return 'Unknown'
+
+  def _ensure_geo_collection(self):
+    """Lazy-load GeoCollection for GUID resolution (heavy operation)."""
+    if self.geo_collection is None:
+      from realestate_analytics.data.geo import GeoCollection
+
+      geo_cache_path = self.cache_dir / 'geo_collection.dill'
+
+      # Try loading from cache first
+      if geo_cache_path.exists():
+        try:
+          self.logger.info(f"Loading GeoCollection from cache: {geo_cache_path}")
+          print(f"Loading GeoCollection from cache: {geo_cache_path}")
+          self.geo_collection = GeoCollection.load(geo_cache_path, use_dill=True)
+          self.logger.info(f"Loaded {len(self.geo_collection)} geos from cache")
+          return self.geo_collection
+        except Exception as e:
+          self.logger.warning(f"Failed to load geo_collection from cache: {e}")
+          self.logger.info("Falling back to loading from datastore...")
+
+      # Fall back to loading from ES
+      self.logger.info("Loading GeoCollection from datastore...")
+      self.geo_collection = GeoCollection.from_datastore(
+        self,
+        require_details=False,  # Include geos without details
+        fix_relationships=True   # CRITICAL: enables parent-child relationships (100x performance)
+      )
+      self.logger.info(f"Loaded {len(self.geo_collection)} geos from datastore")
+
+      # Save to cache for next time
+      try:
+        self.geo_collection.save(geo_cache_path, use_dill=True)
+        self.logger.info(f"Saved geo_collection to cache: {geo_cache_path}")
+      except Exception as e:
+        self.logger.warning(f"Failed to save geo_collection to cache: {e}")
+
+    return self.geo_collection
 
   def get_alias(self) -> Dict:
     """
@@ -494,6 +556,484 @@ class Datastore:
     else:
       self.logger.info(f"Alias '{alias_name}' already exists.")
 
+  def create_ims_sold_listing_index(self):
+    """
+    Create the IMS sold listings index with versioned name and alias.
+
+    Index stores raw IMS (Integrated MLS System) sold listings from all Canadian provinces.
+    Documents use format: {province_code}-{mlsid}-{mlsnumber}-{year} (e.g., on-20-w12193397-2024)
+
+    The schema includes:
+    - Core transaction fields (WrittenDate, SoldPrice, ListPrice, DaysOnMarket)
+    - Geographic fields (Latitude, Longitude, City, Community, Province, guid)
+    - Property characteristics (Bedrooms, Baths, Type, SubType, Style, propertyType)
+    - Context fields (MLSNumber, MLSID, Address, PostalCode, etc.)
+    - Optional fields (SoldOverAsk, SquareFoot, YearBuilt, Garage)
+    - System field (last_updated)
+
+    Note: WrittenDate uses "yyyy-MM-dd" format (date only). Bulk import code must
+    convert IMS datetime strings (e.g., "2024-01-01T00:00:00") to date-only format.
+    """
+    index_name = "rlp_ims_sold_listing_1"
+    alias_name = self.ims_sold_listing_index_name
+
+    index_schema = {
+      "mappings": {
+        "properties": {
+          # Core Transaction Fields
+          "WrittenDate": {"type": "date", "format": "yyyy-MM-dd"},
+          "ListingDate": {"type": "date", "format": "yyyy-MM-dd"},
+          "Province": {"type": "keyword"},
+          "SoldPrice": {"type": "float"},
+          "ListPrice": {"type": "float"},
+          "DaysOnMarket": {"type": "integer"},
+          
+          # Geographic Fields
+          "Latitude": {"type": "float"},
+          "Longitude": {"type": "float"},
+          "City": {"type": "keyword"},
+          "FSACity": {"type": "keyword"},
+          "County": {"type": "keyword"},
+          "CityProvince": {"type": "keyword"},
+          "Community": {"type": "text"},
+          "District": {"type": "keyword"},
+          "Country": {"type": "keyword"},
+          "PostalCode": {"type": "keyword"},
+          "FSA": {"type": "keyword"},
+          "guid": {"type": "text"},
+          
+          # Property Characteristics
+          "Bedrooms": {"type": "integer"},
+          "Baths": {"type": "float"},
+          "Type": {"type": "keyword"},
+          "SubType": {"type": "text"},
+          "Style": {"type": "text"},
+          "SquareFoot": {"type": "integer"},
+          "YearBuilt": {"type": "keyword"},
+          "Garage": {"type": "integer"},
+          "CLASA": {"type": "keyword"},
+          "propertyType": {"type": "keyword"},
+          
+          # Computed/Bonus Fields
+          "SoldOverAsk": {"type": "boolean"},
+          "ListingSellingPriceDiff": {"type": "float"},
+          "ListPricePercentOfSold": {"type": "keyword"},
+          "SoldPricePercentOfList": {"type": "keyword"},
+          "IsLuxuryListed": {"type": "boolean"},
+          "IsLuxurySold": {"type": "boolean"},
+          
+          # Identifiers
+          "MLSNumber": {"type": "keyword"},
+          "MLSID": {"type": "keyword"},
+          "Address": {"type": "text"},
+          
+          # System Fields
+          "last_updated": {"type": "date"}
+        }
+      }
+    }
+
+    # Create the index if it doesn't already exist
+    if not self.es.indices.exists(index=index_name):
+      self.es.indices.create(index=index_name, body=index_schema)
+      self.logger.info(f"Index '{index_name}' created successfully.")
+    else:
+      self.logger.info(f"Index '{index_name}' already exists.")
+
+    # Check if the alias already exists
+    if not self.es.indices.exists_alias(name=alias_name):
+      self.es.indices.put_alias(index=index_name, name=alias_name)
+      self.logger.info(f"Alias '{alias_name}' created for index '{index_name}'.")
+    else:
+      self.logger.info(f"Alias '{alias_name}' already exists.")
+
+  def delete_ims_sold_listing_index(self):
+    """
+    Delete the IMS sold listings index and its alias.
+
+    This is a destructive operation that removes:
+    1. The alias (rlp_ims_sold_listing_current)
+    2. The versioned index (rlp_ims_sold_listing_1) and all its data
+
+    Use with caution - this cannot be undone.
+    """
+    index_name = "rlp_ims_sold_listing_1"
+    alias_name = self.ims_sold_listing_index_name
+
+    # Delete alias first (if it exists)
+    if self.es.indices.exists_alias(name=alias_name):
+      # Need to get the index that the alias points to
+      alias_info = self.es.indices.get_alias(name=alias_name)
+      indices_with_alias = list(alias_info.keys())
+
+      for idx in indices_with_alias:
+        self.es.indices.delete_alias(index=idx, name=alias_name)
+        self.logger.info(f"Alias '{alias_name}' deleted from index '{idx}'.")
+    else:
+      self.logger.info(f"Alias '{alias_name}' does not exist, skipping alias deletion.")
+
+    # Delete the versioned index (if it exists)
+    if self.es.indices.exists(index=index_name):
+      self.es.indices.delete(index=index_name)
+      self.logger.info(f"Index '{index_name}' deleted successfully.")
+    else:
+      self.logger.info(f"Index '{index_name}' does not exist, skipping index deletion.")
+
+  def bulk_import_ims_sold_listings(
+      self,
+      csv_path: Path,
+      batch_size: int = 500
+  ) -> Tuple[int, List[dict]]:
+    """
+    Bulk import IMS sold listings from CSV file.
+
+    Args:
+        csv_path: Path to IMS CSV file with columns matching IMS schema
+        batch_size: Number of documents per batch (default 500)
+
+    Returns:
+        Tuple of (success_count, failed_list) where:
+        - success_count: Number of successfully indexed documents
+        - failed_list: List of error dictionaries for failed operations
+
+    CSV Required Columns:
+        MLSNumber, MLSID, Province, WrittenDate (required for document ID)
+        SoldPrice, ListPrice, DaysOnMarket, Latitude, Longitude, City,
+        Type, SubType, Style, Address, PostalCode, FSA, District,
+        Community, Bedrooms, Baths, Country, SoldOverAsk,
+        ListingSellingPriceDiff, SquareFoot, YearBuilt, Garage
+
+    Document ID Format:
+        {province}-{mlsid}-{mlsnumber}-{year} (all lowercase)
+        Year is extracted from WrittenDate column
+        Example: "on-20-w12193397-2024"
+
+    Note:
+        - WrittenDate in CSV is "YYYY-MM-DDTHH:MM:SS" format, converted to "YYYY-MM-DD"
+        - Year for document ID is parsed from WrittenDate
+        - guid field is populated via MultiPassGUIDResolver (three-pass strategy)
+        - propertyType is populated via IMSPropertyTypeMapper with provincial overrides
+        - Numeric fields are safely coerced (invalid string values become None)
+        - Invalid numeric strings (e.g., "N/A", "$1,234", "--") converted to None
+        - Uses upsert behavior (updates existing, creates new)
+    """
+    self.logger.info(f"Starting bulk import from: {csv_path}")
+
+    # Check if file exists
+    if not csv_path.exists():
+      self.logger.error(f"CSV file not found: {csv_path}")
+      return 0, [{"error": f"File not found: {csv_path}"}]
+
+    # Read CSV
+    try:
+      df = pd.read_csv(csv_path)
+      self.logger.info(f"Loaded {len(df)} rows from CSV")
+    except Exception as e:
+      self.logger.error(f"Error reading CSV: {e}")
+      return 0, [{"error": f"Failed to read CSV: {str(e)}"}]
+
+    # Check if DataFrame is empty
+    if df.empty:
+      self.logger.warning("CSV is empty, nothing to import")
+      return 0, []
+
+    # Validate required columns exist
+    required_columns = [
+      'MLSNumber', 'MLSID', 'Province', 'WrittenDate',  # Required for document ID
+      'SoldPrice', 'ListPrice', 'DaysOnMarket',  # Core transaction fields
+      'Latitude', 'Longitude', 'City',  # Geographic fields
+      'Type', 'SubType', 'Style',  # Property type fields
+      'Bedrooms', 'Baths',  # Property characteristics
+      'Address', 'PostalCode', 'FSA', 'District', 'Community',  # Context fields
+      'Country', 'SoldOverAsk', 'ListingSellingPriceDiff',  # Optional fields
+      'SquareFoot', 'YearBuilt', 'Garage'  # Bonus fields
+    ]
+
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+      error_msg = f"Missing required columns in CSV: {missing_columns}"
+      self.logger.error(error_msg)
+      return 0, [{"error": error_msg}]
+
+    # Pre-convert numeric columns to handle invalid string values safely
+    # Using pd.to_numeric with errors='coerce' converts invalid values to NaN
+    numeric_columns = {
+      'SoldPrice': float,
+      'ListPrice': float,
+      'DaysOnMarket': int,
+      'Latitude': float,
+      'Longitude': float,
+      'Bedrooms': int,
+      'Baths': float,  # Float to support fractional bathrooms (e.g., 1.5, 2.5)
+      'SquareFoot': int,
+      'Garage': int,
+      'ListingSellingPriceDiff': float
+    }
+
+    for col, dtype in numeric_columns.items():
+      if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    self.logger.info("Pre-processed numeric columns for safe conversion")
+
+    # ========== Property Type Mapping ==========
+    # Populate 'propertyType' field using IMSPropertyTypeMapper
+    # This field is required in ES documents (line 840)
+
+    if self.ims_mapper is None:
+      error_msg = (
+        "IMS Property Type Mapper not initialized. "
+        "Set ANALYTICS_CACHE_DIR in .env file and ensure cache directory exists."
+      )
+      self.logger.error(error_msg)
+      return 0, [{"error": error_msg}]
+
+    self.logger.info("Applying property type mappings to IMS data...")
+    property_type_start = time.time()
+
+    # Step 1: Load DataFrame into mapper
+    self.ims_mapper.load_dataframe(df)
+
+    # Step 2: Generate full mapping DataFrame (uses cache-first strategy)
+    # This updates cache with new (Type, SubType, Style) combinations
+    self.ims_mapper.generate_full_mapping_dataframe()
+
+    # Step 3: Apply property types using vectorized lookup
+    # Adds 'propertyType' column to df in-place
+    self.ims_mapper.apply_property_types()
+
+    # Step 4: Apply provincial overrides (AB duplex exception)
+    # Alberta business rule: Duplex → SEMI-DETACHED (not OTHER)
+    ab_duplex_mask = (
+      (df['Province'] == 'AB') &
+      ((df['SubType'] == 'Duplex') | (df['SubType'] == 'Full Duplex') | 
+       (df['SubType'] == 'Half Duplex') | (df['SubType'] == 'Duplex Side By Side'))
+    )
+    if ab_duplex_mask.any():
+      override_count = ab_duplex_mask.sum()
+      df.loc[ab_duplex_mask, 'propertyType'] = 'SEMI-DETACHED'
+      self.logger.info(f"Applied AB duplex override to {override_count:,} listings")
+
+    # Step 5: Save updated mapping cache (persists new combinations)
+    # This ensures future runs don't need to re-compute these mappings
+    try:
+      self.ims_mapper.save_mapping()
+      self.logger.info("Saved updated property type mapping cache")
+    except Exception as e:
+      self.logger.warning(f"Failed to save mapping cache: {e}")
+      # Non-fatal - continue with bulk import
+
+    property_type_elapsed = time.time() - property_type_start
+    self.logger.info(f"Property type mapping completed in {property_type_elapsed:.2f}s")
+
+    # Verify propertyType column exists
+    if 'propertyType' not in df.columns:
+      error_msg = "Property type mapping failed - 'propertyType' column not created"
+      self.logger.error(error_msg)
+      return 0, [{"error": error_msg}]
+
+    # Log property type distribution
+    property_type_counts = df['propertyType'].value_counts()
+    self.logger.info(f"Property type distribution:\n{property_type_counts}")
+
+    # ========== GUID Resolution ==========
+    # Populate 'guid' field using MultiPassGUIDResolver
+    # Uses three-pass strategy: city name matching → polygon containment → LocalLogic API
+
+    self.logger.info("Resolving GUIDs for IMS listings...")
+    guid_start = time.time()
+
+    # Lazy-load GeoCollection (heavy operation, ~10-20 seconds)
+    geo_collection = self._ensure_geo_collection()
+
+    # Initialize resolver with checkpoint directory
+    # Checkpoints enable resume if job is interrupted
+    checkpoint_dir = self.cache_dir / 'ims_guid_resolution_checkpoints'
+
+    from realestate_analytics.utils.ims import MultiPassGUIDResolver
+
+    resolver = MultiPassGUIDResolver(
+      geo_collection=geo_collection,
+      checkpoint_dir=checkpoint_dir,
+      checkpoint_batch_size=10000,  # Checkpoint every 10,000 listings
+      use_geocoder=False,  # Don't use geocoder since it has bad rate limits
+      geocoder_min_interval_sec=3.0,  # Rate limiting (2,500 requests/day limit)
+      logger=self.logger
+    )
+
+    # Apply multi-pass GUID resolution
+    # Modifies df in-place, adds 'guid' column and updates coordinates
+    # CRITICAL: GUID resolution failures will halt processing with detailed diagnostics
+    df = resolver.resolve(df, show_progress=True)
+
+    # Log resolution statistics
+    guid_resolved = df['guid'].notna().sum()
+    guid_total = len(df)
+    guid_rate = (guid_resolved / guid_total * 100) if guid_total > 0 else 0
+
+    self.logger.info(f"GUID resolution: {guid_resolved:,}/{guid_total:,} listings ({guid_rate:.1f}%)")
+
+    guid_elapsed = time.time() - guid_start
+    self.logger.info(f"GUID resolution completed in {guid_elapsed:.2f}s")
+
+    # ========== Pre-Import Validation ==========
+    # Verify required columns exist before bulk indexing
+
+    required_for_import = ['propertyType', 'guid']
+    missing = [col for col in required_for_import if col not in df.columns]
+
+    if missing:
+      error_msg = f"Missing required columns for bulk import: {missing}"
+      self.logger.error(error_msg)
+      return 0, [{"error": error_msg}]
+
+    self.logger.info(f"DataFrame prepared for bulk import: {len(df):,} listings, {len(df.columns)} columns")
+
+    def generate_actions():
+      """Generator that yields ES bulk action dictionaries"""
+      def to_bool(value):
+        """Coerce truthy/falsy strings/numbers to bool, otherwise None."""
+        if pd.isna(value):
+          return None
+        if isinstance(value, bool):
+          return value
+        if isinstance(value, (int, float)):
+          return bool(int(value))
+        if isinstance(value, str):
+          val = value.strip().lower()
+          if val in ('true', '1', 'yes', 'y'):
+            return True
+          if val in ('false', '0', 'no', 'n'):
+            return False
+        return None
+
+      for _, row in tqdm(df.iterrows(), total=len(df), desc="Preparing documents"):
+        # Extract date and year from WrittenDate (convert "2024-01-01T00:00:00" to "2024-01-01" and extract year)
+        written_date_raw = row.get('WrittenDate', '')
+        written_date = None
+        year = None
+
+        if pd.notna(written_date_raw):
+          written_date_str = str(written_date_raw)
+          # Extract date part (before 'T' if present)
+          if 'T' in written_date_str:
+            written_date = written_date_str.split('T')[0]
+          else:
+            written_date = written_date_str
+
+          # Extract year from date (format: YYYY-MM-DD)
+          try:
+            year = written_date.split('-')[0] if written_date else None
+          except (IndexError, AttributeError):
+            year = None
+
+        # Extract date part for ListingDate if present
+        listing_date_raw = row.get('ListingDate', '')
+        listing_date = None
+        if pd.notna(listing_date_raw):
+          listing_date_str = str(listing_date_raw)
+          if 'T' in listing_date_str:
+            listing_date = listing_date_str.split('T')[0]
+          else:
+            listing_date = listing_date_str
+
+        # Construct document ID: {province}-{mlsid}-{mlsnumber}-{year} (lowercase)
+        doc_id = (
+          f"{str(row.get('Province', '')).lower()}-"
+          f"{str(row.get('MLSID', '')).lower()}-"
+          f"{str(row.get('MLSNumber', '')).lower()}-"
+          f"{year if year else 'unknown'}"
+        )
+
+        # Build document source with all fields
+        doc_source = {
+          # Core Transaction Fields
+          "WrittenDate": written_date,
+          "ListingDate": listing_date if listing_date else None,
+          "Province": row.get('Province'),
+          "SoldPrice": row.get('SoldPrice') if pd.notna(row.get('SoldPrice')) else None,
+          "ListPrice": row.get('ListPrice') if pd.notna(row.get('ListPrice')) else None,
+          "DaysOnMarket": int(row.get('DaysOnMarket')) if pd.notna(row.get('DaysOnMarket')) else None,
+
+          # Geographic Fields
+          "Latitude": row.get('Latitude') if pd.notna(row.get('Latitude')) else None,
+          "Longitude": row.get('Longitude') if pd.notna(row.get('Longitude')) else None,
+          "City": row.get('City'),
+          "FSACity": row.get('FSACity') if pd.notna(row.get('FSACity')) else None,
+          "County": row.get('County') if pd.notna(row.get('County')) else None,
+          "CityProvince": row.get('CityProvince') if pd.notna(row.get('CityProvince')) else None,
+          "Community": row.get('Community') if pd.notna(row.get('Community')) else None,
+          "guid": row.get('guid') if pd.notna(row.get('guid')) else None,
+          "PostalCode": row.get('PostalCode') if pd.notna(row.get('PostalCode')) else None,
+          "FSA": row.get('FSA') if pd.notna(row.get('FSA')) else None,
+          "District": row.get('District') if pd.notna(row.get('District')) else None,
+          "Country": row.get('Country', 'Canada'),
+
+          # Property Characteristics (raw values, not computed)
+          "Bedrooms": int(row.get('Bedrooms')) if pd.notna(row.get('Bedrooms')) else None,
+          "Baths": row.get('Baths') if pd.notna(row.get('Baths')) else None,
+          "Type": row.get('Type'),
+          "SubType": row.get('SubType') if pd.notna(row.get('SubType')) else None,
+          "Style": row.get('Style') if pd.notna(row.get('Style')) else None,
+          "SquareFoot": int(row.get('SquareFoot')) if pd.notna(row.get('SquareFoot')) else None,
+          "YearBuilt": str(row.get('YearBuilt')) if pd.notna(row.get('YearBuilt')) else None,
+          "Garage": int(row.get('Garage')) if pd.notna(row.get('Garage')) else None,
+          "CLASA": row.get('CLASA') if pd.notna(row.get('CLASA')) else None,
+          "propertyType": row.get('propertyType') if pd.notna(row.get('propertyType')) else None,  # Populated by ims_mapper before bulk import
+
+          # Context Fields
+          "MLSNumber": row.get('MLSNumber'),
+          "MLSID": row.get('MLSID'),
+          "Address": row.get('Address') if pd.notna(row.get('Address')) else None,
+
+          # Optional/Bonus Fields
+          "SoldOverAsk": to_bool(row.get('SoldOverAsk')),
+          "ListingSellingPriceDiff": row.get('ListingSellingPriceDiff') if pd.notna(row.get('ListingSellingPriceDiff')) else None,
+          "ListPricePercentOfSold": str(row.get('ListPricePercentOfSold')) if pd.notna(row.get('ListPricePercentOfSold')) else None,
+          "SoldPricePercentOfList": str(row.get('SoldPricePercentOfList')) if pd.notna(row.get('SoldPricePercentOfList')) else None,
+          "IsLuxuryListed": to_bool(row.get('IsLuxuryListed')),
+          "IsLuxurySold": to_bool(row.get('IsLuxurySold')),
+
+          # System Fields
+          "last_updated": datetime.now().isoformat()
+        }
+
+        # Yield bulk action
+        yield {
+          '_op_type': 'index',  # Upsert: update if exists, create if new
+          '_index': self.ims_sold_listing_index_name,
+          '_id': doc_id,
+          '_source': doc_source
+        }
+
+    # Execute bulk operation
+    self.logger.info("Executing bulk index operation...")
+    try:
+      success, failed = bulk(
+        client=self.es,
+        actions=generate_actions(),
+        raise_on_error=False,
+        raise_on_exception=False,
+        chunk_size=batch_size,
+        request_timeout=60
+      )
+    except Exception as e:
+      self.logger.error(f"Bulk operation failed: {e}")
+      return 0, [{"error": f"Bulk operation exception: {str(e)}"}]
+
+    # Log summary
+    total_attempts = success + len(failed)
+    success_rate = (success / total_attempts * 100) if total_attempts > 0 else 0
+
+    self.logger.info(f"Bulk import complete: {success}/{total_attempts} successful ({success_rate:.2f}%)")
+
+    if failed:
+      self.logger.warning(f"{len(failed)} documents failed to index")
+      # Log first few failures for debugging
+      for i, failure in enumerate(failed[:5]):
+        self.logger.warning(f"Sample failure {i+1}: {failure}")
+
+    return success, failed
 
   def get_mapping(self, index: str) -> dict:
     """Retrieve mappings for a specific index."""
@@ -554,6 +1094,10 @@ class Datastore:
     elif index == self.listing_tracking_index_name:
       date_format = '%Y-%m-%dT%H:%M:%S.%f'
       pertinent_time_field = 'addedOn'
+    elif index == self.ims_sold_listing_index_name:
+      # IMS sold listings use date-only WrittenDate (YYYY-MM-DD)
+      date_format = '%Y-%m-%d'
+      pertinent_time_field = 'WrittenDate'
     elif index == self.geo_index_name or index == self.geo_details_en_index_name:
       date_format = None       # TODO: decide later on date range filtering
       pertinent_time_field = None
@@ -712,55 +1256,42 @@ class Datastore:
       self.logger.error(f"Error converting sold listings to DataFrame: {e}")
       return False, pd.DataFrame()
 
-  def get_ims_sold_listings(self, start_time: datetime = None, end_time: datetime = None, 
-                           date_field: str = "lastTransition", selects: List[str] = None, 
+
+  def get_ims_sold_listings(self, start_time: datetime = None, end_time: datetime = None,
+                           date_field: str = "WrittenDate", selects: List[str] = None,
                            prov_code: str = None) -> Tuple[bool, pd.DataFrame]:
     """
-    Query sold listings from the new IMS (Integrated MLS System) dataset.
-    
-    TODO: PLACEHOLDER METHOD - Replace with actual IMS implementation when ES index is ready
-    
-    This method will query the new IMS ES index for sold listings across all Canadian provinces.
+    Query sold listings from the IMS (Integrated MLS System) dataset.
+
+    This method queries the IMS ES index for sold listings across all Canadian provinces.
     The IMS dataset uses different field mappings compared to the current rlp_archive_current index:
     - Primary Key: MLSNumber (instead of ES document ID)
-    - Property Type: Derived from (Type, SubType, Style) instead of (searchCategoryType, listingType)
+    - Property Type: Already populated in ES during bulk import (no runtime derivation needed)
     - Field Mappings: WrittenDate → lastTransition, SoldPrice → soldPrice, etc.
     - Geographic Coverage: All Canadian provinces (not just GTA)
     - Data Lag: Sold listings can arrive up to 1 year after transaction date
-    
+
     Parameters:
     - start_time (datetime, optional): The start of the time range for the search. Defaults to one year ago.
     - end_time (datetime, optional): The end of the time range for the search. Defaults to None (current time).
-    - date_field (str, optional): The field to use for date filtering. Defaults to "lastTransition" 
-                                 (mapped from IMS "WrittenDate" field).
+    - date_field (str, optional): The field to use for date filtering. Defaults to "WrittenDate"
+                                 (IMS native field, will be renamed to lastTransition in output).
     - selects (List[str], optional): List of fields to retrieve. If None, all fields are retrieved.
-                                    Note: Field names should match the current interface for compatibility.
-    - prov_code (str, optional): Province code to filter listings (e.g., 'ON', 'BC', 'AB'). 
+                                    Note: Field names should match the canonical interface for compatibility.
+    - prov_code (str, optional): Province code to filter listings (e.g., 'ON', 'BC', 'AB').
                                 If None, returns data for all provinces.
-    
+
     Returns:
     Tuple[bool, pd.DataFrame]: A tuple containing:
         - A boolean indicating success (True) or failure (False)
         - A DataFrame representing the sold listings with same column structure as get_sold_listings()
-        
-    TODO Implementation Notes:
-    - When IMS ES index is ready, replace this stub with actual Elasticsearch query
-    - Implement field mapping from IMS schema to current interface (e.g., WrittenDate → lastTransition)
-    - Add province filtering using prov_code parameter for performance
-    - Implement new property type derivation logic using (Type, SubType, Style) fields
-    - Handle MLSNumber as primary key instead of ES document ID
-    - Add guid field mapping (depends on Boss's geographic mapping work)
-    - Consider performance optimization for province-specific queries
-    - Maintain same return format as get_sold_listings() for compatibility
+
+    Notes:
+    - propertyType is already populated in ES docs during bulk import (via ims_mapper)
+    - This method does NOT derive property types - it just reads and transforms field names
+    - Province filtering is optional (None = all provinces)
+    - Returns canonical schema (WrittenDate→lastTransition, SoldPrice→soldPrice, etc.)
     """
-    
-    # Validate IMS mapper availability early (before any data processing)
-    if not self.ims_mapper:
-      raise RuntimeError(
-        "IMS Property Type Mapper not initialized. "
-        "IMS sold listings require ANALYTICS_CACHE_DIR to be set in .env and cache directory to exist. "
-        "This method cannot operate without the property type mapper."
-      )
 
     # Apply same default as get_sold_listings
     if start_time is None:
@@ -769,63 +1300,135 @@ class Datastore:
     self.logger.info(f"Fetching IMS sold listings from {start_time} to {end_time if end_time else 'unspecified'}{f' for province {prov_code}' if prov_code else ''}")
     start_process_time = time.time()
 
-    # PLACEHOLDER IMPLEMENTATION - Remove when actual IMS implementation is ready
-    self.logger.info("PLACEHOLDER: get_ims_sold_listings called - returning empty dataset")
-    self.logger.info(f"Parameters: start_time={start_time}, end_time={end_time}, date_field={date_field}, prov_code={prov_code}")
-    self.logger.info("TODO: Replace this stub with actual IMS ES index query when index is available")
+    try:
+      must_clauses = []
 
-    # Return empty dataframe for placeholder
-    raw_ims_data_df = pd.DataFrame()
+      # Property type filter (IMS docs already have propertyType field populated during bulk import)
+      # Filter for the 4 main residential property types
+      must_clauses.append({
+        "terms": {"propertyType": ["CONDO", "SEMI-DETACHED", "TOWNHOUSE", "DETACHED"]}
+      })
 
-    if raw_ims_data_df.empty:
-      self.logger.info("No IMS sold listings found (placeholder)")
-      if selects:
-        # Create empty DataFrame with requested columns
-        empty_df = pd.DataFrame(columns=selects)
+      # Province filter (optional)
+      if prov_code:
+        must_clauses.append({
+          "term": {"Province": prov_code}
+        })
 
-        # Ensure datetime columns have correct dtype
-        if 'lastTransition' in empty_df.columns:
-            empty_df['lastTransition'] = pd.to_datetime(empty_df['lastTransition'])
+      # Date range filter
+      date_format = '%Y-%m-%d'  # IMS WrittenDate format
+      time_range_filter = {
+        "range": {
+          date_field: {
+            "gte": start_time.strftime(date_format)
+          }
+        }
+      }
 
-        # Add _id, propertyType columns if not already in selects (these are added by processing logic)
-        if '_id' not in empty_df.columns:
-            empty_df['_id'] = None
-        if 'propertyType' not in empty_df.columns:
-            empty_df['propertyType'] = None
+      # Add end_time to the query if provided
+      if end_time:
+        time_range_filter["range"][date_field]["lte"] = end_time.strftime(date_format)
 
-        self.logger.info(f"Returning empty DataFrame with {len(empty_df.columns)} columns for province: {prov_code or 'ALL'}")
-        return True, empty_df
-      else:
-        # No selects specified, return completely empty DataFrame
-        self.logger.info(f"Returning empty DataFrame for province: {prov_code or 'ALL'}")
-        return True, pd.DataFrame()
-    
-    is_valid, missing = validate_ims_columns(raw_ims_data_df)
-    if not is_valid:
-      self.logger.error(f"IMS sold listings data is missing required columns: {missing}")
+      must_clauses.append(time_range_filter)
+
+      query_body = {
+        "query": {
+          "bool": {
+            "must": must_clauses
+          }
+        },
+        "_source": True  # Get all fields (we'll apply selects after transformation)
+      }
+      self.logger.debug(f"Constructed query: {query_body}")
+
+      scroll_id = None
+      sources = []
+
+      page = self.es.search(index=self.ims_sold_listing_index_name, body=query_body, scroll='5m', size=500)
+      scroll_id = page['_scroll_id']
+      total_hits = page['hits']['total']['value']
+      self.logger.info(f"Total hits for IMS sold listings: {total_hits}")
+
+      hits = page['hits']['hits']
+
+      while hits:
+        for hit in hits:
+          doc = hit['_source']
+          # Note: IMS uses MLSNumber as logical primary key, but we'll include ES _id for consistency
+          doc['_id'] = hit['_id']
+          sources.append(doc)
+
+        page = self.es.scroll(scroll_id=scroll_id, scroll='5m')
+        scroll_id = page['_scroll_id']
+        hits = page['hits']['hits']
+
+    except ConnectionError as e:
+      self.logger.error(f"Connection error while fetching IMS sold listings: {str(e)}")
       return False, pd.DataFrame()
 
-    # When actual data exists, apply property type mapping and transformation
-    # Load data into mapper and generate mappings (updates cache with new combinations)
-    self.ims_mapper.load_dataframe(raw_ims_data_df)
-    self.ims_mapper.generate_full_mapping_dataframe()
+    except Exception as e:
+      self.logger.error(f"Unexpected error in get_ims_sold_listings: {e}")
+      self._safe_remove_scroll_id(scroll_id)
+      return False, pd.DataFrame()
 
-    # Apply mappings using vectorized operations (uses updated cache)
-    self.ims_mapper.apply_property_types()
+    finally:
+      self._safe_remove_scroll_id(scroll_id)
 
-    # Apply AB duplex override (vectorized boolean indexing)
-    ab_duplex_mask = (
-      (raw_ims_data_df['Province'] == 'AB') &
-      ((raw_ims_data_df['SubType'] == 'Duplex') | (raw_ims_data_df['SubType'] == 'Full Duplex'))
-    )
-    raw_ims_data_df.loc[ab_duplex_mask, 'propertyType'] = 'SEMI-DETACHED'
+    if not sources:
+      self.logger.info("No IMS sold listings found")
+      if selects:
+        columns = list(selects)
+        if '_id' not in columns:
+          columns.append('_id')
+      else:
+        columns = [
+          '_id', 'mls', 'lastTransition', 'soldPrice', 'price', 'daysOnMarket',
+          'lat', 'lng', 'city', 'neighbourhood', 'provState',
+          'beds', 'bedsInt', 'baths', 'bathsInt',
+          'listingStatus', 'guid', 'computed_guid', 'transitions', 'lastUpdate',
+          'listingType', 'searchCategoryType', 'propertyType'
+        ]
+      return True, pd.DataFrame(columns=columns)
 
-    # Transform to canonical format
-    canonical_df = rename_ims_to_canonical(raw_ims_data_df, keep_bonus_cols=False)
+    self.logger.info(f"Fetched {len(sources)} IMS sold listings")
 
-    process_time = time.time() - start_process_time
-    self.logger.info(f"Completed fetching IMS sold listings in {process_time:.2f} seconds")
-    return True, canonical_df
+    # Convert to DataFrame
+    try:
+      raw_ims_df = pd.DataFrame(sources)
+
+      # Validate required IMS columns exist
+      is_valid, missing = validate_ims_columns(raw_ims_df)
+      if not is_valid:
+        self.logger.error(f"IMS sold listings data is missing required columns: {missing}")
+        return False, pd.DataFrame()
+
+      # Transform IMS schema to canonical schema
+      # Note: propertyType already exists in raw_ims_df (populated during bulk import)
+      # No need to call ims_mapper here - it was applied during bulk import
+      canonical_df = rename_ims_to_canonical(raw_ims_df, keep_bonus_cols=False)
+
+      # Ensure lastTransition is datetime for downstream ETL comparisons
+      if 'lastTransition' in canonical_df.columns:
+        canonical_df['lastTransition'] = pd.to_datetime(
+          canonical_df['lastTransition'],
+          errors='coerce'
+        )
+
+      # Apply selects filter if specified (after transformation to canonical names)
+      if selects:
+        # Only keep columns that exist in both selects and canonical_df
+        available_cols = [col for col in selects if col in canonical_df.columns]
+        if '_id' in canonical_df.columns and '_id' not in available_cols:
+          available_cols.append('_id')
+        canonical_df = canonical_df[available_cols]
+
+      process_time = time.time() - start_process_time
+      self.logger.info(f"Completed fetching IMS sold listings in {process_time:.2f} seconds")
+      return True, canonical_df
+
+    except Exception as e:
+      self.logger.error(f"Error converting IMS sold listings to DataFrame: {e}")
+      return False, pd.DataFrame()
 
 
   def get_current_active_listings(self, selects: List[str], prov_code: str=None,
@@ -1403,7 +2006,7 @@ class Datastore:
     if filters:
       for key, value in filters.items():
         if isinstance(value, str):
-          must_clauses.append({"match": {key: value}})
+          must_clauses.append({"match_phrase": {key: value}})
         else:
           must_clauses.append({"term": {key: value}})
 

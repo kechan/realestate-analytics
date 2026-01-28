@@ -56,7 +56,8 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       'lat', 'lng',
       'city','neighbourhood',
       'provState',
-      'guid'
+      'guid',
+      'propertyType'
     ]
 
     # The number of days to look back for sold and current listings in the delta load
@@ -126,7 +127,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
         # Merge delta for sold listings
         self.sold_listing_df = pd.concat([self.sold_listing_df, delta_sold_listing_df], axis=0, ignore_index=True)
-        self.sold_listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='first')   # TODO: keep first to preserve hacked guid, undo this later
+        self.sold_listing_df.drop_duplicates(subset=['_id'], inplace=True, keep='last')   # keep='last' so delta overwrites stale cached data
 
         # Filter out sold listings older than 5 years (but incl. the full 1st month)
         len_sold_listing_df_before_delete = len(self.sold_listing_df)
@@ -275,18 +276,22 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     # Filter out cross-province geog_ids to prevent contamination
     if not self.geog_id_validator.bypass_mode:
       before_count = len(expanded_df)
-      expanded_df = expanded_df[expanded_df['geog_id'].isin(self.geog_id_validator.valid_geog_ids)].reset_index(drop=True)
-      after_count = len(expanded_df)
+      invalid_mask = ~expanded_df['geog_id'].isin(self.geog_id_validator.valid_geog_ids)
+      contaminated_count = int(invalid_mask.sum())
 
-      contaminated_count = before_count - after_count
       if contaminated_count > 0:
         contamination_pct = 100 * contaminated_count / before_count
+        sample_ids = expanded_df.loc[invalid_mask, 'geog_id'].dropna().unique()[:5]
+        sample_str = ", ".join(sample_ids) if len(sample_ids) > 0 else "None"
         self.logger.warning(
           f"[CONTAMINATION] Filtered {contaminated_count} cross-province geog_ids "
-          f"({contamination_pct:.2f}%) for province {self.prov_code}"
+          f"({contamination_pct:.2f}%) for province {self.prov_code}. "
+          f"Sample geog_id(s): {sample_str}"
         )
       else:
         self.logger.info(f"No cross-province contamination detected for {self.prov_code}")
+
+      expanded_df = expanded_df[~invalid_mask].reset_index(drop=True)
     else:
       self.logger.warning(
         f"[VALIDATION BYPASS] Skipping geog_id validation for {self.prov_code} - "
@@ -465,6 +470,16 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
     self.sold_listing_df['guid'].replace("None", np.nan, inplace=True)
     self.sold_listing_df.dropna(subset=['guid'], inplace=True)    # guid is None implies geog_id is unknown, and it can't contribute to any time series.
+
+    if self.sold_listing_df.empty:
+      self.logger.warning(f"No sold listings available for {self.prov_code} - skipping metrics computation.")
+      empty_cols = ['geog_id', 'propertyType', 'geo_level']
+      self.final_price_series = pd.DataFrame(columns=empty_cols)
+      self.final_dom_series = pd.DataFrame(columns=empty_cols)
+      self.final_over_ask_series = pd.DataFrame(columns=empty_cols)
+      self.final_below_ask_series = pd.DataFrame(columns=empty_cols)
+      self.final_sold_listing_count_series = pd.DataFrame(columns=empty_cols)
+      return
 
     while start_date < current_date_ts:
       # end_date = min(start_date + pd.DateOffset(months=self.BATCH_SIZE_MONTHS), current_date)

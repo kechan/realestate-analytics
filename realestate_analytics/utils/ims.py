@@ -1,9 +1,16 @@
+from __future__ import annotations
+from typing import List, Dict, Optional, Union
 from pathlib import Path
 from tqdm.auto import tqdm
 import pandas as pd
 import logging
+import unicodedata
 from datetime import datetime
+import json
 
+from .ims_geocoder import GeocoderCAClient
+from .ims_oda_geocoder import OdaOfflineGeocoder
+from .ims_locallogic import LocalLogicAPIClient
 
 class IMSPropertyTypeMapper:
   def __init__(self, cached_mapping_path: Path = None):
@@ -17,18 +24,44 @@ class IMSPropertyTypeMapper:
     else:
       self.cached_mapping_df = None
 
+    # Load manual override lookup table if available
+    self.override_lookup_path = None
+    self.override_lookup_df = None
+
+    if cached_mapping_path:
+      # Derive override table path from main cache path
+      self.override_lookup_path = cached_mapping_path.parent / 'ims_property_type_lookup_df'
+
+      if self.override_lookup_path.exists():
+        try:
+          self.override_lookup_df = pd.read_feather(self.override_lookup_path)
+
+          # Validate columns
+          required_cols = ['Type', 'SubType', 'Style', 'propertyType']
+          missing_cols = [col for col in required_cols if col not in self.override_lookup_df.columns]
+
+          if missing_cols:
+            self.logger.error(f"Override lookup table missing columns: {missing_cols}")
+            self.override_lookup_df = None
+          else:
+            self.logger.info(f"Loaded {len(self.override_lookup_df)} manual overrides from {self.override_lookup_path.name}")
+        except Exception as e:
+          self.logger.warning(f"Failed to load override lookup table: {e}")
+          self.override_lookup_df = None
+      else:
+        self.logger.debug(f"No override lookup table found at {self.override_lookup_path}")
 
     # Our target categories - can be expanded beyond the original 4
     self.primary_categories = ['CONDO', 'SEMI-DETACHED', 'TOWNHOUSE', 'DETACHED']
     self.additional_categories = ['MOBILE_MINI', 'LAND_VACANT', 'COMMERCIAL', 'OTHER']
     self.all_categories = self.primary_categories + self.additional_categories
-    
+
     # Initialize mapping rules - we'll build these incrementally
     self.type_rules = {}
     self.subtype_rules = {}
     self.style_rules = {}
     self.combination_lookup = {}
-    
+
     # Keywords that indicate specific property types
     # Note: Provincial exceptions (like AB duplex) are handled in es.py, not here
     self.keyword_patterns = {
@@ -49,11 +82,11 @@ class IMSPropertyTypeMapper:
       ],
       'DETACHED': [
         'detached', 'single family', 'house', 'bungalow', 'bungaloft',
-        'cottage', '2-storey', 'storey', 
+        'cottage', '2-storey', 'storey',
         'rancher', 'backsplit', 'sidesplit'
       ],
       'MOBILE_MINI': [
-        'mobile', 'mini', 'mobile / mini', 
+        'mobile', 'mini', 'mobile / mini',
         # 'manufactured'
       ],
       'LAND_VACANT': [
@@ -141,7 +174,7 @@ class IMSPropertyTypeMapper:
     # PRIORITY 0: Handle specific Type exact matches (highest priority)
     if type_clean in ['16-unit', '5-8 units', '9-12 units', 'over 12 units']:
       return "COMMERCIAL"
-    
+
     # PRIORITY 0.1: Mobile Home - Strongest Signal (Type OR Style)
     # [NEW] Added style tokens here to catch "Detached/Mobile" cases
     mobile_tokens = ['mobile', 'mobile home', 'manufactured', 'double wide', 'single wide', 'park model', 'mini home']
@@ -152,7 +185,7 @@ class IMSPropertyTypeMapper:
 
     # PRIORITY 0.5: Handle all plex cases first
     plex_patterns = ['triplex', 'fourplex', '4 plex', 'multiplex',
-                     '4plex', '5plex', '6plex', '7plex', '8plex', 
+                     '4plex', '5plex', '6plex', '7plex', '8plex',
                     'duplex', 'dixplex', 'huitplex', 'cinqplex'
                      ]
 
@@ -164,50 +197,55 @@ class IMSPropertyTypeMapper:
     # Handle duplex → OTHER (base classification, AB exception in es.py)
     if (
       '6plex' in combined_text or '8plex' in combined_text or '12plex' in combined_text or
-      'uplex' in combined_text or 
-      ' plex' in combined_text or 
-      'iplex' in combined_text or 
-      '-plex' in combined_text or 
+      'uplex' in combined_text or
+      ' plex' in combined_text or
+      'iplex' in combined_text or
+      '-plex' in combined_text or
       'doublex' in combined_text or
       'quintplex' in combined_text or 'quadrex' in combined_text or 'fourplex' in combined_text or
-      "fiveplex" in combined_text or "sixplex" in combined_text or 
-      "sevenplex" in combined_text or "eightplex" in combined_text or 
-      "tenplex" in combined_text or 
+      "fiveplex" in combined_text or "sixplex" in combined_text or
+      "sevenplex" in combined_text or "eightplex" in combined_text or
+      "tenplex" in combined_text or
       "12 Apartments" in combined_text
       ):
       return "OTHER"
 
-    
-    
+
+
     # PRIORITY 1: Direct Type matches (definitive - skip scoring)
 
     # Handle multi-family Type patterns → OTHER
     if 'multifamily' in type_clean or 'multi-family' in type_clean or 'multi-residential' in type_clean:
       return "OTHER"
-    
+
     if 'vacant land' in type_clean or 'land only' in type_clean or 'lots/acreage' in type_clean:
       return "LAND_VACANT"
-    
+
     # This catches "Live/Work", "Warehouse Conversion", etc.
     comm_style_tokens = ['live/work', 'warehouse', 'industrial', 'retail', 'office']
     if any(token in style_clean for token in comm_style_tokens) or any(token in subtype_clean for token in comm_style_tokens):
         return "COMMERCIAL"
-    
+
     if 'twnhouse' in type_clean or 'townhouse' in type_clean or 'row house' in type_clean or 'row unit' in type_clean or 'attached' in type_clean:
       return "TOWNHOUSE"
-    
+
     if 'apartment' in type_clean or 'condo' in type_clean or 'co-op' in type_clean or 'cooperative' in type_clean:
-      return "CONDO"         
-    
+      return "CONDO"
+
     if 'modular' in type_clean or 'parking space' in type_clean or 'locker' in type_clean or 'other' in type_clean:
       return "OTHER"
-    
+
     if 'multi family' in type_clean:
       return "OTHER"
-    
+
     if 'commercial' in type_clean or 'office' in type_clean:
       return "COMMERCIAL"
-    
+
+    # PRIORITY 1.5: Strong SubType signal - Semi Detached (before Style "attached" check)
+    # This ensures SubType="Semi Detached" is classified correctly regardless of Style
+    # containing "Attached-side By Side" etc. Added 2025-01 to fix Calgary SEMI-DETACHED drop.
+    if 'semi detached' in subtype_clean or 'semi-detached' in subtype_clean:
+      return "SEMI-DETACHED"
 
     # PRIORTY 2: Direct Style matches (definitive - skip scoring)
     # if 'semi detached' in style_clean or 'semi-detached' in style_clean or 'semi - detached' in style_clean:
@@ -237,11 +275,11 @@ class IMSPropertyTypeMapper:
       return "DETACHED"
     if 'condo' in subtype_clean or 'condominium' in subtype_clean or 'apartment' in subtype_clean:
       return "CONDO"
-    
+
     if 'modular' in subtype_clean or 'manufactured' in subtype_clean or 'other' in subtype_clean:
       return "OTHER"
 
-   
+
     # PRIORITY 4: Regular keyword scoring for all other cases
     # print("using scoring")
     scores = {}
@@ -275,15 +313,15 @@ class IMSPropertyTypeMapper:
       # return "UNCLEAR"
       # print("Calling _suggest_mapping_refined")
       return self._suggest_mapping_refined(type_val, subtype_val, style_val)
-    
+
     return max(scores.keys(), key=lambda k: scores[k])   # Return the category with highest score
 
-  def create_mapping_rule(self, type_pattern=None, subtype_pattern=None, 
+  def create_mapping_rule(self, type_pattern=None, subtype_pattern=None,
                          style_pattern=None, target_category=None):
     """Create a mapping rule"""
     rule = {
       'type_pattern': type_pattern,
-      'subtype_pattern': subtype_pattern, 
+      'subtype_pattern': subtype_pattern,
       'style_pattern': style_pattern,
       'target_category': target_category
     }
@@ -293,12 +331,12 @@ class IMSPropertyTypeMapper:
     """Apply all mapping rules to classify property types"""
     if df_subset is None:
       df_subset = self.df.copy()
-    
+
     df_subset['predicted_category'] = 'UNCLASSIFIED'
-    
+
     # Apply rules in order of specificity
     # TODO: Implement rule application logic once we define the rules
-    
+
   def get_statistics(self):
     """Get current statistics of the data"""
     self.logger.info("=== Current IMS Data Statistics ===\n")
@@ -317,7 +355,7 @@ class IMSPropertyTypeMapper:
 
     self.logger.info(f"Total unique Type/SubType/Style combinations: {len(self.get_unique_combinations())}")
 
-  
+
   def generate_full_mapping_dataframe(self):
     """
     Generate a complete DataFrame with all combinations and their mappings.
@@ -381,18 +419,24 @@ class IMSPropertyTypeMapper:
       mappings = []
 
     # Process only NEW combinations (loop only when necessary)
+    # Track new combinations separately for logging
+    new_mappings_only = []
+
     if new_count > 0:
       new_rows = merged[is_new]
       for _, row in tqdm(new_rows.iterrows(), total=new_count, desc="Processing new combinations"):
         suggested_mapping = self.suggest_mapping(row['Type'], row['SubType'], row['Style'])
 
-        mappings.append({
+        new_mapping = {
           'Type': row['Type'],
           'SubType': row['SubType'],
           'Style': row['Style'],
           'Count': row['Count'],
           'Inferred': suggested_mapping
-        })
+        }
+
+        mappings.append(new_mapping)
+        new_mappings_only.append(new_mapping)  # Track for separate logging
 
     # Report cache performance
     total_in_current_data = len(combinations_with_counts)
@@ -411,12 +455,19 @@ class IMSPropertyTypeMapper:
     del self.cached_mapping_df  # Explicitly delete old reference
     self.cached_mapping_df = new_mappings_df
 
+    # Split new combinations into UNCLEAR and RESOLVED for separate logging
+    new_unclear_combos = [m for m in new_mappings_only if m['Inferred'] == 'UNCLEAR']
+    new_resolved_combos = [m for m in new_mappings_only if m['Inferred'] != 'UNCLEAR']
+
     # Log UNCLEAR mappings to CSV for manual review
-    self._log_unclear_mappings()
+    self._log_unclear_mappings(new_unclear_combos=new_unclear_combos)
+
+    # Log newly-resolved mappings to CSV for audit and validation
+    self._log_new_resolved_mappings(new_resolved_combos=new_resolved_combos)
 
     return self.cached_mapping_df
 
-  def _log_unclear_mappings(self):
+  def _log_unclear_mappings(self, new_unclear_combos: List[Dict] = None):
     """
     Log UNCLEAR property type mappings to a CSV file for manual review.
 
@@ -427,6 +478,11 @@ class IMSPropertyTypeMapper:
     For each UNCLEAR combination, it attempts to extract City and Province from a sample
     record in self.df to help prioritize manual review.
 
+    Args:
+        new_unclear_combos: Optional list of dicts with newly-classified UNCLEAR combinations.
+                           If provided, only these will be logged (more efficient).
+                           If None, extracts all UNCLEAR from cache (legacy behavior).
+
     CSV Structure:
     - Columns: Type, SubType, Style, Count, City, Province
     - Uniqueness: (Type, SubType, Style) combinations are unique
@@ -434,19 +490,59 @@ class IMSPropertyTypeMapper:
 
     Note: If City or Province columns don't exist in self.df, 'N/A' is used as placeholder.
     """
-    # Check if we have cached mappings to log
-    if self.cached_mapping_df is None or self.cached_mapping_df.empty:
-      return
+    # If new_unclear_combos provided, use those (more efficient)
+    if new_unclear_combos is not None:
+      if not new_unclear_combos:
+        self.logger.info("No new UNCLEAR mappings to log")
+        return
 
-    # Extract UNCLEAR mappings
-    unclear_mask = self.cached_mapping_df['Inferred'] == 'UNCLEAR'
-    unclear_mappings = self.cached_mapping_df[unclear_mask].copy()
+      # Convert list of dicts to DataFrame
+      unclear_mappings = pd.DataFrame(new_unclear_combos)
+      self.logger.info(f"Found {len(unclear_mappings)} new UNCLEAR mappings to log")
+    else:
+      # Legacy behavior: extract from cache
+      # Check if we have cached mappings to log
+      if self.cached_mapping_df is None or self.cached_mapping_df.empty:
+        return
 
-    if unclear_mappings.empty:
-      self.logger.info("No UNCLEAR mappings to log")
-      return
+      # Extract UNCLEAR mappings
+      unclear_mask = self.cached_mapping_df['Inferred'] == 'UNCLEAR'
+      unclear_mappings = self.cached_mapping_df[unclear_mask].copy()
 
-    self.logger.info(f"Found {len(unclear_mappings)} UNCLEAR mappings to log")
+      if unclear_mappings.empty:
+        self.logger.info("No UNCLEAR mappings to log")
+        return
+
+      self.logger.info(f"Found {len(unclear_mappings)} UNCLEAR mappings to log")
+
+    # Filter out combinations that are already handled by override lookup table
+    # These have been manually reviewed and don't need to appear in unclear_mappings.csv
+    if self.override_lookup_df is not None and not self.override_lookup_df.empty:
+      # Reset index to ensure alignment with merge result (merge creates RangeIndex)
+      unclear_mappings_reset = unclear_mappings.reset_index(drop=True)
+
+      # Use vectorized merge to identify which unclear mappings exist in override table
+      override_check = unclear_mappings_reset[['Type', 'SubType', 'Style']].merge(
+        self.override_lookup_df[['Type', 'SubType', 'Style']],
+        on=['Type', 'SubType', 'Style'],
+        how='left',
+        indicator=True
+      )
+
+      # Keep only rows NOT in override table (indicator='left_only')
+      is_not_overridden = override_check['_merge'] == 'left_only'
+
+      before_filter = len(unclear_mappings_reset)
+      unclear_mappings = unclear_mappings_reset[is_not_overridden].copy()
+
+      filtered_count = before_filter - len(unclear_mappings)
+      if filtered_count > 0:
+        self.logger.info(f"Filtered {filtered_count} UNCLEAR items already in override table")
+
+      # Early exit if all UNCLEAR items are already handled by overrides
+      if unclear_mappings.empty:
+        self.logger.info("All UNCLEAR mappings are handled by override table - nothing to log")
+        return
 
     # Add City and Province columns by looking up sample records from self.df
     if hasattr(self, 'df') and self.df is not None and not self.df.empty:
@@ -490,18 +586,31 @@ class IMSPropertyTypeMapper:
         existing_unclear = pd.read_csv(csv_path)
         self.logger.info(f"Loaded {len(existing_unclear)} existing UNCLEAR mappings from {csv_path.name}")
 
-        # Merge and deduplicate based on (Type, SubType, Style)
-        # Keep the row with higher Count (prefer new data)
-        combined = pd.concat([existing_unclear, unclear_mappings[['Type', 'SubType', 'Style', 'Count', 'City', 'Province']]], ignore_index=True)
+        # Merge and aggregate based on (Type, SubType, Style)
+        combined = pd.concat(
+          [existing_unclear, unclear_mappings[['Type', 'SubType', 'Style', 'Count', 'City', 'Province']]],
+          ignore_index=True
+        )
 
-        # Sort by Count descending and drop duplicates, keeping first (highest count)
-        combined = combined.sort_values('Count', ascending=False)
-        combined = combined.drop_duplicates(subset=['Type', 'SubType', 'Style'], keep='first')
+        # Ensure Count is numeric for aggregation
+        combined['Count'] = pd.to_numeric(combined['Count'], errors='coerce').fillna(0)
+
+        def _first_non_null(series: pd.Series) -> str:
+          non_null = series.dropna()
+          if not non_null.empty:
+            return str(non_null.iloc[0])
+          return 'N/A'
+
+        combined = combined.groupby(['Type', 'SubType', 'Style'], as_index=False).agg({
+          'Count': 'sum',
+          'City': _first_non_null,
+          'Province': _first_non_null
+        })
 
         # Sort by Count descending for final output
         combined = combined.sort_values('Count', ascending=False).reset_index(drop=True)
 
-        self.logger.info(f"After deduplication: {len(combined)} unique UNCLEAR mappings")
+        self.logger.info(f"After aggregation: {len(combined)} unique UNCLEAR mappings")
 
       except Exception as e:
         self.logger.error(f"Error loading existing unclear_mappings.csv: {e}. Creating new file.")
@@ -517,6 +626,153 @@ class IMSPropertyTypeMapper:
       self.logger.info(f"Logged {len(combined)} UNCLEAR mappings to {csv_path}")
     except Exception as e:
       self.logger.error(f"Error saving unclear_mappings.csv: {e}")
+
+  def _log_new_resolved_mappings(self, new_resolved_combos: List[Dict] = None):
+    """
+    Log newly-resolved property type mappings to CSV for audit and validation.
+
+    This method is called automatically at the end of generate_full_mapping_dataframe().
+    It logs new combinations (not previously in cache) that resolved to a property type
+    (DETACHED, TOWNHOUSE, etc.) - excluding UNCLEAR.
+
+    Args:
+        new_resolved_combos: List of dicts with newly-classified resolved combinations.
+                            Each dict contains: Type, SubType, Style, Count, Inferred.
+                            If None or empty, no logging occurs.
+
+    CSV Structure:
+    - Columns: Type, SubType, Style, Count, Inferred, City, Province
+    - Uniqueness: (Type, SubType, Style, Inferred) combinations are unique
+    - Location: {cache_dir}/new_resolved_mappings.csv
+
+    Behavior:
+    - Appends to existing CSV (never overwrites)
+    - Aggregates counts for duplicate combinations
+    - Filters out combinations in override lookup table
+    - Each combo appears only once when first encountered
+
+    Note: If City or Province columns don't exist in self.df, 'N/A' is used as placeholder.
+    """
+    # Early exit if no new resolved combos
+    if not new_resolved_combos:
+      self.logger.info("No new resolved mappings to log")
+      return
+
+    # Convert list of dicts to DataFrame
+    resolved_mappings = pd.DataFrame(new_resolved_combos)
+    self.logger.info(f"Found {len(resolved_mappings)} new resolved mappings to log")
+
+    # Filter out combinations that are already handled by override lookup table
+    # These have been manually reviewed and don't need to appear in new_resolved_mappings.csv
+    if self.override_lookup_df is not None and not self.override_lookup_df.empty:
+      # Reset index to ensure alignment with merge result
+      resolved_mappings_reset = resolved_mappings.reset_index(drop=True)
+
+      # Use vectorized merge to identify which resolved mappings exist in override table
+      override_check = resolved_mappings_reset[['Type', 'SubType', 'Style']].merge(
+        self.override_lookup_df[['Type', 'SubType', 'Style']],
+        on=['Type', 'SubType', 'Style'],
+        how='left',
+        indicator=True
+      )
+
+      # Keep only rows NOT in override table (indicator='left_only')
+      is_not_overridden = override_check['_merge'] == 'left_only'
+
+      before_filter = len(resolved_mappings_reset)
+      resolved_mappings = resolved_mappings_reset[is_not_overridden].copy()
+
+      filtered_count = before_filter - len(resolved_mappings)
+      if filtered_count > 0:
+        self.logger.info(f"Filtered {filtered_count} resolved items already in override table")
+
+      # Early exit if all resolved items are already handled by overrides
+      if resolved_mappings.empty:
+        self.logger.info("All resolved mappings are handled by override table - nothing to log")
+        return
+
+    # Add City and Province columns by looking up sample records from self.df
+    if hasattr(self, 'df') and self.df is not None and not self.df.empty:
+      resolved_mappings['City'] = 'N/A'
+      resolved_mappings['Province'] = 'N/A'
+
+      for idx, row in resolved_mappings.iterrows():
+        # Find a sample record with this combination
+        mask = (
+          (self.df['Type'].fillna('N/A') == row['Type']) &
+          (self.df['SubType'].fillna('N/A') == row['SubType']) &
+          (self.df['Style'].fillna('N/A') == row['Style'])
+        )
+
+        matching_records = self.df[mask]
+        if not matching_records.empty:
+          sample_record = matching_records.iloc[0]
+
+          # Extract City if available
+          if 'City' in sample_record.index and pd.notna(sample_record['City']):
+            resolved_mappings.at[idx, 'City'] = sample_record['City']
+
+          # Extract Province if available
+          if 'Province' in sample_record.index and pd.notna(sample_record['Province']):
+            resolved_mappings.at[idx, 'Province'] = sample_record['Province']
+    else:
+      # No data available - use N/A placeholders
+      resolved_mappings['City'] = 'N/A'
+      resolved_mappings['Province'] = 'N/A'
+
+    # Determine CSV file path
+    if self.cached_mapping_path is None:
+      self.logger.warning("No cache path set - cannot log resolved mappings to CSV")
+      return
+
+    csv_path = self.cached_mapping_path.parent / 'new_resolved_mappings.csv'
+
+    # Load existing CSV if it exists and merge with new resolved items
+    if csv_path.exists():
+      try:
+        existing_resolved = pd.read_csv(csv_path)
+        self.logger.info(f"Loaded {len(existing_resolved)} existing resolved mappings from {csv_path.name}")
+
+        # Merge and aggregate based on (Type, SubType, Style, Inferred)
+        combined = pd.concat(
+          [existing_resolved, resolved_mappings[['Type', 'SubType', 'Style', 'Count', 'Inferred', 'City', 'Province']]],
+          ignore_index=True
+        )
+
+        # Ensure Count is numeric for aggregation
+        combined['Count'] = pd.to_numeric(combined['Count'], errors='coerce').fillna(0)
+
+        def _first_non_null(series: pd.Series) -> str:
+          non_null = series.dropna()
+          if not non_null.empty:
+            return str(non_null.iloc[0])
+          return 'N/A'
+
+        combined = combined.groupby(['Type', 'SubType', 'Style', 'Inferred'], as_index=False).agg({
+          'Count': 'sum',
+          'City': _first_non_null,
+          'Province': _first_non_null
+        })
+
+        # Sort by Count descending for final output
+        combined = combined.sort_values('Count', ascending=False).reset_index(drop=True)
+
+        self.logger.info(f"After aggregation: {len(combined)} unique resolved mappings")
+
+      except Exception as e:
+        self.logger.error(f"Error loading existing new_resolved_mappings.csv: {e}. Creating new file.")
+        combined = resolved_mappings[['Type', 'SubType', 'Style', 'Count', 'Inferred', 'City', 'Province']].sort_values('Count', ascending=False)
+    else:
+      # No existing file - use new data
+      combined = resolved_mappings[['Type', 'SubType', 'Style', 'Count', 'Inferred', 'City', 'Province']].sort_values('Count', ascending=False)
+      self.logger.info(f"Creating new new_resolved_mappings.csv with {len(combined)} entries")
+
+    # Save to CSV
+    try:
+      combined.to_csv(csv_path, index=False)
+      self.logger.info(f"Logged {len(combined)} resolved mappings to {csv_path}")
+    except Exception as e:
+      self.logger.error(f"Error saving new_resolved_mappings.csv: {e}")
 
   def apply_property_types(self, df: pd.DataFrame = None):
     """
@@ -565,6 +821,30 @@ class IMSPropertyTypeMapper:
     # Vectorized lookup using map (memory efficient)
     df['propertyType'] = df['_temp_key'].map(lookup_dict)
 
+    # Apply manual override lookup table if available
+    # This runs AFTER the main cache, allowing overrides to supersede base mappings
+    override_count = 0  # Initialize for logging later
+
+    if self.override_lookup_df is not None and not self.override_lookup_df.empty:
+      self.logger.info("Applying manual override lookup table...")
+
+      # Create override lookup dictionary (same pattern as main lookup)
+      override_dict = self.override_lookup_df.set_index(['Type', 'SubType', 'Style'])['propertyType'].to_dict()
+
+      # Apply overrides using vectorized map (only overrides non-None values)
+      override_values = df['_temp_key'].map(override_dict)
+
+      # Count how many overrides will be applied
+      override_mask = override_values.notna()
+      override_count = override_mask.sum()
+
+      if override_count > 0:
+        # Apply overrides (replaces existing propertyType values where override exists)
+        df.loc[override_mask, 'propertyType'] = override_values[override_mask]
+        self.logger.info(f"Applied {override_count:,} manual overrides ({override_count/len(df)*100:.1f}%)")
+      else:
+        self.logger.info("No overrides matched current data")
+
     # Drop temporary column
     df.drop(columns=['_temp_key'], inplace=True)
 
@@ -577,6 +857,8 @@ class IMSPropertyTypeMapper:
     self.logger.info(f"  Mapped: {mapped_count:,} ({mapped_count/len(df)*100:.1f}%)")
     self.logger.info(f"  Unmapped (not in cache): {unmapped_count:,} ({unmapped_count/len(df)*100:.1f}%)")
     self.logger.info(f"  UNCLEAR: {unclear_count:,} ({unclear_count/len(df)*100:.1f}%)")
+    if self.override_lookup_df is not None and override_count > 0:
+      self.logger.info(f"  Manual overrides applied: {override_count:,}")
 
   def refresh_unclear_mappings(self, raise_on_regression: bool = True) -> dict:
     """
@@ -1247,3 +1529,950 @@ class IMSPropertyTypeMapper:
     # 5) FALLBACK
     # -----------------------------------------------------------
     return "UNCLEAR"
+
+
+class MultiPassGUIDResolver:
+  """
+  Multi-pass GUID resolution for IMS sold listings.
+
+  Implements multiple resolution strategies:
+  - City name matching (g30 only) ✅
+  - Polygon containment (all levels) ✅
+  - LocalLogic API (all levels) ✅
+  - Geocoder coordinate correction (automatic for invalid coords) ✅
+
+  The geocoder is used transparently by polygon and API methods to fix
+  invalid/missing coordinates before attempted GUID resolution.
+  """
+
+  def __init__(
+    self,
+    geo_collection: 'GeoCollection',
+    checkpoint_dir: Union[str, Path],
+    checkpoint_batch_size: int = 100,
+    use_geocoder: bool = True,
+    geocoder_min_interval_sec: float = 3.0,
+    logger: Optional[logging.Logger] = None
+  ):
+    """
+    Initialize MultiPassGUIDResolver.
+
+    Args:
+        geo_collection: GeoCollection instance with geographic data
+        checkpoint_dir: Directory for checkpoint files (REQUIRED, str or Path)
+        checkpoint_batch_size: Listings per batch for checkpointing (default: 100)
+        use_geocoder: Whether to use geocoder for coordinate correction (default: True)
+        geocoder_min_interval_sec: Minimum seconds between geocoder requests (default: 3.0)
+        logger: Optional logger instance
+    """
+    self.logger = logger or logging.getLogger(self.__class__.__name__)
+    self.geo_collection = geo_collection
+
+    # Checkpoint configuration
+    self.checkpoint_dir = Path(checkpoint_dir)
+    self.checkpoint_batch_size = checkpoint_batch_size
+
+    # Create checkpoint directory if doesn't exist
+    self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Verify checkpoint directory is writable by attempting to create a test file
+    try:
+      test_file = self.checkpoint_dir / '.write_test'
+      test_file.touch()
+      test_file.unlink()
+    except (OSError, PermissionError) as e:
+      raise ValueError(f"Checkpoint directory not writable: {checkpoint_dir}") from e
+
+    # Checkpoint file paths
+    self.metadata_file = self.checkpoint_dir / 'metadata.json'
+    self.city_results_file = self.checkpoint_dir / 'city_results.json'
+    self.polygon_results_file = self.checkpoint_dir / 'polygon_results.json'
+    self.geocoder_cache_file = self.checkpoint_dir / 'geocoder_cache.json'
+    self.api_results_file = self.checkpoint_dir / 'locallogic_api_results.json'
+
+    # Build city name lookup indices
+    self.city_en_index = {}  # (normalized_city, province) → g30_geog_id
+    self.city_fr_index = {}  # (normalized_city, province) → g30_geog_id
+
+    self._build_city_indices()
+
+    # Initialize geocoder client for fixing invalid coordinates
+    self.geocoder_client = None
+    self.geocoder_cache = {}  # doc_id → (lat, lng)
+
+    if use_geocoder:
+      try:
+        self.geocoder_client = GeocoderCAClient(
+          min_interval_sec=geocoder_min_interval_sec,
+          logger=self.logger
+        )
+        self.logger.info(f"Geocoder.ca client initialized (min_interval={geocoder_min_interval_sec}s)")
+      except Exception as e:
+        self.logger.warning(f"Failed to initialize geocoder client: {e}")
+        self.logger.warning("Coordinate correction via geocoder will be disabled")
+
+    # Initialize LocalLogic API client (reused across multiple resolve_by_locallogic_api calls)
+    self.locallogic_client = None
+    try:
+      self.locallogic_client = LocalLogicAPIClient(logger=self.logger)
+      self.logger.info("LocalLogic API client initialized")
+    except RuntimeError as e:
+      self.logger.warning(f"LocalLogic API not available: {e}")
+      self.logger.warning("LocalLogic API resolution will be disabled")
+
+    # Statistics tracking
+    self.stats = {
+      'city_name_success': 0,
+      'city_name_fsa_fallback': 0,
+      'geocoder_corrections': 0,
+      # More stats will be added for other methods
+    }
+
+  # ========== Checkpoint Management Methods ==========
+
+  def _init_metadata(self, total_listings: int):
+    """Initialize metadata for new checkpoint run."""
+    metadata = {
+      'start_datetime': datetime.now().isoformat(),
+      'total_listings': total_listings,
+      'batch_size': self.checkpoint_batch_size,
+      'status': 'in_progress',
+      'city_completed': False,
+      'polygon_last_batch': -1,
+      'api_last_batch': -1
+    }
+    self._save_metadata(metadata)
+
+  def _save_metadata(self, metadata: Dict):
+    """Save metadata to checkpoint file."""
+    with open(self.metadata_file, 'w') as f:
+      json.dump(metadata, f, indent=2)
+
+  def _load_metadata(self) -> Optional[Dict]:
+    """Load metadata from checkpoint file if exists."""
+    if self.metadata_file.exists():
+      try:
+        with open(self.metadata_file, 'r') as f:
+          return json.load(f)
+      except (json.JSONDecodeError, IOError) as e:
+        self.logger.warning(f"Failed to load metadata: {e}")
+        return None
+    return None
+
+  def _update_metadata(self, **updates):
+    """Update specific metadata fields."""
+    metadata = self._load_metadata()
+    if metadata:
+      metadata.update(updates)
+      self._save_metadata(metadata)
+
+  def _check_stale_checkpoint(self, metadata: Dict):
+    """
+    Check if checkpoint is stale (older than 7 days).
+
+    Raises RuntimeError if checkpoint is older than 7 days.
+    Devops can override by manually removing 'start_datetime' field.
+    """
+    # If start_datetime field absent, skip check (manual override)
+    if 'start_datetime' not in metadata:
+      self.logger.info("Checkpoint age check skipped (start_datetime field removed)")
+      return
+
+    start_datetime_str = metadata['start_datetime']
+
+    try:
+      start_datetime = datetime.fromisoformat(start_datetime_str)
+      now = datetime.now()
+      age = now - start_datetime
+      age_days = age.total_seconds() / 86400
+
+      self.logger.info(f"Checkpoint age: {age_days:.1f} days (started {start_datetime_str})")
+
+      if age_days > 7:
+        raise RuntimeError(
+          f"Checkpoint is stale (started {start_datetime_str}, {age_days:.1f} days ago). "
+          f"This job may be stuck. Please investigate and manually remove 'start_datetime' "
+          f"from {self.metadata_file} to override this check."
+        )
+    except ValueError as e:
+      self.logger.warning(f"Failed to parse start_datetime '{start_datetime_str}': {e}")
+
+  def _append_results(self, filepath: Path, batch_results: List[Dict]):
+    """Append batch results to checkpoint file."""
+    # Load existing results if file exists
+    if filepath.exists():
+      try:
+        with open(filepath, 'r') as f:
+          all_results = json.load(f)
+      except (json.JSONDecodeError, IOError):
+        all_results = []
+    else:
+      all_results = []
+
+    # Append new results
+    all_results.extend(batch_results)
+
+    # Save back
+    with open(filepath, 'w') as f:
+      json.dump(all_results, f)
+
+  def _load_results(self, filepath: Path) -> List[Dict]:
+    """Load results from checkpoint file."""
+    if filepath.exists():
+      try:
+        with open(filepath, 'r') as f:
+          return json.load(f)
+      except (json.JSONDecodeError, IOError) as e:
+        self.logger.warning(f"Failed to load results from {filepath}: {e}")
+        return []
+    return []
+
+  def _save_results(self, filepath: Path, results: List[Dict]):
+    """Save results to checkpoint file (overwrite)."""
+    with open(filepath, 'w') as f:
+      json.dump(results, f)
+
+  def _save_geocoder_cache(self):
+    """Save entire geocoder cache to checkpoint file."""
+    # Convert to JSON-serializable format
+    cache_data = {
+      doc_id: [lat, lng] if lat is not None and lng is not None else None
+      for doc_id, (lat, lng) in self.geocoder_cache.items()
+    }
+    with open(self.geocoder_cache_file, 'w') as f:
+      json.dump(cache_data, f)
+
+  def _load_geocoder_cache(self):
+    """Load geocoder cache from checkpoint file."""
+    if self.geocoder_cache_file.exists():
+      try:
+        with open(self.geocoder_cache_file, 'r') as f:
+          cache_data = json.load(f)
+        # Convert back to tuple format
+        self.geocoder_cache = {
+          doc_id: tuple(coords) if coords is not None else (None, None)
+          for doc_id, coords in cache_data.items()
+        }
+        self.logger.info(f"Loaded {len(self.geocoder_cache)} entries from geocoder cache")
+      except (json.JSONDecodeError, IOError) as e:
+        self.logger.warning(f"Failed to load geocoder cache: {e}")
+        self.geocoder_cache = {}
+
+  def _cleanup_checkpoints(self):
+    """Delete all checkpoint files on successful completion."""
+    for filepath in [self.metadata_file, self.city_results_file,
+                     self.polygon_results_file, self.geocoder_cache_file,
+                     self.api_results_file]:
+      if filepath.exists():
+        filepath.unlink()
+    self.logger.info(f"Cleaned up checkpoint files in {self.checkpoint_dir}")
+
+  # ========== End Checkpoint Management Methods ==========
+
+  def _is_valid_canada_lat_lng(self, lat: float, lng: float) -> bool:
+    """
+    Validate coordinates are within Canada bounds.
+
+    Uses same bounds as LocalLogicAPIClient for consistency.
+
+    Args:
+        lat: Latitude
+        lng: Longitude
+
+    Returns:
+        True if coordinates are valid and within Canada bounds
+    """
+    # Canada geographic bounds
+    MIN_LAT = 41.0   # Windsor, ON ~42°
+    MAX_LAT = 84.0   # Ellesmere Island ~83°
+    MIN_LNG = -141.1 # Yukon border
+    MAX_LNG = -52.0  # Eastern Newfoundland
+
+    if pd.isna(lat) or pd.isna(lng):
+      return False
+
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+      return False
+
+    return (MIN_LAT <= lat <= MAX_LAT and MIN_LNG <= lng <= MAX_LNG)
+
+  def _get_valid_coords(self, listing: Dict) -> tuple:
+    """
+    Get valid coordinates for a listing, using geocoder to fix invalid coords.
+
+    Args:
+        listing: Listing dict with IMS field names (Latitude, Longitude, Address, City, Province, PostalCode, etc.)
+
+    Returns:
+        Tuple (lat, lng) with valid coordinates, or (None, None) if unable to resolve
+    """
+    lat = listing.get('Latitude')
+    lng = listing.get('Longitude')
+
+    # If coordinates are already valid, return them
+    if self._is_valid_canada_lat_lng(lat, lng):
+      return (lat, lng)
+
+    # If geocoder not available, return None
+    if self.geocoder_client is None:
+      return (None, None)
+
+    # Check cache first (to avoid duplicate API calls for same listing)
+    doc_id = self._construct_doc_id(listing)
+    if doc_id in self.geocoder_cache:
+      cached_coords = self.geocoder_cache[doc_id]
+      self.logger.debug(f"Using cached geocoded coords for {doc_id}")
+      return cached_coords
+
+    # Call geocoder API to fix coordinates
+    self.logger.debug(f"Geocoding {doc_id} - invalid coords: ({lat}, {lng})")
+
+    geocoded = self.geocoder_client.geocode_address(
+      address=listing.get('Address'),
+      city=listing.get('City'),
+      province=listing.get('Province'),
+      postal_code=listing.get('PostalCode')
+    )
+
+    if geocoded:
+      corrected_lat = geocoded['lat']
+      corrected_lng = geocoded['lng']
+      self.geocoder_cache[doc_id] = (corrected_lat, corrected_lng)
+      self.stats['geocoder_corrections'] += 1
+      self.logger.info(f"Geocoded {doc_id}: ({lat}, {lng}) → ({corrected_lat}, {corrected_lng})")
+      return (corrected_lat, corrected_lng)
+    else:
+      # Cache the failure to avoid retrying
+      self.geocoder_cache[doc_id] = (None, None)
+      return (None, None)
+
+  def _build_city_indices(self):
+    """Build city name lookup dictionaries from GeoCollection"""
+    self.logger.info("Building city name indices...")
+
+    g30_geos = self.geo_collection.get_by_level(30)
+
+    for geo in g30_geos.all():
+      province = geo.province
+
+      # Index English name
+      if geo.level_30_en:
+        key = (self._normalize_city(geo.level_30_en), province)
+        self.city_en_index[key] = geo.geog_id
+
+      # Index French name
+      if geo.level_30_fr:
+        key = (self._normalize_city(geo.level_30_fr), province)
+        self.city_fr_index[key] = geo.geog_id
+
+      # Also index geo.city for additional coverage
+      if geo.city:
+        key = (self._normalize_city(geo.city), province)
+        self.city_en_index[key] = geo.geog_id
+
+    self.logger.info(f"City indices built: EN={len(self.city_en_index)}, FR={len(self.city_fr_index)}")
+
+  def _normalize_city(self, name: str) -> str:
+    """Normalize city name for matching (lowercase, trim, strip accents)"""
+    normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    return normalized.lower().strip()
+
+  def _lookup_city_g30(self, city_name: str, province: str) -> Optional[str]:
+    """
+    Internal helper: Find g30 geog_id by city name.
+
+    Checks both English and French indices.
+    Returns None if not found.
+    """
+    if not city_name or not province:
+      return None
+
+    normalized = self._normalize_city(city_name)
+    province_norm = province.upper()
+    key = (normalized, province_norm)
+
+    # Try English index first
+    if key in self.city_en_index:
+      return self.city_en_index[key]
+
+    # Try French index
+    if key in self.city_fr_index:
+      return self.city_fr_index[key]
+
+    return None
+
+  def _construct_doc_id(self, listing: Dict) -> str:
+    """
+    Construct the ES document _id to align with bulk_import_ims_sold_listings.
+    Format: {province}-{mlsid}-{mlsnumber}-{year}
+    """
+    written_date_raw = listing.get('WrittenDate', '')
+    written_date = None
+    year = None
+    if pd.notna(written_date_raw):
+      written_date_str = str(written_date_raw)
+      if 'T' in written_date_str:
+        written_date = written_date_str.split('T')[0]
+      else:
+        written_date = written_date_str
+      try:
+        year = written_date.split('-')[0] if written_date else None
+      except (IndexError, AttributeError):
+        year = None
+
+    return (
+      f"{str(listing.get('Province', '')).lower()}-"   # province
+      f"{str(listing.get('MLSID', '')).lower()}-"      # board id
+      f"{str(listing.get('MLSNumber', '')).lower()}-"  # listing number
+      f"{year if year else 'unknown'}"                 # year
+    )
+
+  def resolve_by_city_name(self, listings_df: pd.DataFrame, show_progress: bool = True) -> List[Dict]:
+    """
+    City name matching (g30 level only).
+
+    Fast in-memory lookup using bilingual city name matching.
+
+    Args:
+        listings_df: DataFrame of listings with IMS field names:
+            - 'City': City name (from IMS 'City' field)
+            - 'FSACity': FSA-based city name (fallback, optional)
+            - 'Province': Province code (e.g., 'ON', 'BC')
+            - 'MLSNumber': MLS listing number (primary key)
+            - 'MLSID': MLS board id (used for _id construction)
+            - 'WrittenDate': transaction date (used for _id year)
+
+    Returns:
+        List of result dicts with keys:
+            - '_id': document id {province}-{mlsid}-{mlsnumber}-{year}
+            - 'guid': resolved g30 geog_id (single entry) or None
+            - 'source': 'city_name', 'fsa_city', or None
+    """
+    self.logger.info(f"Starting City Name Matching for {len(listings_df)} listings")
+
+    results = []
+    success_count = 0
+    fsa_fallback_count = 0
+
+    for _, listing in tqdm(listings_df.iterrows(), total=len(listings_df), desc="City Name Matching", disable=not show_progress):
+      city = listing.get('City')          # IMS field name
+      fsa_city = listing.get('FSACity')   # IMS field name (fallback)
+      province = listing.get('Province')  # IMS field name
+
+      g30_geog_id = None
+      source = None
+
+      # Try primary city name
+      if city and province:
+        g30_geog_id = self._lookup_city_g30(city, province)
+        if g30_geog_id:
+          source = 'city_name'
+          success_count += 1
+
+      # Try FSACity fallback if primary failed
+      if not g30_geog_id and fsa_city and province:
+        g30_geog_id = self._lookup_city_g30(fsa_city, province)
+        if g30_geog_id:
+          source = 'fsa_city'
+          success_count += 1
+          fsa_fallback_count += 1
+
+      doc_id = self._construct_doc_id(listing)
+
+      results.append({
+        '_id': doc_id,
+        'guid': g30_geog_id,
+        'source': source
+      })
+
+    total = len(listings_df)
+    self.logger.info(f"City Name Matching complete: {success_count}/{total} matched ({success_count/total*100:.1f}%)")
+    if fsa_fallback_count > 0:
+      self.logger.info(f"  FSA fallback used: {fsa_fallback_count} times")
+
+    return results
+
+  def resolve_by_polygon(self, listings_df: pd.DataFrame, show_progress: bool = True) -> List[Dict]:
+    """
+    Polygon containment using GeoCollection.compute_guid for each listing.
+
+    Automatically uses geocoder to fix invalid coordinates before polygon checks.
+    Geocoded coordinates are cached to avoid duplicate API calls.
+
+    Args:
+        listings_df: DataFrame of listings with IMS field names:
+            - 'Latitude', 'Longitude': Coordinates (will be geocoded if invalid)
+            - 'Address', 'City', 'Province', 'PostalCode': Used for geocoding if needed
+            - 'MLSID', 'MLSNumber', 'WrittenDate': used for _id construction
+    Returns:
+        List of result dicts with keys:
+            - '_id': document id {province}-{mlsid}-{mlsnumber}-{year}
+            - 'guid': comma-separated geog_ids (all levels) or None
+            - 'source': 'polygon' when guid is found, else None
+    """
+    total = len(listings_df)
+    self.logger.info(f"Starting Polygon Containment for {total} listings")
+    if total == 0:
+      return []
+
+    results = []
+    success_count = 0
+
+    for _, listing in tqdm(listings_df.iterrows(), total=total, desc="Polygon Containment", disable=not show_progress):
+      # Get valid coordinates (uses geocoder to fix invalid coords if needed)
+      lat, lng = self._get_valid_coords(listing)
+
+      guid = None
+      if lat is not None and lng is not None:
+        try:
+          guid = self.geo_collection.compute_guid(lat, lng)
+        except Exception as e:
+          # Log full diagnostic information about the problematic listing
+          self.logger.error("=" * 80)
+          self.logger.error("CRITICAL: Polygon containment failed for listing")
+          self.logger.error("=" * 80)
+          self.logger.error(f"Exception type: {type(e).__name__}")
+          self.logger.error(f"Exception message: {e}")
+          self.logger.error(f"\nListing coordinates:")
+          self.logger.error(f"  Latitude: {lat}")
+          self.logger.error(f"  Longitude: {lng}")
+          self.logger.error(f"\nListing details:")
+          for key, value in listing.items():
+            self.logger.error(f"  {key}: {value}")
+          self.logger.error("=" * 80)
+          # Re-raise the exception to halt processing
+          raise
+
+      if guid:
+        success_count += 1
+
+      doc_id = self._construct_doc_id(listing)
+      results.append({
+        '_id': doc_id,
+        'guid': guid,
+        'source': 'polygon' if guid else None
+      })
+
+    self.logger.info(f"Polygon Containment complete: {success_count}/{total} matched ({success_count/total*100:.1f}%)")
+    return results
+
+  def resolve_by_locallogic_api(self, listings_df: pd.DataFrame, show_progress: bool = True) -> List[Dict]:
+    """
+    LocalLogic API resolution (all levels: g10, g20, g30, g35, g40).
+
+    Uses LocalLogic API to query geographies by lat/lng coordinates.
+    Automatically uses geocoder to fix invalid coordinates before API calls.
+    Geocoded coordinates are cached to avoid duplicate API calls.
+    Gracefully skips if credentials not provided.
+
+    Args:
+        listings_df: DataFrame of listings with IMS field names:
+            - 'Latitude', 'Longitude': Coordinates (will be geocoded if invalid)
+            - 'Address', 'City', 'Province', 'PostalCode': Used for geocoding if needed
+            - 'MLSID', 'MLSNumber', 'WrittenDate': used for _id construction
+
+    Returns:
+        List of result dicts with keys:
+            - '_id': document id {province}-{mlsid}-{mlsnumber}-{year}
+            - 'guid': comma-separated geog_ids (all levels) or None
+            - 'source': 'locallogic_api' when guid is found, else None
+    """
+    total = len(listings_df)
+    self.logger.info(f"Starting LocalLogic API Resolution for {total} listings")
+
+    # Check if LocalLogic client is available
+    if self.locallogic_client is None:
+      self.logger.warning("LocalLogic API client not available, skipping API resolution")
+      return [{'_id': self._construct_doc_id(row), 'guid': None, 'source': None}
+              for _, row in listings_df.iterrows()]
+
+    if total == 0:
+      return []
+
+    results = []
+    success_count = 0
+
+    for _, listing in tqdm(listings_df.iterrows(), total=total, desc="LocalLogic API", disable=not show_progress):
+      # Get valid coordinates (uses geocoder to fix invalid coords if needed)
+      lat, lng = self._get_valid_coords(listing)
+
+      guid = None
+
+      if lat is not None and lng is not None:
+        # Call LocalLogic API
+        geog_dict = self.locallogic_client.get_geographies(lat, lng)
+
+        if geog_dict:
+          # Build comma-separated GUID ordered from finest to coarsest
+          # Order: g40, g35, g30, g20, g10 (reverse of hierarchy)
+          guid_parts = []
+          for level in ['g40', 'g35', 'g30', 'g20', 'g10']:
+            if level in geog_dict:
+              guid_parts.append(geog_dict[level])
+
+          guid = ','.join(guid_parts) if guid_parts else None
+
+      if guid:
+        success_count += 1
+
+      doc_id = self._construct_doc_id(listing)
+      results.append({
+        '_id': doc_id,
+        'guid': guid,
+        'source': 'locallogic_api' if guid else None
+      })
+
+    self.logger.info(f"LocalLogic API complete: {success_count}/{total} matched ({success_count/total*100:.1f}%)")
+    self.logger.info(f"Total API calls made: {self.locallogic_client.total_api_calls}")
+
+    return results
+
+  def resolve(self, listings_df: pd.DataFrame, show_progress: bool = True) -> pd.DataFrame:
+    """
+    Main method to resolve GUIDs for all listings using multi-pass strategy with checkpointing.
+
+    Strategy:
+    1. City name matching (fast, g30 only)
+    2. Polygon containment (batched with checkpoints, all levels, with geocoder fallback)
+    3. LocalLogic API (batched with checkpoints, for failed polygon OR geocoded coords, all levels)
+    4. Merge all GUIDs found for each listing into comprehensive result
+    5. Add 'guid' column to DataFrame inplace
+    6. Update 'Latitude' and 'Longitude' columns with geocoded coordinates if available
+
+    The method modifies the input DataFrame inplace by:
+    - Adding a 'guid' column with resolved geographic identifiers
+    - Updating 'Latitude' and 'Longitude' columns with corrected coordinates
+
+    Checkpointing:
+    - Automatically resumes from last checkpoint if interrupted
+    - Raises RuntimeError if checkpoint is >7 days old (stale job detection)
+    - Cleans up checkpoint files on successful completion
+
+    Args:
+        listings_df: DataFrame with IMS field names (modified inplace)
+        show_progress: Show progress bars
+
+    Returns:
+        Same DataFrame with 'guid' column added and coordinates corrected
+    """
+    total = len(listings_df)
+    self.logger.info(f"Starting multi-pass GUID resolution for {total} listings")
+
+    # Step 1: Load checkpoint metadata (if exists)
+    metadata = self._load_metadata()
+
+    if metadata:
+      # Check if checkpoint is stale (raises RuntimeError if >7 days old)
+      self._check_stale_checkpoint(metadata)
+
+      self.logger.info(f"Resuming from checkpoint: city_completed={metadata['city_completed']}, "
+                       f"polygon_last_batch={metadata['polygon_last_batch']}, "
+                       f"api_last_batch={metadata['api_last_batch']}")
+
+      # Load geocoder cache
+      self._load_geocoder_cache()
+
+      # Validate checkpoint is for same dataset size
+      if metadata['total_listings'] != total:
+        self.logger.warning(f"Checkpoint total_listings mismatch ({metadata['total_listings']} vs {total}), starting fresh")
+        self._cleanup_checkpoints()
+        metadata = None
+
+    if not metadata:
+      self._init_metadata(total)
+      metadata = self._load_metadata()
+
+    # Step 2: Pass 1 - City name matching (fast, no batching)
+    if metadata['city_completed']:
+      self.logger.info("Pass 1/3: City name matching (loading from checkpoint)...")
+      city_results = self._load_results(self.city_results_file)
+    else:
+      self.logger.info("Pass 1/3: City name matching...")
+      city_results = self.resolve_by_city_name(listings_df, show_progress=show_progress)
+      self._save_results(self.city_results_file, city_results)
+      self._update_metadata(city_completed=True)
+
+    city_df = pd.DataFrame(city_results)
+
+    # Step 3: Pass 2 - Polygon containment (batched)
+    self.logger.info("Pass 2/3: Polygon containment...")
+    last_polygon_batch = metadata['polygon_last_batch']
+    polygon_results = self._load_results(self.polygon_results_file)
+
+    # Calculate starting point
+    start_batch_idx = last_polygon_batch + 1
+    start_idx = start_batch_idx * self.checkpoint_batch_size
+
+    if start_idx < total:
+      self.logger.info(f"Resuming polygon from batch {start_batch_idx} (listing {start_idx}/{total})")
+
+      # Calculate total batches for progress tracking
+      total_batches = (total + self.checkpoint_batch_size - 1) // self.checkpoint_batch_size
+
+      # Process remaining batches
+      for batch_start in range(start_idx, total, self.checkpoint_batch_size):
+        batch_idx = batch_start // self.checkpoint_batch_size
+        batch_end = min(batch_start + self.checkpoint_batch_size, total)
+        batch_df = listings_df.iloc[batch_start:batch_end]
+
+        # Log batch progress
+        current_batch = batch_idx + 1  # Convert to 1-based numbering
+        self.logger.info(f"Processing batch {current_batch}/{total_batches} ({len(batch_df)} listings)")
+
+        # Call existing resolve_by_polygon method
+        batch_results = self.resolve_by_polygon(batch_df, show_progress=show_progress)
+
+        # Save checkpoint
+        self._append_results(self.polygon_results_file, batch_results)
+        self._save_geocoder_cache()  # Save at same time
+        self._update_metadata(polygon_last_batch=batch_idx)
+
+        polygon_results.extend(batch_results)
+
+      # Log completion
+      success_count = sum(1 for r in polygon_results if r.get('guid'))
+      self.logger.info(f"Polygon Containment complete: {success_count}/{total} matched ({success_count/total*100:.1f}%)")
+    else:
+      self.logger.info(f"Polygon already completed (all {total} listings)")
+
+    # Deduplicate polygon results by '_id' (keeps last entry for duplicates)
+    # This handles cases where batch size changed and listings were reprocessed
+    if polygon_results:
+      original_count = len(polygon_results)
+      seen_ids = {}
+      for result in polygon_results:
+        doc_id = result['_id']
+        seen_ids[doc_id] = result  # Overwrites duplicates with latest
+      polygon_results = list(seen_ids.values())
+
+      if len(polygon_results) < original_count:
+        self.logger.warning(f"Deduplicated polygon results: {original_count} → {len(polygon_results)} (removed {original_count - len(polygon_results)} duplicates)")
+
+    polygon_df = pd.DataFrame(polygon_results)
+
+    # Step 4: Pass 3 - LocalLogic API (batched, conditional)
+    api_df = None
+    if self.locallogic_client is not None:
+      # Determine which listings need API (failed polygon OR geocoded coords)
+      failed_mask = polygon_df['guid'].isna()
+      geocoded_mask = polygon_df['_id'].isin(self.geocoder_cache.keys())
+      needs_api_mask = failed_mask | geocoded_mask
+      needs_api_count = needs_api_mask.sum()
+
+      if needs_api_count > 0:
+        self.logger.info(f"Pass 3/3: LocalLogic API for {needs_api_count} listings")
+        self.logger.info(f"  - Polygon failures: {failed_mask.sum()}")
+        self.logger.info(f"  - Geocoded coords: {geocoded_mask.sum()}")
+
+        # Get indices of listings needing API
+        api_indices = polygon_df[needs_api_mask].index.tolist()
+        api_listings_df = listings_df.iloc[api_indices].copy()
+
+        # Process in batches
+        last_api_batch = metadata['api_last_batch']
+        api_results = self._load_results(self.api_results_file)
+
+        start_api_batch_idx = last_api_batch + 1
+        start_api_idx = start_api_batch_idx * self.checkpoint_batch_size
+        api_total = len(api_listings_df)
+
+        if start_api_idx < api_total:
+          self.logger.info(f"Resuming API from batch {start_api_batch_idx} (listing {start_api_idx}/{api_total})")
+
+          # Process remaining batches
+          for batch_start in range(start_api_idx, api_total, self.checkpoint_batch_size):
+            batch_idx = batch_start // self.checkpoint_batch_size
+            batch_end = min(batch_start + self.checkpoint_batch_size, api_total)
+            batch_df = api_listings_df.iloc[batch_start:batch_end]
+
+            # Call existing resolve_by_locallogic_api method
+            batch_results = self.resolve_by_locallogic_api(batch_df, show_progress=show_progress)
+
+            # Save checkpoint
+            self._append_results(self.api_results_file, batch_results)
+            self._save_geocoder_cache()  # Save in case geocoding happened
+            self._update_metadata(api_last_batch=batch_idx)
+
+            api_results.extend(batch_results)
+
+          # Log completion
+          success_count = sum(1 for r in api_results if r.get('guid'))
+          self.logger.info(f"LocalLogic API complete: {success_count}/{api_total} matched ({success_count/api_total*100:.1f}%)")
+        else:
+          self.logger.info(f"LocalLogic API already completed (all {api_total} listings)")
+
+        # Deduplicate API results by '_id' (keeps last entry for duplicates)
+        # This handles cases where batch size changed and listings were reprocessed
+        if api_results:
+          original_count = len(api_results)
+          seen_ids = {}
+          for result in api_results:
+            doc_id = result['_id']
+            seen_ids[doc_id] = result  # Overwrites duplicates with latest
+          api_results = list(seen_ids.values())
+
+          if len(api_results) < original_count:
+            self.logger.warning(f"Deduplicated API results: {original_count} → {len(api_results)} (removed {original_count - len(api_results)} duplicates)")
+
+        api_df = pd.DataFrame(api_results)
+      else:
+        self.logger.info("Pass 3/3: Skipping LocalLogic API - all listings resolved by polygon")
+    else:
+      self.logger.info("Pass 3/3: Skipping LocalLogic API - client not available")
+
+    # Step 5: Merge results
+    self.logger.info("Merging results from all passes...")
+    merged_df = self._merge_resolution_results(city_df, polygon_df, api_df)
+
+    # Add guid column to original DataFrame
+    guid_map = merged_df.set_index('_id')['guid'].to_dict()
+    listings_df['guid'] = listings_df.apply(
+      lambda row: guid_map.get(self._construct_doc_id(row)),
+      axis=1
+    )
+
+    # Propagate corrected coordinates from geocoder cache
+    if self.geocoder_cache:
+      self._update_corrected_coordinates(listings_df)
+
+    # Step 6: Mark as completed and cleanup
+    self._update_metadata(status='completed')
+    self._cleanup_checkpoints()
+
+    # Log final statistics
+    resolved_count = listings_df['guid'].notna().sum()
+    self.logger.info(f"Resolution complete: {resolved_count}/{total} listings resolved ({resolved_count/total*100:.1f}%)")
+    self.logger.info(f"Geocoder corrections: {self.stats.get('geocoder_corrections', 0)}")
+
+    return listings_df
+
+  def _merge_resolution_results(self, city_df: pd.DataFrame, polygon_df: pd.DataFrame, api_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Merge GUID results from all resolution methods.
+
+    Strategy: Combine all unique geog_ids from all sources, deduplicate, and order by level.
+
+    Args:
+        city_df: Results from city name matching (g30 only)
+        polygon_df: Results from polygon containment (all levels)
+        api_df: Results from LocalLogic API (all levels, may be None)
+
+    Returns:
+        DataFrame with columns: _id, guid (merged and deduplicated)
+    """
+    # Start with all doc IDs from polygon (which has all listings)
+    merged = polygon_df[['_id']].copy()
+
+    # Merge city results
+    merged = merged.merge(
+      city_df[['_id', 'guid']].rename(columns={'guid': 'city_guid'}),
+      on='_id',
+      how='left'
+    )
+
+    # Merge polygon results
+    merged = merged.merge(
+      polygon_df[['_id', 'guid']].rename(columns={'guid': 'polygon_guid'}),
+      on='_id',
+      how='left'
+    )
+
+    # Merge API results if available
+    if api_df is not None and len(api_df) > 0:
+      merged = merged.merge(
+        api_df[['_id', 'guid']].rename(columns={'guid': 'api_guid'}),
+        on='_id',
+        how='left'
+      )
+    else:
+      merged['api_guid'] = None
+
+    # Merge GUIDs from all sources (vectorized)
+    merged['guid'] = merged.apply(
+      lambda row: self._combine_guids(row['city_guid'], row['polygon_guid'], row['api_guid']),
+      axis=1
+    )
+
+    return merged[['_id', 'guid']]
+
+  def _combine_guids(self, city_guid, polygon_guid, api_guid) -> Optional[str]:
+    """
+    Combine GUIDs from all sources into a single comprehensive GUID.
+
+    Collects all unique geog_ids from all sources, deduplicates, and orders by level.
+
+    Args:
+        city_guid: GUID from city name matching (g30 only)
+        polygon_guid: GUID from polygon containment (all levels)
+        api_guid: GUID from LocalLogic API (all levels)
+
+    Returns:
+        Comma-separated GUID with all unique geog_ids, ordered by level (g40→g10)
+    """
+    all_geog_ids = set()
+
+    # Collect geog_ids from all sources
+    for guid_str in [city_guid, polygon_guid, api_guid]:
+      if pd.notna(guid_str) and guid_str:
+        all_geog_ids.update(guid_str.split(','))
+
+    if not all_geog_ids:
+      return None
+
+    # Sort by level (g40, g35, g30, g20, g10)
+    level_order = {'g40': 0, 'g35': 1, 'g30': 2, 'g20': 3, 'g10': 4}
+
+    def sort_key(geog_id):
+      prefix = geog_id[:3]
+      return level_order.get(prefix, 99)
+
+    sorted_ids = sorted(all_geog_ids, key=sort_key)
+
+    return ','.join(sorted_ids)
+
+  def _update_corrected_coordinates(self, listings_df: pd.DataFrame):
+    """
+    Update DataFrame with corrected coordinates from geocoder cache.
+
+    Propagates geocoded coordinates back to the original DataFrame inplace.
+    Only updates rows where coordinates were originally invalid/missing and
+    geocoder successfully resolved them.
+
+    This is a vectorized operation using pandas merge for efficiency.
+
+    Args:
+        listings_df: DataFrame to update (modified inplace)
+    """
+    if not self.geocoder_cache:
+      return
+
+    # Build DataFrame from geocoder cache
+    corrections = []
+    for doc_id, (lat, lng) in self.geocoder_cache.items():
+      if lat is not None and lng is not None:
+        corrections.append({'_doc_id': doc_id, 'corrected_lat': lat, 'corrected_lng': lng})
+
+    if not corrections:
+      return
+
+    corrections_df = pd.DataFrame(corrections)
+
+    # Add temporary _doc_id column (vectorized)
+    listings_df['_doc_id'] = listings_df.apply(lambda row: self._construct_doc_id(row), axis=1)
+
+    # Merge corrections using a temporary variable (to avoid breaking the reference to original DataFrame)
+    merged_df = listings_df.merge(corrections_df, on='_doc_id', how='left')
+
+    # Update Latitude and Longitude where corrections exist (vectorized)
+    has_correction = merged_df['corrected_lat'].notna()
+    correction_count = has_correction.sum()
+
+    if correction_count > 0:
+      # Update the ORIGINAL DataFrame using values from the merged DataFrame
+      listings_df.loc[has_correction, 'Latitude'] = merged_df.loc[has_correction, 'corrected_lat'].values
+      listings_df.loc[has_correction, 'Longitude'] = merged_df.loc[has_correction, 'corrected_lng'].values
+
+      self.logger.info(f"Updated {correction_count} listings with corrected coordinates from geocoder")
+
+    # Drop temporary _doc_id column from original DataFrame
+    listings_df.drop(columns=['_doc_id'], inplace=True, errors='ignore')

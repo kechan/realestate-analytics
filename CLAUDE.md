@@ -323,12 +323,12 @@ raw_ims_df.loc[ab_duplex_mask, 'propertyType'] = 'SEMI-DETACHED'
      - Bedrooms → bedsInt, Baths → bathsInt
 
    - **Constructed fields**:
-     - `_id`: Constructed as `{province}-{MLSID}-{MLSNumber}` (lowercase)
+     - `_id`: Constructed as `{province}-{mlsid}-{mlsnumber}-{year}` (lowercase, 4 parts)
      - `beds`, `baths`: String versions of bedsInt/bathsInt for legacy compatibility
      - `listingStatus`: Hardcoded as "SOLD" for all IMS records
 
    - **Missing/Placeholder fields**:
-     - `guid`, `computed_guid`: Not available (Boss working on geographic mapping)
+     - `guid`: Populated during bulk import via MultiPassGUIDResolver (~94% success rate)
      - `transitions`, `lastUpdate`: Set as None (not used downstream)
      - `listingType`: None (legacy field, not in IMS)
      - `searchCategoryType`: None (NOT used in IMS ETL logic - only for legacy RLP)
@@ -342,7 +342,7 @@ raw_ims_df.loc[ab_duplex_mask, 'propertyType'] = 'SEMI-DETACHED'
 - **Data Lag**: Sold listings can arrive up to 1 year after transaction date
 - **Field Names**: Requires preprocessing to match canonical schema
 
-**Current Status**: `get_ims_sold_listings()` is a PLACEHOLDER - returns empty DataFrame until IMS ES index is available. All preprocessing logic is implemented and ready for activation.
+**Current Status**: `get_ims_sold_listings()` is fully functional and actively queries the `rlp_ims_sold_listing_current` index. GUID resolution is performed during bulk import via MultiPassGUIDResolver.
 
 ### Testing Framework
 - Uses Python's built-in `unittest` framework

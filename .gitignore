@@ -175,3 +175,6 @@ scripts/uat_config.yaml
 scripts/*.txt
 scripts/*.json
 scripts/backup
+
+# MCP
+.playwright-mcp/

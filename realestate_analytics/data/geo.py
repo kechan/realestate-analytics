@@ -379,12 +379,63 @@ class Geo:
   def __repr__(self):
     return f"Geo(geog_id='{self.geog_id}', name='{self.name}', level={self.level}, longId={self.long_id})"
 
+  def equals(self, other: object) -> bool:
+    """
+    Deep equality check between Geo objects, ignoring timestamp fields.
+
+    Ignores: created, modified, uploaded, logger, _multipolygon.
+    Compares children/overlaps by geog_id.
+    """
+    if not isinstance(other, Geo):
+      return False
+
+    ignore_fields = {'created', 'modified', 'uploaded', 'logger', '_multipolygon'}
+
+    def to_comparable(g: 'Geo') -> dict:
+      data = {
+        k: v
+        for k, v in vars(g).items()
+        if k not in ignore_fields and not k.startswith('__')
+      }
+      data['children'] = sorted([c.geog_id for c in g.children]) if g.children else []
+      data['overlaps'] = sorted([o.geog_id for o in g.overlaps]) if g.overlaps else []
+      return data
+
+    return to_comparable(self) == to_comparable(other)
+
 
   @classmethod
-  def from_geog_id(cls, geog_id: str, datastore: Datastore) -> 'Geo':
+  def from_geog_id(cls, geog_id: str, datastore: Datastore, require_details: bool = True) -> 'Geo':
+    """
+    Create a Geo object from a geog_id by querying the datastore.
+
+    Args:
+      geog_id: The geographic ID to fetch
+      datastore: The Datastore instance to query
+      require_details: If True, raises exception if geo_details not found.
+                      If False, creates Geo with basic data only (detail fields = None)
+
+    Returns:
+      Geo object
+
+    Raises:
+      Exception: If geo_base not found, or if require_details=True and geo_details not found
+    """
     geo_base = datastore.search(index=datastore.geo_index_name, _id=geog_id)[0]
-    geo_details = datastore.search(index=datastore.geo_details_en_index_name, _id=geog_id)[0]
-    geo_dict = {**geo_base, **geo_details}
+
+    # Try to fetch geo_details, but allow graceful degradation
+    try:
+      geo_details = datastore.search(index=datastore.geo_details_en_index_name, _id=geog_id)[0]
+      geo_dict = {**geo_base, **geo_details}
+    except (IndexError, Exception) as e:
+      if require_details:
+        raise  # Re-raise if details are required
+      # Log warning and proceed with basic data only
+      import logging
+      logger = logging.getLogger(cls.__name__)
+      logger.warning(f"No details found for {geog_id}, creating Geo with basic data only: {e}")
+      geo_dict = geo_base
+
     return cls.from_dict(geo_dict)
   
   @classmethod
@@ -585,31 +636,106 @@ class GeoCollection:
     return collection
   
   @classmethod
-  def from_datastore(cls, datastore: Datastore) -> 'GeoCollection':
+  def from_datastore(cls, datastore: Datastore, require_details: bool = False,
+                     fix_relationships: bool = True) -> 'GeoCollection':
+    """
+    Create a GeoCollection from an Elasticsearch datastore.
+
+    This method replicates the "golden standard" logic from the Geo.ipynb notebook,
+    which includes loading geos, fixing parent IDs, and populating children relationships.
+
+    Args:
+      datastore: The Datastore instance to query
+      require_details: If True, geos without details will be excluded.
+                      If False (default), geos without details will be included with None values.
+      fix_relationships: If True (default), fix parent_ids and populate children after loading.
+                        This is critical for compute_guid() performance (~100x improvement).
+
+    Returns:
+      GeoCollection with all geos from the datastore, with relationships established
+    """
 
     geo_list = []
     fail_list = []
-    for geo_base in datastore.search(index=datastore.geo_index_name, selects=['localLogicId', 'longId', 'path'], size=None):
-      geog_id = geo_base['localLogicId']
 
-      try:
-        geo = Geo.from_geog_id(geog_id=geog_id, datastore=datastore)
-        geo_list.append(geo)
-      except Exception as e:
-        cls.logger.warning(f"Error creating Geo object for {geog_id}: {e}")
-        fail_list.append(geog_id)
+    # Step 1: Fetch list of all geo IDs from geo_index
+    cls.logger.info("Fetching geo list from datastore...")
+    geo_infos = datastore.search(
+      index=datastore.geo_index_name,
+      selects=['localLogicId', 'longId', 'path'],
+      size=None
+    )
+    cls.logger.info(f"Found {len(geo_infos)} geos in geo_index")
 
-    cls.logger.warning(f"Failed to create Geo objects for {len(fail_list)} geos")
+    geog_ids = [g['localLogicId'] for g in geo_infos]
 
-    # try again 2nd time for failed geos
-    for geog_id in fail_list:
-      try:
-        geo = Geo.from_geog_id(geog_id=geog_id, datastore=datastore)
-        geo_list.append(geo)
-      except Exception as e:
-        cls.logger.error(f"Error creating Geo object for {geog_id}: {e}")
-      
-    return cls.from_list(geo_list)
+    def _chunked(iterable, size):
+      for i in range(0, len(iterable), size):
+        yield iterable[i:i + size]
+
+    def _mget(index: str, ids: List[str]) -> Dict[str, dict]:
+      """Fetch documents by id using mget; returns dict geog_id -> _source."""
+      resp = datastore.es.mget(index=index, body={"ids": ids})
+      docs = {}
+      for doc in resp.get('docs', []):
+        geog_id = doc.get('_id')
+        if doc.get('found') and geog_id:
+          docs[geog_id] = doc.get('_source', {})
+        else:
+          cls.logger.warning(f"Document with ID '{geog_id}' not found in index '{index}'.")
+      return docs
+
+    batch_size = 500  # balance between payload size and request count
+
+    # Step 2: Load geos in batches to reduce per-id round trips
+    total_batches = (len(geog_ids) + batch_size - 1) // batch_size
+    for id_batch in tqdm(_chunked(geog_ids, batch_size), total=total_batches, desc="Loading geos from datastore"):
+      base_docs = _mget(datastore.geo_index_name, id_batch)
+      detail_docs = _mget(datastore.geo_details_en_index_name, id_batch)
+
+      for geog_id in id_batch:
+        base_doc = base_docs.get(geog_id)
+        if not base_doc:
+          fail_list.append(geog_id)
+          continue
+
+        details = detail_docs.get(geog_id)
+        if details:
+          geo_dict = {**base_doc, **details}
+        else:
+          if require_details:
+            cls.logger.warning(f"No details found for {geog_id}, skipping due to require_details=True")
+            fail_list.append(geog_id)
+            continue
+          cls.logger.warning(f"No details found for {geog_id}, creating Geo with basic data only")
+          geo_dict = base_doc
+
+        try:
+          geo = Geo.from_dict(geo_dict)
+          geo_list.append(geo)
+        except Exception as e:
+          cls.logger.warning(f"Error creating Geo object for {geog_id}: {e}")
+          fail_list.append(geog_id)
+
+    if fail_list:
+      cls.logger.warning(f"Failed to create Geo objects for {len(fail_list)} geos: {fail_list}")
+
+    # Step 3: Create the collection
+    collection = cls.from_list(geo_list)
+    cls.logger.info(f"Created GeoCollection with {len(collection)} geos")
+
+    # Step 4: Post-processing to establish relationships (matching notebook cells 21, 30)
+    if fix_relationships:
+      cls.logger.info("Fixing parent IDs using geometric containment...")
+      fixed_count, could_not_find = collection.fix_parent_ids()
+      cls.logger.info(f"Fixed {fixed_count} parent IDs")
+      if could_not_find:
+        cls.logger.warning(f"Could not find parents for {len(could_not_find)} geos: {could_not_find[:10]}...")
+
+      cls.logger.info("Populating children relationships...")
+      collection.populate_children()
+
+    return collection
 
 
   def save(self, file_path: str, use_dill: bool = False) -> None:
@@ -647,49 +773,6 @@ class GeoCollection:
     assert 'lat' in df.columns and 'lng' in df.columns, "Latitude and longitude columns are required in the DataFrame"
     
     self.logger.info(f'# of geos in collection: {len(self)}')
-
-    def construct_guid(lat: float, lng: float) -> str:
-      """
-      Construct a GUID for a given latitude and longitude.
-      Returns:
-      - str: A string representing the GUID, which is a comma-separated list of geo
-            region identifiers that contain the given point, ordered from the finest level
-            of granularity to the coarsest. Returns None if no geographic regions contain
-            the point.
-      """
-      levels = [40, 35, 30, 20, 10]
-      found_geos = []
-      searched_levels = set()
-
-      def search_geo(level, parent_geo=None):
-        """Search for the geo at the current level or that belonging to the given parent."""
-        if level in searched_levels:
-          return None
-        geos = parent_geo.children if parent_geo else self.get_by_level(level)
-        searched_levels.add(level)
-        for geo in geos:
-          if geo.contains_point(lat, lng):
-            return geo
-        return None
-
-      # Start from the coarsest level (40) and work down to the finest (10)
-      parent_geo = None
-      for level in levels:
-        geo = search_geo(level, parent_geo)
-        if geo:
-          if geo not in found_geos:
-            found_geos.append(geo)
-            # Check for overlaps at this level
-            for overlap_geo in geo.overlaps:
-              if overlap_geo.contains_point(lat, lng) and overlap_geo not in found_geos:
-                found_geos.append(overlap_geo)
-          parent_geo = geo
-        else:
-          parent_geo = None
-
-      # Construct the GUID string
-      guid = ','.join([geo.geog_id for geo in reversed(found_geos)])
-      return guid if guid else None
     
     # just fix here those 'None' a string with None, they are really None.
     df['guid'] = df['guid'].replace({'None': None})
@@ -707,10 +790,52 @@ class GeoCollection:
         lat, lng = row['lat'], row['lng']
 
         # old_guid = row['guid']  # Fetch the old GUID for comparison    
-        guid = construct_guid(lat, lng)
+        guid = self.compute_guid(lat, lng)
         
         df.loc[i, 'computed_guid'] = None if guid == '' else guid
         df.loc[i, 'guid'] = None if guid == '' else guid
+
+  def compute_guid(self, lat: float, lng: float) -> Optional[str]:
+    """
+    Construct a GUID for a given latitude and longitude.
+
+    Returns a comma-separated list of geog_ids ordered from the finest level
+    to the coarsest for regions containing the point, or None when no match.
+    """
+    if pd.isna(lat) or pd.isna(lng):
+      return None
+
+    levels = [40, 35, 30, 20, 10]
+    found_geos = []
+    searched_levels = set()
+
+    def search_geo(level, parent_geo=None):
+      """Search for the geo at the current level or that belonging to the given parent."""
+      if level in searched_levels:
+        return None
+      geos = parent_geo.children if parent_geo else self.get_by_level(level)
+      searched_levels.add(level)
+      for geo in geos:
+        if geo.contains_point(lat, lng):
+          return geo
+      return None
+
+    parent_geo = None
+    for level in levels:
+      geo = search_geo(level, parent_geo)
+      if geo:
+        if geo not in found_geos:
+          found_geos.append(geo)
+          # Check for overlaps at this level
+          for overlap_geo in geo.overlaps:
+            if overlap_geo.contains_point(lat, lng) and overlap_geo not in found_geos:
+              found_geos.append(overlap_geo)
+        parent_geo = geo
+      else:
+        parent_geo = None
+
+    guid = ','.join([geo.geog_id for geo in reversed(found_geos)])
+    return guid if guid else None
 
   def restore_all_overlaps(self):
     """Restore overlaps for all geos after deserialization."""
@@ -803,17 +928,16 @@ class GeoCollection:
       self._index_by_id[geo_id].children = children
 
     # Count total geos with children
-    # geos_with_children = sum(1 for geo in geo_dict.values() if geo.children)
-    n = self.filter(lambda g: len(g.children) > 0)
+    geos_with_children = len(self.filter(lambda g: len(g.children) > 0))
 
-    print(f"Populated children for {n} Geo objects")
+    print(f"Populated children for {geos_with_children} Geo objects")
 
   def compute_overlaps(self):
     """Compute overlaps for each Geo object in the collection based on their level."""
     for level, geos in self._index_by_level.items():
       print(f"Computing overlaps for level {level} with {len(geos)} geos.")
       
-      for i, geo in enumerate(geos):
+      for i, geo in tqdm(enumerate(geos), total=len(geos), desc=f"Level {level} overlaps"):
         # Skip if the geometry is None
         if geo._multipolygon is None:
           print(f"Geometry is None for {geo.geog_id}. Skipping.")

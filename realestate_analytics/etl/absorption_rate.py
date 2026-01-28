@@ -304,12 +304,10 @@ class AbsorptionRateProcessor(BaseETLProcessor):
   def _load_from_cache(self):
     super()._load_from_cache()
     
-    # Load sold listings from new IMS source (5 years)
-    # TODO: when IMS data is ready, this should be:
-    # self.sold_listing_df = self.cache.get(f'SoldMedianMetricsProcessor/{self.prov_code.lower()}_five_years_sold_listing')    
-    self.sold_listing_df = self.cache.get('SoldMedianMetricsProcessor/on_five_years_sold_listing')  # formerly f'{nearby_comparable_solds_prefix}one_year_sold_listing'
+    # Load sold listings from new IMS source (5 years) - now available for all provinces
+    self.sold_listing_df = self.cache.get(f'SoldMedianMetricsProcessor/{self.prov_code.lower()}_five_years_sold_listing')
 
-    self.listing_df = self.cache.get(f'NearbyComparableSoldsProcessor/{self.prov_code.lower()}_listing')  # TODO: need prov_code param later
+    self.listing_df = self.cache.get(f'NearbyComparableSoldsProcessor/{self.prov_code.lower()}_listing')
 
     # Load cached current counts time series
     # IMPORTANT: this has to be pre-seeded from current staging run 
@@ -650,7 +648,41 @@ class AbsorptionRateProcessor(BaseETLProcessor):
 
     return success, failed
 
-  
+
+  def delete_all_months_of_inventory(self):
+    """
+    Deletes the 'months_of_inventory' field from all documents in the market trends time series index.
+    """
+    def generate_actions():
+      query = {
+        "query": {
+          "exists": {
+            "field": "metrics.months_of_inventory"
+          }
+        }
+      }
+      for hit in scan(self.datastore.es, index=self.datastore.mkt_trends_index_name, query=query):
+        yield {
+          "_op_type": "update",
+          "_index": self.datastore.mkt_trends_index_name,
+          "_id": hit["_id"],
+          "script": {
+            "source": """
+            if (ctx._source.metrics != null) {
+              ctx._source.metrics.remove('months_of_inventory');
+            }
+            """
+          }
+        }
+
+    success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
+
+    self.logger.info(f"Delete months of inventory: Successfully updated {success} documents")
+    if failed:
+      self.logger.error(f"Delete months of inventory: Failed to update {len(failed)} documents")
+      self.datastore.summarize_update_failures(failed)
+
+    return success, failed
 
 
   def delete_checkpoints_data(self):
