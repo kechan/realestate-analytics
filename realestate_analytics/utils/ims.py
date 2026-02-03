@@ -73,12 +73,13 @@ class IMSPropertyTypeMapper:
       ],
       'SEMI-DETACHED': [
         'semi', 'half duplex', '1/2 duplex', 'semi detached', 'semi-detached',
-        'over-under', 'side by side'
+        'over-under', 'side by side',
+        'link'  # Link homes - minimal connection, more similar to semi than townhouse (mgmt approved 2026-01-28)
         # Note: 'duplex' goes to OTHER (AB exception handled in es.py)
       ],
       'TOWNHOUSE': [
-        'townhouse', 'row', 'row/townhouse', 'town house', 'condo townhouse',
-        'link'  # Link homes are typically townhouse style
+        'townhouse', 'row', 'row/townhouse', 'town house', 'condo townhouse'
+        # 'link' removed 2026-01-28 - now classified as SEMI-DETACHED (minimal connection vs row housing)
       ],
       'DETACHED': [
         'detached', 'single family', 'house', 'bungalow', 'bungaloft',
@@ -183,16 +184,43 @@ class IMSPropertyTypeMapper:
     if any(token in style_clean for token in mobile_tokens):
         return "MOBILE_MINI"
 
-    # PRIORITY 0.5: Handle all plex cases first
-    plex_patterns = ['triplex', 'fourplex', '4 plex', 'multiplex',
-                     '4plex', '5plex', '6plex', '7plex', '8plex',
-                    'duplex', 'dixplex', 'huitplex', 'cinqplex'
-                     ]
+    # PRIORITY 0.45: Duplex + Semi patterns → SEMI-DETACHED
+    # Management approved 2026-01-28: Reclassify duplex with semi indicators as SEMI-DETACHED
+    # Exclude: apartment/condo ownership types and multi-family (keep as OTHER/CONDO)
+    if 'apartment' not in type_clean and 'condo' not in type_clean and not ('multi' in type_clean and 'family' in type_clean):
+      # Pattern 1: Type=Duplex → SEMI-DETACHED
+      # Management approved 2026-01-29: Trust Type field above SubType/Style (Type is the higher order bit)
+      # All Type=Duplex → SEMI-DETACHED (except apartment/condo/multi-family already excluded above)
+      if type_clean == 'duplex':
+        return 'SEMI-DETACHED'
 
-    # Check for non-duplex plexes → OTHER (highest priority)
-    for plex in plex_patterns:
-      if plex in combined_text:
-        return "OTHER"
+      # Pattern 2: Type contains "semi" AND "duplex"
+      # Matches: Semi Detached half Duplex / ... / Duplex (2 listings)
+      if 'semi' in type_clean and 'duplex' in type_clean:
+        return 'SEMI-DETACHED'
+
+      # Pattern 3: Style contains both "duplex" AND "semi"
+      # Matches: Residential/Other / N/R / Semi Detached, Duplex (112 listings)
+      if ('duplex' in style_clean or '1/2 duplex' in style_clean or 'half duplex' in style_clean) and 'semi' in style_clean:
+        return 'SEMI-DETACHED'
+
+      # Pattern 4: Half Duplex or 1/2 Duplex → SEMI-DETACHED
+      # Matches: BC/AB "Half Duplex" SubType (~15,000 listings)
+      if 'half duplex' in combined_text or '1/2 duplex' in combined_text:
+        return 'SEMI-DETACHED'
+
+    # PRIORITY 0.5: Handle all plex cases first
+    # BUT exclude half duplex and 1/2 duplex - those are semi-detached (management approved 2026-01-28)
+    if 'half duplex' not in combined_text and '1/2 duplex' not in combined_text:
+      plex_patterns = ['triplex', 'fourplex', '4 plex', 'multiplex',
+                       '4plex', '5plex', '6plex', '7plex', '8plex',
+                      'duplex', 'dixplex', 'huitplex', 'cinqplex'
+                       ]
+
+      # Check for non-duplex plexes → OTHER (highest priority)
+      for plex in plex_patterns:
+        if plex in combined_text:
+          return "OTHER"
 
     # Handle duplex → OTHER (base classification, AB exception in es.py)
     if (
@@ -269,7 +297,27 @@ class IMSPropertyTypeMapper:
     # if 'semi detached' in subtype_clean or 'semi-detached' in subtype_clean or 'semi - detached' in subtype_clean:
     if 'semi' in subtype_clean:
       return "SEMI-DETACHED"
-    if 'townhouse' in subtype_clean or 'attached' in subtype_clean or 'row house' in subtype_clean or 'row unit' in subtype_clean:
+    # Keep only strong TOWNHOUSE signals (no ambiguity)
+    if 'townhouse' in subtype_clean or 'row house' in subtype_clean or 'row unit' in subtype_clean:
+      return "TOWNHOUSE"
+
+    # Handle SubType=Attached based on Style field
+    # SubType=Attached is ambiguous - use Style to distinguish SEMI-DETACHED from TOWNHOUSE
+    if 'attached' in subtype_clean:
+      # Override: Penthouse is always CONDO
+      if 'penthouse' in style_clean:
+        return "CONDO"
+
+      # If Style indicates row/townhouse → TOWNHOUSE
+      if 'row' in style_clean or 'townhouse' in style_clean or 'twnhouse' in style_clean:
+        return "TOWNHOUSE"
+
+      # If Style indicates standalone dwelling → SEMI-DETACHED
+      standalone_styles = ['bungalow', 'storey', 'story', 'bi-level', 'split', 'raised', 'tri-level']
+      if any(style_word in style_clean for style_word in standalone_styles):
+        return "SEMI-DETACHED"
+
+      # Default: preserve old behavior for ambiguous cases → TOWNHOUSE
       return "TOWNHOUSE"
     if 'detached' in subtype_clean:
       return "DETACHED"
@@ -463,7 +511,11 @@ class IMSPropertyTypeMapper:
     self._log_unclear_mappings(new_unclear_combos=new_unclear_combos)
 
     # Log newly-resolved mappings to CSV for audit and validation
-    self._log_new_resolved_mappings(new_resolved_combos=new_resolved_combos)
+    # Skip if no initial cache (all combinations would be "new", causing massive slowdown)
+    if cached_count > 0:
+      self._log_new_resolved_mappings(new_resolved_combos=new_resolved_combos)
+    else:
+      self.logger.info("Skipping resolved mappings log (no initial cache - all combinations are new)")
 
     return self.cached_mapping_df
 

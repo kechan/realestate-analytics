@@ -1035,6 +1035,350 @@ class Datastore:
 
     return success, failed
 
+  
+  def bulk_update_ims_sold_listings(                                                                                                                                                                   
+      self,                                                                                                                                                                                            
+      csv_path: Path,                                                                                                                                                                                  
+      mode: str,                                                                                                                                                                                       
+      batch_size: int = 500                                                                                                                                                                            
+  ) -> Tuple[int, List[dict]]:                                                                                                                                                                         
+    """                                                                                                                                                                                                
+    Selectively update IMS sold listings in Elasticsearch.                                                                                                                                             
+                                                                                                                                                                                                       
+    This method allows updating only specific fields without re-processing                                                                                                                             
+    expensive operations like GUID resolution or property type mapping.                                                                                                                                
+                                                                                                                                                                                                       
+    **IMPORTANT**: This method uses ES update operations, which means:                                                                                                                                 
+    - Only specified fields are modified                                                                                                                                                               
+    - All other fields in existing documents are preserved unchanged                                                                                                                                   
+    - Update will FAIL if document doesn't exist (safety feature)                                                                                                                                      
+    - Run full bulk_import_ims_sold_listings first to create documents                                                                                                                                 
+                                                                                                                                                                                                       
+    Args:                                                                                                                                                                                              
+        csv_path: Path to IMS CSV file with updated data                                                                                                                                               
+        mode: Update mode - one of:                                                                                                                                                                    
+            - "propertyType": Update only propertyType field                                                                                                                                           
+                             (runs property type mapping, skips GUID resolution)                                                                                                                       
+            - "guid": Update only guid field                                                                                                                                                           
+                     (runs GUID resolution, skips property type mapping)                                                                                                                               
+            - "IMS": Update all IMS data fields EXCEPT guid and propertyType                                                                                                                           
+                    (skips both expensive operations)                                                                                                                                                  
+        batch_size: Documents per ES bulk batch (default 500)                                                                                                                                          
+                                                                                                                                                                                                       
+    Returns:                                                                                                                                                                                           
+        (success_count, failed_list): Tuple of successful update count and list of failures                                                                                                            
+                                                                                                                                                                                                       
+    Raises:                                                                                                                                                                                            
+        ValueError: If mode not in ["propertyType", "guid", "IMS"]                                                                                                                                     
+                                                                                                                                                                                                       
+    Example:                                                                                                                                                                                           
+        # After fixing property type mapper logic                                                                                                                                                      
+        datastore.bulk_update_ims_sold_listings(                                                                                                                                                       
+            csv_path=Path('IMSData2025.csv'),                                                                                                                                                          
+            mode="propertyType"                                                                                                                                                                        
+        )                                                                                                                                                                                              
+        # This updates ONLY propertyType field, preserving guid and all other fields                                                                                                                   
+    """                                                                                                                                                                                                
+    # Validate mode parameter                                                                                                                                                                          
+    valid_modes = ["propertyType", "guid", "IMS"]                                                                                                                                                      
+    if mode not in valid_modes:                                                                                                                                                                        
+      raise ValueError(f"Invalid mode '{mode}'. Must be one of: {valid_modes}")                                                                                                                        
+                                                                                                                                                                                                       
+    self.logger.info(f"Starting bulk UPDATE with mode='{mode}' for {csv_path}")                                                                                                                        
+    overall_start = time.time()                                                                                                                                                                        
+                                                                                                                                                                                                       
+    # Step 1: Load CSV                                                                                                                                                                                 
+    self.logger.info(f"Loading CSV from {csv_path}")                                                                                                                                                   
+    try:                                                                                                                                                                                               
+      df = pd.read_csv(csv_path)                                                                                                                                                                       
+      self.logger.info(f"Loaded {len(df)} rows from CSV")                                                                                                                                              
+    except FileNotFoundError:                                                                                                                                                                          
+      return 0, [{"error": f"CSV file not found: {csv_path}"}]                                                                                                                                         
+    except Exception as e:                                                                                                                                                                             
+      return 0, [{"error": f"Failed to read CSV: {str(e)}"}]                                                                                                                                           
+                                                                                                                                                                                                       
+    if df.empty:                                                                                                                                                                                       
+      return 0, [{"error": "CSV file is empty"}]                                                                                                                                                       
+                                                                                                                                                                                                       
+    # Step 2: Mode-dependent column validation                                                                                                                                                         
+    base_required = ['MLSNumber', 'MLSID', 'Province', 'WrittenDate']                                                                                                                                  
+                                                                                                                                                                                                       
+    if mode == "propertyType":                                                                                                                                                                         
+      required_columns = base_required + ['Type', 'SubType', 'Style']                                                                                                                                  
+    elif mode == "guid":                                                                                                                                                                               
+      required_columns = base_required + ['Latitude', 'Longitude', 'City', 'Community']                                                                                                                
+    elif mode == "IMS":                                                                                                                                                                                
+      required_columns = base_required + [                                                                                                                                                             
+        'SoldPrice', 'ListPrice', 'DaysOnMarket',                                                                                                                                                      
+        'Address', 'City', 'PostalCode', 'FSA',                                                                                                                                                        
+        'Bedrooms', 'Baths', 'SquareFoot', 'YearBuilt', 'Garage'                                                                                                                                       
+      ]                                                                                                                                                                                                
+                                                                                                                                                                                                       
+    missing_cols = [col for col in required_columns if col not in df.columns]                                                                                                                          
+    if missing_cols:                                                                                                                                                                                   
+      return 0, [{"error": f"Missing required columns for mode '{mode}': {missing_cols}"}]                                                                                                             
+                                                                                                                                                                                                       
+    self.logger.info(f"Column validation passed for mode '{mode}'")                                                                                                                                    
+                                                                                                                                                                                                       
+    # Step 3: Numeric conversion (shared across all modes)                                                                                                                                             
+    self.logger.info("Converting numeric columns...")                                                                                                                                                  
+    numeric_columns = {                                                                                                                                                                                
+      'SoldPrice': float,                                                                                                                                                                              
+      'ListPrice': float,                                                                                                                                                                              
+      'DaysOnMarket': int,                                                                                                                                                                             
+      'Latitude': float,                                                                                                                                                                               
+      'Longitude': float,                                                                                                                                                                              
+      'Bedrooms': int,                                                                                                                                                                                 
+      'Baths': float,                                                                                                                                                                                  
+      'SquareFoot': int,                                                                                                                                                                               
+      'Garage': int,                                                                                                                                                                                   
+      'ListingSellingPriceDiff': float                                                                                                                                                                 
+    }                                                                                                                                                                                                  
+                                                                                                                                                                                                       
+    for col, dtype in numeric_columns.items():                                                                                                                                                         
+      if col in df.columns:                                                                                                                                                                            
+        df[col] = pd.to_numeric(df[col], errors='coerce')                                                                                                                                              
+                                                                                                                                                                                                       
+    # Step 4: Conditional - Property Type Mapping (only for mode="propertyType")                                                                                                                       
+    if mode == "propertyType":                                                                                                                                                                         
+      self.logger.info("Running property type mapping...")                                                                                                                                             
+      property_type_start = time.time()                                                                                                                                                                
+                                                                                                                                                                                                       
+      # Initialize mapper if needed                                                                                                                                                                    
+      if self.ims_mapper is None:                                                                                                                                                                      
+        if self.cache_dir is None:                                                                                                                                                                     
+          return 0, [{"error": "Cache directory not set - cannot initialize IMS property type mapper"}]                                                                                                
+                                                                                                                                                                                                       
+        cached_mapping_path = self.cache_dir / 'ims_property_type_mapping_v4_df'                                                                                                                       
+        self.logger.info(f"Initializing IMS property type mapper with cache: {cached_mapping_path}")                                                                                                   
+        self.ims_mapper = IMSPropertyTypeMapper(                                                                                                                                                       
+          cached_mapping_path=cached_mapping_path,                                                                                                                                                     
+          logger=self.logger                                                                                                                                                                           
+        )                                                                                                                                                                                              
+                                                                                                                                                                                                       
+      # Load data and generate mappings                                                                                                                                                                
+      self.ims_mapper.load_dataframe(df)                                                                                                                                                               
+      self.logger.info("Generating full property type mapping...")                                                                                                                                     
+      self.ims_mapper.generate_full_mapping_dataframe()                                                                                                                                                
+                                                                                                                                                                                                       
+      # Apply property types via vectorized lookup                                                                                                                                                     
+      self.ims_mapper.apply_property_types()                                                                                                                                                           
+                                                                                                                                                                                                       
+      # Apply provincial overrides (AB duplex rule)                                                                                                                                                    
+      ab_duplex_mask = (                                                                                                                                                                               
+        (df['Province'] == 'AB') &                                                                                                                                                                     
+        ((df['SubType'] == 'Duplex') | (df['SubType'] == 'Full Duplex') |                                                                                                                              
+         (df['SubType'] == 'Half Duplex') | (df['SubType'] == 'Duplex Side By Side'))                                                                                                                  
+      )                                                                                                                                                                                                
+      if ab_duplex_mask.any():                                                                                                                                                                         
+        override_count = ab_duplex_mask.sum()                                                                                                                                                          
+        df.loc[ab_duplex_mask, 'propertyType'] = 'SEMI-DETACHED'                                                                                                                                       
+        self.logger.info(f"Applied AB duplex override to {override_count:,} listings")                                                                                                                 
+                                                                                                                                                                                                       
+      # Save updated mapping cache                                                                                                                                                                     
+      try:                                                                                                                                                                                             
+        self.ims_mapper.save_mapping()                                                                                                                                                                 
+        self.logger.info("Saved updated property type mapping cache")                                                                                                                                  
+      except Exception as e:                                                                                                                                                                           
+        self.logger.warning(f"Failed to save mapping cache: {e}")                                                                                                                                      
+                                                                                                                                                                                                       
+      # Log property type distribution                                                                                                                                                                 
+      if 'propertyType' in df.columns:                                                                                                                                                                 
+        type_dist = df['propertyType'].value_counts()                                                                                                                                                  
+        self.logger.info(f"Property type distribution:\n{type_dist}")                                                                                                                                  
+                                                                                                                                                                                                       
+      property_type_elapsed = time.time() - property_type_start                                                                                                                                        
+      self.logger.info(f"Property type mapping completed in {property_type_elapsed:.2f}s")                                                                                                             
+                                                                                                                                                                                                       
+    else:                                                                                                                                                                                              
+      self.logger.info(f"Skipping property type mapping (mode={mode})")                                                                                                                                
+                                                                                                                                                                                                       
+    # Step 5: Conditional - GUID Resolution (only for mode="guid")                                                                                                                                     
+    if mode == "guid":                                                                                                                                                                                 
+      self.logger.info("Running GUID resolution...")                                                                                                                                                   
+      guid_start = time.time()                                                                                                                                                                         
+                                                                                                                                                                                                       
+      # Lazy-load GeoCollection                                                                                                                                                                        
+      geo_collection = self._ensure_geo_collection()                                                                                                                                                   
+                                                                                                                                                                                                       
+      # Initialize MultiPassGUIDResolver                                                                                                                                                               
+      from realestate_analytics.utils.ims import MultiPassGUIDResolver                                                                                                                              
+                                                                                                                                                                                                       
+      checkpoint_dir = self.cache_dir / 'ims_guid_resolution_checkpoints' if self.cache_dir else None                                                                                                  
+                                                                                                                                                                                                       
+      resolver = MultiPassGUIDResolver(                                                                                                                                                                
+        geo_collection=geo_collection,                                                                                                                                                                 
+        checkpoint_dir=checkpoint_dir,                                                                                                                                                                 
+        checkpoint_batch_size=10000,                                                                                                                                                                   
+        use_geocoder=False,                                                                                                                                                                            
+        geocoder_min_interval_sec=3.0,                                                                                                                                                                 
+        logger=self.logger                                                                                                                                                                             
+      )                                                                                                                                                                                                
+                                                                                                                                                                                                       
+      # Apply multi-pass GUID resolution                                                                                                                                                               
+      self.logger.info("Resolving GUIDs...")                                                                                                                                                           
+      df = resolver.resolve(df, show_progress=True)                                                                                                                                                    
+                                                                                                                                                                                                       
+      # Log resolution statistics                                                                                                                                                                      
+      guid_total = len(df)                                                                                                                                                                             
+      guid_resolved = df['guid'].notna().sum()                                                                                                                                                         
+      guid_rate = (guid_resolved / guid_total * 100) if guid_total > 0 else 0                                                                                                                          
+      self.logger.info(f"GUID resolution: {guid_resolved:,}/{guid_total:,} listings ({guid_rate:.1f}%)")                                                                                               
+                                                                                                                                                                                                       
+      guid_elapsed = time.time() - guid_start                                                                                                                                                          
+      self.logger.info(f"GUID resolution completed in {guid_elapsed:.2f}s")                                                                                                                            
+                                                                                                                                                                                                       
+    else:                                                                                                                                                                                              
+      self.logger.info(f"Skipping GUID resolution (mode={mode})")                                                                                                                                      
+                                                                                                                                                                                                       
+    # Step 6: Pre-update validation                                                                                                                                                                    
+    if mode == "propertyType":                                                                                                                                                                         
+      required_for_update = ['propertyType']                                                                                                                                                           
+    elif mode == "guid":                                                                                                                                                                               
+      required_for_update = ['guid']                                                                                                                                                                   
+    else:  # mode == "IMS"                                                                                                                                                                             
+      required_for_update = []                                                                                                                                                                         
+                                                                                                                                                                                                       
+    missing = [col for col in required_for_update if col not in df.columns]                                                                                                                            
+    if missing:                                                                                                                                                                                        
+      return 0, [{"error": f"Missing columns after processing: {missing}"}]                                                                                                                            
+                                                                                                                                                                                                       
+    # Step 7: Generate ES update actions (mode-specific)                                                                                                                                               
+    self.logger.info(f"Generating ES update actions for mode='{mode}'...")                                                                                                                             
+                                                                                                                                                                                                       
+    def generate_actions():                                                                                                                                                                            
+      def to_bool(value):
+        """Coerce truthy/falsy strings/numbers to bool, otherwise None."""
+        if pd.isna(value):
+          return None
+        if isinstance(value, bool):
+          return value
+        if isinstance(value, (int, float)):
+          return bool(int(value))
+        if isinstance(value, str):
+          val = value.strip().lower()
+          if val in ('true', '1', 'yes', 'y'):
+            return True
+          if val in ('false', '0', 'no', 'n'):
+            return False
+        return None
+
+      for _, row in tqdm(df.iterrows(), total=len(df), desc="Generating updates"):                                                                                                                     
+        # Extract document ID (same logic for all modes)                                                                                                                                               
+        written_date = str(row['WrittenDate']).split('T')[0]  # YYYY-MM-DD                                                                                                                             
+        year = written_date.split('-')[0]                                                                                                                                                              
+                                                                                                                                                                                                       
+        prov = str(row['Province']).lower()                                                                                                                                                            
+        mlsid = str(row['MLSID']).lower()                                                                                                                                                              
+        mlsnumber = str(row['MLSNumber']).lower()                                                                                                                                                      
+                                                                                                                                                                                                       
+        doc_id = f"{prov}-{mlsid}-{mlsnumber}-{year}"                                                                                                                                                  
+                                                                                                                                                                                                       
+        # Build doc payload based on mode                                                                                                                                                              
+        if mode == "propertyType":                                                                                                                                                                     
+          doc_source = {                                                                                                                                                                               
+            "propertyType": row['propertyType'],                                                                                                                                                       
+            "last_updated": datetime.now().isoformat()                                                                                                                                                 
+          }                                                                                                                                                                                            
+                                                                                                                                                                                                       
+        elif mode == "guid":                                                                                                                                                                           
+          doc_source = {                                                                                                                                                                               
+            "guid": row['guid'] if pd.notna(row['guid']) else None,                                                                                                                                    
+            "last_updated": datetime.now().isoformat()                                                                                                                                                 
+          }                                                                                                                                                                                            
+                                                                                                                                                                                                       
+          # Update coordinates if resolver corrected them                                                                                                                                              
+          if pd.notna(row.get('Latitude')) and pd.notna(row.get('Longitude')):                                                                                                                         
+            doc_source['Latitude'] = float(row['Latitude'])                                                                                                                                            
+            doc_source['Longitude'] = float(row['Longitude'])                                                                                                                                          
+                                                                                                                                                                                                       
+        elif mode == "IMS":                                                                                                                                                                            
+          # All IMS fields EXCEPT propertyType and guid                                                                                                                                                
+          doc_source = {                                                                                                                                                                               
+            "WrittenDate": written_date,                                                                                                                                                               
+            "Province": str(row['Province']) if pd.notna(row['Province']) else None,                                                                                                                   
+            "SoldPrice": float(row['SoldPrice']) if pd.notna(row['SoldPrice']) else None,                                                                                                              
+            "ListPrice": float(row['ListPrice']) if pd.notna(row['ListPrice']) else None,                                                                                                              
+            "DaysOnMarket": int(row['DaysOnMarket']) if pd.notna(row['DaysOnMarket']) else None,                                                                                                       
+            "Latitude": float(row['Latitude']) if pd.notna(row['Latitude']) else None,                                                                                                                 
+            "Longitude": float(row['Longitude']) if pd.notna(row['Longitude']) else None,                                                                                                              
+            "City": str(row['City']) if pd.notna(row['City']) else None,                                                                                                                               
+            "FSACity": str(row.get('FSACity', '')) if pd.notna(row.get('FSACity')) else None,                                                                                                          
+            "County": str(row.get('County', '')) if pd.notna(row.get('County')) else None,                                                                                                             
+            "CityProvince": str(row.get('CityProvince', '')) if pd.notna(row.get('CityProvince')) else None,                                                                                           
+            "Community": str(row['Community']) if pd.notna(row['Community']) else None,                                                                                                                
+            "PostalCode": str(row['PostalCode']) if pd.notna(row['PostalCode']) else None,                                                                                                             
+            "FSA": str(row['FSA']) if pd.notna(row['FSA']) else None,                                                                                                                                  
+            "District": str(row.get('District', '')) if pd.notna(row.get('District')) else None,                                                                                                       
+            "Country": str(row.get('Country', '')) if pd.notna(row.get('Country')) else None,                                                                                                          
+            "Bedrooms": int(row['Bedrooms']) if pd.notna(row['Bedrooms']) else None,                                                                                                                   
+            "Baths": float(row['Baths']) if pd.notna(row['Baths']) else None,                                                                                                                          
+            "Type": str(row.get('Type', '')) if pd.notna(row.get('Type')) else None,                                                                                                                   
+            "SubType": str(row.get('SubType', '')) if pd.notna(row.get('SubType')) else None,                                                                                                          
+            "Style": str(row.get('Style', '')) if pd.notna(row.get('Style')) else None,                                                                                                                
+            "SquareFoot": int(row['SquareFoot']) if pd.notna(row['SquareFoot']) else None,                                                                                                             
+            "YearBuilt": str(row['YearBuilt']) if pd.notna(row['YearBuilt']) else None,                                                                                                                
+            "Garage": int(row['Garage']) if pd.notna(row['Garage']) else None,                                                                                                                         
+            "CLASA": str(row.get('CLASA', '')) if pd.notna(row.get('CLASA')) else None,                                                                                                                
+            "MLSNumber": str(row['MLSNumber']) if pd.notna(row['MLSNumber']) else None,                                                                                                                
+            "MLSID": str(row['MLSID']) if pd.notna(row['MLSID']) else None,                                                                                                                            
+            "Address": str(row.get('Address', '')) if pd.notna(row.get('Address')) else None,                                                                                                          
+            "SoldOverAsk": to_bool(row.get('SoldOverAsk')) if pd.notna(row.get('SoldOverAsk')) else None,                                                                                         
+            "ListingSellingPriceDiff": float(row.get('ListingSellingPriceDiff')) if pd.notna(row.get('ListingSellingPriceDiff')) else None,                                                            
+            "ListPricePercentOfSold": float(row.get('ListPricePercentOfSold')) if pd.notna(row.get('ListPricePercentOfSold')) else None,                                                               
+            "SoldPricePercentOfList": float(row.get('SoldPricePercentOfList')) if pd.notna(row.get('SoldPricePercentOfList')) else None,                                                               
+            "IsLuxuryListed": to_bool(row.get('IsLuxuryListed')) if pd.notna(row.get('IsLuxuryListed')) else None,                                                                                
+            "IsLuxurySold": to_bool(row.get('IsLuxurySold')) if pd.notna(row.get('IsLuxurySold')) else None,                                                                                      
+            "last_updated": datetime.now().isoformat()                                                                                                                                                 
+            # NOTE: Explicitly exclude 'propertyType' and 'guid' to preserve existing values                                                                                                           
+          }                                                                                                                                                                                            
+                                                                                                                                                                                                       
+        # Yield ES update action (not index/upsert)                                                                                                                                                    
+        yield {                                                                                                                                                                                        
+          '_op_type': 'update',  # Update existing doc only                                                                                                                                            
+          '_index': self.ims_sold_listing_index_name,                                                                                                                                                  
+          '_id': doc_id,                                                                                                                                                                               
+          'doc': doc_source,  # Fields to update (partial document)                                                                                                                                    
+          'doc_as_upsert': False  # Fail if document doesn't exist (safety)                                                                                                                            
+        }                                                                                                                                                                                              
+                                                                                                                                                                                                       
+    # Step 8: Execute ES bulk update                                                                                                                                                                   
+    self.logger.info(f"Starting ES bulk update ({len(df):,} documents)...")                                                                                                                            
+    bulk_start = time.time()                                                                                                                                                                           
+                                                                                                                                                                                                       
+    try:                                                                                                                                                                                               
+      success, failed = bulk(                                                                                                                                                                          
+        client=self.es,                                                                                                                                                                                
+        actions=generate_actions(),                                                                                                                                                                    
+        raise_on_error=False,                                                                                                                                                                          
+        raise_on_exception=False,                                                                                                                                                                      
+        chunk_size=batch_size,                                                                                                                                                                         
+        request_timeout=60                                                                                                                                                                             
+      )                                                                                                                                                                                                
+                                                                                                                                                                                                       
+      bulk_elapsed = time.time() - bulk_start                                                                                                                                                          
+      self.logger.info(f"Bulk update completed in {bulk_elapsed:.2f}s")                                                                                                                                
+                                                                                                                                                                                                       
+    except Exception as e:                                                                                                                                                                             
+      self.logger.error(f"Bulk update operation failed: {e}")                                                                                                                                          
+      return 0, [{"error": f"Bulk update exception: {str(e)}"}]                                                                                                                                        
+                                                                                                                                                                                                       
+    # Step 9: Log summary                                                                                                                                                                              
+    total_attempts = success + len(failed)                                                                                                                                                             
+    success_rate = (success / total_attempts * 100) if total_attempts > 0 else 0                                                                                                                       
+                                                                                                                                                                                                       
+    overall_elapsed = time.time() - overall_start                                                                                                                                                      
+    self.logger.info(f"Bulk update complete: {success:,}/{total_attempts:,} successful ({success_rate:.2f}%) in {overall_elapsed:.2f}s")                                                               
+                                                                                                                                                                                                       
+    if failed:                                                                                                                                                                                         
+      self.logger.warning(f"{len(failed):,} documents failed to update")                                                                                                                               
+      # Log first few failures for debugging                                                                                                                                                           
+      for i, failure in enumerate(failed[:5]):                                                                                                                                                         
+        self.logger.warning(f"Sample failure {i+1}: {failure}")                                                                                                                                        
+                                                                                                                                                                                                       
+    return success, failed                 
+
+
   def get_mapping(self, index: str) -> dict:
     """Retrieve mappings for a specific index."""
     return self.es.indices.get_mapping(index=index)
