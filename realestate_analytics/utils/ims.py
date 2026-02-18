@@ -209,6 +209,12 @@ class IMSPropertyTypeMapper:
       if 'half duplex' in combined_text or '1/2 duplex' in combined_text:
         return 'SEMI-DETACHED'
 
+      # Pattern 5: SubType contains "Duplex" (when Type is Residential/single-family) → SEMI-DETACHED
+      # Catches: ON "Residential/2 Storey, Duplex", "Residential/Duplex", etc.
+      # Exclude multi-family types: Multi-residential, Multi-family, Multifamily (those are investment properties)
+      if 'duplex' in subtype_clean and 'multi' not in type_clean:
+        return 'SEMI-DETACHED'
+
     # PRIORITY 0.5: Handle all plex cases first
     # BUT exclude half duplex and 1/2 duplex - those are semi-detached (management approved 2026-01-28)
     if 'half duplex' not in combined_text and '1/2 duplex' not in combined_text:

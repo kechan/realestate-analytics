@@ -791,6 +791,10 @@ class Datastore:
     self.logger.info("Applying property type mappings to IMS data...")
     property_type_start = time.time()
 
+    # Trim whitespace from Type, SubType, Style columns
+    for col in ["Type", "SubType", "Style"]:
+      df[col] = df[col].where(df[col].isna(), df[col].astype(str).str.strip())
+
     # Step 1: Load DataFrame into mapper
     self.ims_mapper.load_dataframe(df)
 
@@ -1134,7 +1138,11 @@ class Datastore:
       'Garage': int,                                                                                                                                                                                   
       'ListingSellingPriceDiff': float                                                                                                                                                                 
     }                                                                                                                                                                                                  
-                                                                                                                                                                                                       
+
+    # Trim whitespace from Type, SubType, Style columns
+    for col in ["Type", "SubType", "Style"]:
+      df[col] = df[col].where(df[col].isna(), df[col].astype(str).str.strip())
+
     for col, dtype in numeric_columns.items():                                                                                                                                                         
       if col in df.columns:                                                                                                                                                                            
         df[col] = pd.to_numeric(df[col], errors='coerce')                                                                                                                                              

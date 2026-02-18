@@ -240,6 +240,12 @@ The IMS (Integrated MLS System) dataset provides sold listings across all Canadi
 - **UNCLEAR logging**: Automatically logs ambiguous property type combinations to CSV for manual review
 - **Regression protection**: Prevents accidental changes to previously correct mappings when improving classification logic
 - **Provincial overrides**: Base mapper handles generic classification; provincial exceptions (e.g., AB duplex → SEMI-DETACHED) applied separately in es.py
+- **SubType='Attached' disambiguation**: Uses Style field to distinguish SEMI-DETACHED from TOWNHOUSE when SubType='Attached' is ambiguous
+  - Style contains "row/townhouse" → TOWNHOUSE
+  - Style contains standalone dwelling types (Bungalow, 2 Storey, Bi-level, Split, Raised, Tri-level) → SEMI-DETACHED
+  - Penthouse → CONDO (explicit override)
+  - Ambiguous cases → TOWNHOUSE (default, preserves legacy behavior)
+  - This fix resolved Saskatchewan's 0% SEMI-DETACHED issue (increased to 10.65%, +4,810 listings)
 
 **Usage Pattern**:
 ```python
@@ -343,6 +349,35 @@ raw_ims_df.loc[ab_duplex_mask, 'propertyType'] = 'SEMI-DETACHED'
 - **Field Names**: Requires preprocessing to match canonical schema
 
 **Current Status**: `get_ims_sold_listings()` is fully functional and actively queries the `rlp_ims_sold_listing_current` index. GUID resolution is performed during bulk import via MultiPassGUIDResolver.
+
+#### IMS Bulk Update Operations
+
+**Entry Point**: `Datastore.bulk_update_ims_sold_listings()` in `realestate_analytics/data/es.py`
+
+**Purpose**: Selectively update specific fields in existing IMS documents without full re-import. Useful for applying classification fixes or adding new computed fields to large datasets.
+
+**Mode Parameter** (determines what gets updated):
+- `mode="propertyType"`: Update only propertyType field (skips expensive GUID resolution)
+- `mode="guid"`: Update only GUID field (skips property type mapping)
+- `mode="IMS"`: Full document update (all fields including derived metrics)
+
+**Usage Pattern**:
+```python
+# Update only propertyType after classification fixes
+df = pd.read_csv('ims_sold_listings_2024.csv')
+datastore.bulk_update_ims_sold_listings(df, mode="propertyType")
+# Completes in minutes instead of hours (skips GUID resolution)
+```
+
+**Performance**:
+- Reduces update time from hours to minutes for targeted field updates
+- Prevents wasted computation when only specific fields need updating
+- Uses ES bulk update API with validation (>50% success rate required)
+
+**ETL Delta Mode Caveat**: When re-running ETLs after propertyType updates, be aware that delta mode only processes recent data. For historic metrics to reflect classification changes across all years, either:
+- Manually delete province cache files (e.g., `sk_*`) and checkpoints before re-running
+- Use a new job_id to force fresh extraction of full 5-year dataset
+- This ensures time series include all reclassified data, not just recent deltas
 
 ### Testing Framework
 - Uses Python's built-in `unittest` framework
