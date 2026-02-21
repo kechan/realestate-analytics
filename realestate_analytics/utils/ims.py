@@ -7,6 +7,18 @@ import logging
 import unicodedata
 from datetime import datetime
 import json
+import re
+
+# Matches multi-unit Type values → COMMERCIAL
+# Covers: "6 units", "8 units", "16-unit", "5-8 units", "9-12 units", "over 12 units"
+# Guard: skips 1-2 unit buildings (could be duplexes, not investment properties)
+_COMMERCIAL_UNITS_RE = re.compile(
+    r'(?:over\s+)?'       # optional "over " prefix
+    r'([3-9]|\d{2,})'     # 3-9 or any 2+ digit number (excludes 1 and 2)
+    r'(?:[–\-]\d+)?'      # optional range: "-8" or "-12"
+    r'\s*-?\s*'           # optional hyphen (for "16-unit") or space
+    r'units?'             # "unit" or "units"
+)
 
 from .ims_geocoder import GeocoderCAClient
 from .ims_oda_geocoder import OdaOfflineGeocoder
@@ -173,7 +185,9 @@ class IMSPropertyTypeMapper:
     combined_text = f"{type_clean} {subtype_clean} {style_clean}"
 
     # PRIORITY 0: Handle specific Type exact matches (highest priority)
-    if type_clean in ['16-unit', '5-8 units', '9-12 units', 'over 12 units']:
+    # Use regex to catch all "N units" / "N-M units" / "over N units" / "N-unit" patterns
+    # Guard: 3+ units only (excludes 1-2 unit buildings which may be duplexes)
+    if _COMMERCIAL_UNITS_RE.search(type_clean):
       return "COMMERCIAL"
 
     # PRIORITY 0.1: Mobile Home - Strongest Signal (Type OR Style)

@@ -1,0 +1,26 @@
+{
+  "name": "realestate-analytics",
+  "version": "1.0.0",
+  "description": "All analytics related features and supports.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kechan/realestate-analytics.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/kechan/realestate-analytics/issues"
+  },
+  "homepage": "https://github.com/kechan/realestate-analytics#readme",
+  "devDependencies": {
+    "pptxgenjs": "^4.0.1"
+  }
+}

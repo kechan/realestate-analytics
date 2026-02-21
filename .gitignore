@@ -178,3 +178,4 @@ scripts/backup
 
 # MCP
 .playwright-mcp/
+node_modules/

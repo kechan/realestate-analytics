@@ -1,3 +1,9 @@
+- **Refactor `es.py`**: file is too long, making it hard to reason about the full pipeline. Natural split points:
+  - Extract IMS bulk import/update methods (`bulk_import_ims_sold_listings`, `bulk_update_ims_sold_listings`) into a dedicated `ims_ingest.py` module — these are the largest and most complex methods
+  - Extract index/schema management (index creation, alias management, schema definitions) into a separate module
+  - Query/search operations are another natural grouping
+- **Add regex pattern to `suggest_mapping()`** in `ims.py` to catch multi-unit Type values in `N Units`, `N-plex`, `Nplex` formats (e.g. `6 Units`, `6-plex`, `Sixplex`) and map them to `COMMERCIAL` — currently only range formats like `5-8 units` are handled, causing some multi-unit types to fall through to wrong classifications
+
 - Add override entries for low-prevalence IMS mapper mismatches (quadrex, residential mixed use, residential ranch + townhome, duplex storey conflict) in `ims_property_type_lookup_df` if we choose to use the tree model instead of `suggest_mapping()`.
 - Decide whether to align ML mapper to cache overrides or updated `suggest_mapping` duplex rules before switching to ML-based mapping.
 - ML mapping experiment (not for prod yet): use `IMSPropertyTypeEnsembleModel.evaluate_dataframe(..., min_conf=...)` on new IMS dataframes. For tuples not in the cache, stamp model predictions into ES; log `(Type, SubType, Style, pred, p_pred)` for review and prioritize by lowest `p_pred`. Any `pred == "UNCLEAR"` should be logged as unclear for manual review. Corrections should go to `ims_property_type_lookup_df`; retrain the model on cache + overrides if that table grows too large.
