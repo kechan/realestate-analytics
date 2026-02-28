@@ -182,6 +182,13 @@ class IMSPropertyTypeMapper:
     subtype_clean = str(subtype_val).lower() if pd.notna(subtype_val) else ""
     style_clean = str(style_val).lower() if pd.notna(style_val) else ""
 
+    # Normalize French "appartement(s)" → "apartment" so all downstream checks
+    # (PRIORITY 1/2/3/4) work without needing French variants scattered throughout.
+    # Substring match handles both singular and plural in one pass.
+    type_clean    = type_clean.replace('appartement', 'apartment')
+    subtype_clean = subtype_clean.replace('appartement', 'apartment')
+    style_clean   = style_clean.replace('appartement', 'apartment')
+
     combined_text = f"{type_clean} {subtype_clean} {style_clean}"
 
     # PRIORITY 0: Handle specific Type exact matches (highest priority)
@@ -234,7 +241,11 @@ class IMSPropertyTypeMapper:
     if 'half duplex' not in combined_text and '1/2 duplex' not in combined_text:
       plex_patterns = ['triplex', 'fourplex', '4 plex', 'multiplex',
                        '4plex', '5plex', '6plex', '7plex', '8plex',
-                      'duplex', 'dixplex', 'huitplex', 'cinqplex'
+                       'duplex', 'dixplex', 'huitplex', 'cinqplex',
+                       # "N Plus" in Style = N-or-more units (investment property)
+                       # Skip ≤4 — "Two/Three/Four Plus" are ambiguous with bedroom counts
+                       'five plus', 'six plus', 'seven plus', 'eight plus',
+                       'nine plus', 'ten plus',
                        ]
 
       # Check for non-duplex plexes → OTHER (highest priority)
@@ -263,16 +274,23 @@ class IMSPropertyTypeMapper:
     # PRIORITY 1: Direct Type matches (definitive - skip scoring)
 
     # Handle multi-family Type patterns → OTHER
-    if 'multifamily' in type_clean or 'multi-family' in type_clean or 'multi-residential' in type_clean:
+    # 'logement' catches QC "Nxlogements" / "logements" (French for dwelling/unit);
+    # 'logis' catches the shorter QC variant — both must fire before SubType can override
+    if ('multifamily' in type_clean or 'multi-family' in type_clean or 'multi-residential' in type_clean
+        or 'logement' in type_clean or 'logis' in type_clean):
       return "OTHER"
 
     if 'vacant land' in type_clean or 'land only' in type_clean or 'lots/acreage' in type_clean:
       return "LAND_VACANT"
 
     # This catches "Live/Work", "Warehouse Conversion", etc.
+    # Guard: skip if SubType is an explicit residential signal — e.g. "Apartment Unit Loft/warehouse"
+    # describes a warehouse-conversion loft apartment, not a commercial warehouse.
     comm_style_tokens = ['live/work', 'warehouse', 'industrial', 'retail', 'office']
-    if any(token in style_clean for token in comm_style_tokens) or any(token in subtype_clean for token in comm_style_tokens):
-        return "COMMERCIAL"
+    residential_subtype = any(x in subtype_clean for x in ['apartment', 'condo', 'co-op'])
+    if not residential_subtype:
+        if any(token in style_clean for token in comm_style_tokens) or any(token in subtype_clean for token in comm_style_tokens):
+            return "COMMERCIAL"
 
     if 'twnhouse' in type_clean or 'townhouse' in type_clean or 'row house' in type_clean or 'row unit' in type_clean or 'attached' in type_clean:
       return "TOWNHOUSE"
@@ -1401,6 +1419,11 @@ class IMSPropertyTypeMapper:
     t  = "" if Type  is None else str(Type).strip().lower()
     st = "" if SubType is None else str(SubType).strip().lower()
     sy = "" if Style   is None else str(Style).strip().lower()
+
+    # Normalize French "appartement(s)" → "apartment" (same as suggest_mapping)
+    t  = t.replace('appartement', 'apartment')
+    st = st.replace('appartement', 'apartment')
+    sy = sy.replace('appartement', 'apartment')
 
     text = f"{t} {st} {sy}"
 

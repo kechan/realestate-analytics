@@ -13,6 +13,14 @@ from sklearn.feature_extraction import DictVectorizer
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 
+# Matches multi-unit Type values → COMMERCIAL
+_COMMERCIAL_UNITS_RE = re.compile(
+  r'(?:over\s+)?'       # optional "over " prefix
+  r'([3-9]|\d{2,})'     # 3-9 or any 2+ digit number (excludes 1 and 2)
+  r'(?:[–\-]\d+)?'      # optional range: "-8" or "-12"
+  r'\s*-?\s*'           # optional hyphen (for "16-unit") or space
+  r'units?'             # "unit" or "units"
+)
 
 def _tokens(text: str) -> Iterable[str]:
   normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
@@ -28,6 +36,12 @@ def extract_features(type_val: str, subtype_val: str, style_val: str) -> Dict[st
   t = "" if type_val is None else str(type_val).strip().lower()
   st = "" if subtype_val is None else str(subtype_val).strip().lower()
   sy = "" if style_val is None else str(style_val).strip().lower()
+
+  # Normalize French "appartement(s)" to align tokenization/signals with rule mapper.
+  t = t.replace("appartement", "apartment")
+  st = st.replace("appartement", "apartment")
+  sy = sy.replace("appartement", "apartment")
+
   combined = f"{t} {st} {sy}"
 
   feats: Dict[str, float] = {}
@@ -129,6 +143,7 @@ def extract_features(type_val: str, subtype_val: str, style_val: str) -> Dict[st
   add("type_has_apartment", 1.0 if "apartment" in t else 0.0)
   add("type_has_condo", 1.0 if "condo" in t else 0.0)
   add("type_has_multi_family", 1.0 if "multi" in t and "family" in t else 0.0)
+  add("type_has_commercial_units", 1.0 if _COMMERCIAL_UNITS_RE.search(t) else 0.0)
   add(
     "duplex_allowed_type",
     1.0
@@ -184,6 +199,12 @@ def extract_features(type_val: str, subtype_val: str, style_val: str) -> Dict[st
     "eightplex",
     "tenplex",
     "12 apartments",
+    "five plus",
+    "six plus",
+    "seven plus",
+    "eight plus",
+    "nine plus",
+    "ten plus",
   ]
   for pattern in plex_patterns:
     add(f"combined_has:{pattern}", 1.0 if pattern in combined else 0.0)
@@ -220,6 +241,14 @@ def extract_features(type_val: str, subtype_val: str, style_val: str) -> Dict[st
   for tok in comm_style_tokens:
     add(f"style_has:{tok}", 1.0 if tok in sy else 0.0)
     add(f"subtype_has:{tok}", 1.0 if tok in st else 0.0)
+  residential_subtype_signal = any(tok in st for tok in ["apartment", "condo", "co-op"])
+  commercial_style_signal = any(tok in sy for tok in comm_style_tokens) or any(
+    tok in st for tok in comm_style_tokens
+  )
+  add(
+    "commercial_style_with_residential_subtype",
+    1.0 if commercial_style_signal and residential_subtype_signal else 0.0,
+  )
 
   subtype_tokens = [
     "semi detached",
@@ -402,6 +431,7 @@ def extract_features(type_val: str, subtype_val: str, style_val: str) -> Dict[st
 
   other_keywords = [
     "plex",
+    "logement",
     "logements",
     "logis",
     "dwellings",
@@ -504,6 +534,7 @@ def extract_features(type_val: str, subtype_val: str, style_val: str) -> Dict[st
       "semi-detached",
       "over-under",
       "side by side",
+      "link",
     ],
     "TOWNHOUSE": [
       "townhouse",
@@ -511,7 +542,6 @@ def extract_features(type_val: str, subtype_val: str, style_val: str) -> Dict[st
       "row/townhouse",
       "town house",
       "condo townhouse",
-      "link",
     ],
     "DETACHED": [
       "detached",
