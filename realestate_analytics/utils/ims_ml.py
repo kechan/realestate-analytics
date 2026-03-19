@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -857,3 +857,137 @@ class IMSPropertyTypeEnsembleModel:
   @staticmethod
   def load(path: Path | str) -> "IMSPropertyTypeEnsembleModel":
     return joblib.load(path)
+
+
+@dataclass
+class IMSPropertyTypeTorchModel:
+  hidden_dim: int = 128
+  epochs: int = 25
+  batch_size: int = 512
+  learning_rate: float = 1e-3
+  weight_decay: float = 1e-4
+  random_state: int = 42
+  device: str = "mps"
+
+  vec: DictVectorizer | None = None
+  model: object | None = None
+  classes_: np.ndarray | None = None
+
+  def _resolve_device(self):
+    try:
+      import torch
+    except Exception as e:
+      raise RuntimeError(f"PyTorch import failed: {e!r}") from e
+
+    if self.device == "mps":
+      if not torch.backends.mps.is_built():
+        raise RuntimeError("PyTorch was not built with MPS support.")
+      if not torch.backends.mps.is_available():
+        raise RuntimeError("MPS device is not available in this environment.")
+      return torch.device("mps")
+
+    # Explicit device override if needed later (e.g. cpu/cuda)
+    dev = torch.device(self.device)
+    if dev.type == "cuda" and not torch.cuda.is_available():
+      raise RuntimeError("CUDA device requested but not available.")
+    return dev
+
+  def fit(self, df: pd.DataFrame, label_col: str = "Inferred") -> "IMSPropertyTypeTorchModel":
+    if label_col not in df.columns:
+      raise ValueError(f"Missing label column: {label_col}")
+
+    try:
+      import torch
+      from torch import nn
+      from torch.utils.data import DataLoader, TensorDataset
+    except Exception as e:
+      raise RuntimeError(f"PyTorch import failed: {e!r}") from e
+
+    train_df = df[df[label_col] != "UNCLEAR"].reset_index(drop=True)
+    if train_df.empty:
+      raise ValueError("No trainable rows after excluding UNCLEAR labels.")
+
+    features = [
+      extract_features(row["Type"], row["SubType"], row["Style"])
+      for _, row in train_df.iterrows()
+    ]
+    labels = train_df[label_col].astype(str).values
+
+    self.vec = DictVectorizer(sparse=True)
+    X = self.vec.fit_transform(features).toarray().astype(np.float32)
+
+    classes = np.array(sorted(pd.unique(labels)))
+    self.classes_ = classes
+    label_to_idx = {lab: idx for idx, lab in enumerate(classes)}
+    y = np.array([label_to_idx[lab] for lab in labels], dtype=np.int64)
+
+    device = self._resolve_device()
+    torch.manual_seed(self.random_state)
+    if device.type == "mps":
+      try:
+        torch.mps.manual_seed(self.random_state)
+      except Exception:
+        pass
+
+    x_tensor = torch.tensor(X, dtype=torch.float32)
+    y_tensor = torch.tensor(y, dtype=torch.long)
+    dataset = TensorDataset(x_tensor, y_tensor)
+    loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+    input_dim = X.shape[1]
+    num_classes = len(classes)
+    net = nn.Sequential(
+      nn.Linear(input_dim, self.hidden_dim),
+      nn.ReLU(),
+      nn.Linear(self.hidden_dim, num_classes),
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(
+      net.parameters(),
+      lr=self.learning_rate,
+      weight_decay=self.weight_decay,
+    )
+    criterion = nn.CrossEntropyLoss()
+
+    net.train()
+    for _ in range(self.epochs):
+      for xb, yb in loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+        optimizer.zero_grad()
+        logits = net(xb)
+        loss = criterion(logits, yb)
+        loss.backward()
+        optimizer.step()
+
+    self.model = net
+    return self
+
+  def predict_with_uncertainty(
+    self, type_val: str, subtype_val: str, style_val: str, min_conf: float = 0.5
+  ) -> Tuple[str, Dict[str, float]]:
+    if self.vec is None or self.model is None or self.classes_ is None:
+      raise RuntimeError("Model not fitted. Call fit(...) first.")
+
+    try:
+      import torch
+    except Exception as e:
+      raise RuntimeError(f"PyTorch import failed: {e!r}") from e
+
+    device = self._resolve_device()
+    feats = extract_features(type_val, subtype_val, style_val)
+    X = self.vec.transform([feats]).toarray().astype(np.float32)
+    x_tensor = torch.tensor(X, dtype=torch.float32, device=device)
+
+    self.model.eval()
+    with torch.no_grad():
+      logits = self.model(x_tensor)
+      probs = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
+
+    prob_dict = dict(zip(self.classes_, probs))
+    max_prob = float(np.max(probs))
+    if max_prob < min_conf:
+      return "UNCLEAR", prob_dict
+
+    label = self.classes_[int(np.argmax(probs))]
+    return str(label), prob_dict
