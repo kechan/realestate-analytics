@@ -178,9 +178,9 @@ class IMSPropertyTypeMapper:
     This method returns the base classification for Type/SubType/Style combinations.
     """
     # Clean the values
-    type_clean = str(type_val).lower() if pd.notna(type_val) else ""
-    subtype_clean = str(subtype_val).lower() if pd.notna(subtype_val) else ""
-    style_clean = str(style_val).lower() if pd.notna(style_val) else ""
+    type_clean = str(type_val).strip().lower() if pd.notna(type_val) else ""
+    subtype_clean = str(subtype_val).strip().lower() if pd.notna(subtype_val) else ""
+    style_clean = str(style_val).strip().lower() if pd.notna(style_val) else ""
 
     # Normalize French "appartement(s)" → "apartment" so all downstream checks
     # (PRIORITY 1/2/3/4) work without needing French variants scattered throughout.
