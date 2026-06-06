@@ -3,6 +3,7 @@ import argparse
 import logging
 import yaml
 import os, json, sys
+from dotenv import load_dotenv, find_dotenv
 from datetime import datetime, timedelta
 from pathlib import Path
 import pandas as pd
@@ -34,9 +35,12 @@ def rotate_log_file(log_filename: Path):
 
 def get_last_deletion_check_date(tracking_file: Path) -> datetime:
   if tracking_file.exists():
-    with open(tracking_file, 'r') as f:
-      data = json.load(f)
-    return datetime.fromisoformat(data['last_check'])
+    try:
+      with open(tracking_file, 'r') as f:
+        data = json.load(f)
+      return datetime.fromisoformat(data['last_check'])
+    except (OSError, json.JSONDecodeError, KeyError, ValueError) as e:
+      logging.warning(f"Invalid deletion check tracking file {tracking_file}: {e}. Forcing deletion check.")
   return datetime.min
 
 def update_deletion_check_date(tracking_file: Path):
@@ -64,6 +68,8 @@ def should_check_deletions(tracking_file: Path) -> bool:
   return False
 
 def main():
+  load_dotenv(find_dotenv())
+
   parser = argparse.ArgumentParser(description="Run NearbyComparableSoldsProcessor ETL")
   parser.add_argument("--config", required=True, help="Path to the YAML configuration file")
   parser.add_argument("--es_host", help="Elasticsearch host")
@@ -93,6 +99,7 @@ def main():
   es_host = args.es_host or config.get('es_host') or DEFAULT_ES_HOST
   es_port = args.es_port or config.get('es_port') or DEFAULT_ES_PORT
   log_level = args.log_level or config.get('log_level') or DEFAULT_LOG_LEVEL
+  api_key = os.getenv('RLP_LISTING_ES_API_KEY')   # None on local/UAT; set in .env on prod
 
   # nearby_solds_run.csv keeps historical run results, which for simplicity be always in the same directory as this script
   hist_runs_csv_path = get_script_dir() / "nearby_solds_run.csv"
@@ -133,15 +140,13 @@ def main():
   logging.info("="*50)
 
   # Initialize datastores
-  datastore = Datastore(host=es_host, port=es_port)
+  datastore = Datastore(host=es_host, port=es_port, api_key=api_key)
   bq_datastore = BigQueryDatastore()
 
-  # Set up the tracking file for BigQuery deletion checks and determine if we should check for deletions
-  bq_deletion_check_file = get_script_dir() / "bq_deletion_check.json"
+  # Track deletion checks per province. A shared marker lets the first province
+  # run suppress cleanup for later province runs on the same day.
+  bq_deletion_check_file = get_script_dir() / f"bq_deletion_check_{args.prov_code.lower()}.json"
   check_bq_deletions = should_check_deletions(bq_deletion_check_file)
-
-  if check_bq_deletions:
-    update_deletion_check_date(bq_deletion_check_file)
 
   # Initialize and run the processor
   processor = NearbyComparableSoldsProcessor(
@@ -176,6 +181,9 @@ def main():
 
   if not success:
     sys.exit(1)
+
+  if check_bq_deletions:
+    update_deletion_check_date(bq_deletion_check_file)
 
 if __name__ == "__main__":
   main()

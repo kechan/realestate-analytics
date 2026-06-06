@@ -180,5 +180,6 @@ scripts/backup
 .playwright-mcp/
 node_modules/
 
-# Claude
+# Claude/Codex stuff
 .claude
+.agents

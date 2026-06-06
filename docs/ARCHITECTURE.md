@@ -103,6 +103,9 @@ All ETL processors inherit from `BaseETLProcessor` (abstract base class) which i
 
 **ETL Processors:**
 1. **NearbyComparableSoldsProcessor**: Find comparable sold properties within geographic areas
+   - **Data source: `rlp_archive_current` ONLY** (via `get_sold_listings()`). **Never use IMS** (`rlp_ims_sold_listing_current`). Comparable solds must come from the same pipeline as the active listing (legacy RLP/archive feed) for consistency. IMS is an aggregate of many MLS boards and would produce inconsistent comparables.
+   - ON: full comparable solds processing. All other provinces: runs for side-effect only (caches current active listings); sold data is not queried for non-ON provinces.
+   - If zero sold listings returned for ON → upstream archive feed problem, not a code issue.
 2. **SoldMedianMetricsProcessor**: Calculate 5-year trends (median price, DOM, over/under ask)
 3. **LastMthMetricsProcessor**: Monthly metrics with end-of-month special processing
 4. **CurrentMthMetricsProcessor**: Real-time current month metrics (all provinces, no province filtering)

@@ -436,7 +436,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     if remove_es_metrics:
       self.logger.info("Removing selected metrics from ES documents...")
       updated, failures = self.remove_metrics_from_mkt_trends_ts()
-      self.logger.info(f"Removed metrics from {updated} docs in mkt_trends_ts index with {len(failures)} failures.")
+      self.logger.info(f"Removed metrics from {updated} docs in mkt_trends_ts index with {failures} failures.")
       
   
   def reset(self, remove_es_metrics=False):
@@ -885,7 +885,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
     self.logger.info(f"Successfully updated {success} documents")
     if failed:
-      self.logger.error(f"Failed to update {len(failed)} documents")
+      self.logger.error(f"Failed to update {failed} documents")
 
     return success, failed
 

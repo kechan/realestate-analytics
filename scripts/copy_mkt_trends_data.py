@@ -43,7 +43,8 @@ if __name__ == "__main__":
   # PROD Datastore
   prod_host = os.getenv('PROD_ES_HOST')
   prod_port = int(os.getenv('PROD_ES_PORT'))
-  prod_datastore = Datastore(host=prod_host, port=prod_port)
+  prod_api_key = os.getenv('RLP_LISTING_ES_API_KEY')   # set in .env on prod
+  prod_datastore = Datastore(host=prod_host, port=prod_port, api_key=prod_api_key)
 
   if uat_datastore.ping() and prod_datastore.ping():
     print("Connected to UAT and PROD datastores successfully")

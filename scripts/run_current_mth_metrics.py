@@ -1,8 +1,9 @@
 from typing import Dict, Any
 import argparse
-import sys, logging
+import sys, logging, os
 from datetime import datetime
 from pathlib import Path
+from dotenv import load_dotenv, find_dotenv
 
 from realestate_analytics.etl.run_utils import load_config, get_next_job_id, update_run_csv, is_last_run_successful
 from realestate_analytics.etl.current_mth_metrics import CurrentMthMetricsProcessor
@@ -28,6 +29,8 @@ def rotate_log_file(log_filename: Path):
 
 
 def main():
+  load_dotenv(find_dotenv())
+
   parser = argparse.ArgumentParser(description="Run CurrentMthMetricsProcessor ETL")
   parser.add_argument("--config", required=True, help="Path to the YAML configuration file")
   parser.add_argument("--es_host", help="Elasticsearch host")
@@ -47,6 +50,7 @@ def main():
   es_host = args.es_host or config.get('es_host') or DEFAULT_ES_HOST
   es_port = args.es_port or config.get('es_port') or DEFAULT_ES_PORT
   log_level = args.log_level or config.get('log_level') or DEFAULT_LOG_LEVEL
+  api_key = os.getenv('RLP_LISTING_ES_API_KEY')   # None on local/UAT; set in .env on prod
 
   # current_mth_metrics_run.csv keeps historical run results
   hist_runs_csv_path = get_script_dir() / "current_mth_metrics_run.csv"
@@ -83,7 +87,7 @@ def main():
   logging.info("="*50)
 
   # Initialize datastore
-  datastore = Datastore(host=es_host, port=es_port)
+  datastore = Datastore(host=es_host, port=es_port, api_key=api_key)
 
   # Initialize and run the processor
   processor = CurrentMthMetricsProcessor(

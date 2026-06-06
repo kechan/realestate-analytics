@@ -48,5 +48,15 @@ python scripts/run_current_mth_metrics.py --config scripts/prod_config.yaml
 ./scripts/run_all_etl.sh
 ```
 
+## Data Source Constraints — Do Not Mix
+
+**`NearbyComparableSoldsProcessor` MUST use `rlp_archive_current` (via `get_sold_listings()`) — NEVER IMS.**
+
+Nearby comparable solds surfaces sold listings alongside a current active listing. For consistency, both the active listing and its comparable solds must come from the same data pipeline (the legacy RLP/archive feed). IMS (`rlp_ims_sold_listing_current`) is an aggregate of many MLS boards with different field semantics and MUST NOT be used here — mixing sources would produce inconsistent comparables.
+
+If zero sold listings are returned from `rlp_archive_current` for ON, that is a data pipeline problem upstream (the archive feed has stopped receiving new solds). The fix is to restore the archive feed — **not** to switch to IMS.
+
+IMS data is used exclusively in other ETL processors (historic metrics, last month metrics, absorption rate, etc.).
+
 ## Architecture Reference
 Full details (package structure, API endpoints, ETL processors, IMS pipeline, env vars, data flow, deployment) → **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
