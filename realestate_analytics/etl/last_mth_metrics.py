@@ -1,5 +1,6 @@
 from typing import Dict, List, Union, Callable
 import pandas as pd
+import numpy as np
 from datetime import datetime, date, timedelta
 
 from pathlib import Path
@@ -389,17 +390,48 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
     # Function to calculate metrics for both specific property types and 'ALL'
     def calculate_metrics(group):
+        prices = group['price']
+        positive_prices = prices[prices > 0]   # log() is undefined for non-positive prices
+
+        if positive_prices.empty:
+          # No valid positive prices at all (shouldn't happen in practice) - fall back to raw.
+          min_price = prices.min()
+          max_price = prices.max()
+        else:
+          # 2-standard-deviation bandpass filter, applied in log-space: asking prices are
+          # right-skewed/log-normal-ish, not normally distributed, so a raw-dollar mean +/- 2*std
+          # band is unusable (a single extreme listing inflates the std enough that the lower
+          # bound goes negative, meaning it can never exclude anything on the low end). Taking
+          # log(price) first turns "how many times more expensive" into a fixed distance, so the
+          # band is naturally always positive once exponentiated back, and a single outlier no
+          # longer dominates the variance calculation the way it does in raw-dollar space.
+          log_prices = np.log(positive_prices)
+          log_mean = log_prices.mean()
+          log_std = log_prices.std()
+
+          if pd.isna(log_std) or log_std == 0:
+            filtered_prices = positive_prices
+          else:
+            lower_bound = np.exp(log_mean - 2 * log_std)
+            upper_bound = np.exp(log_mean + 2 * log_std)
+            filtered_prices = positive_prices[(positive_prices >= lower_bound) & (positive_prices <= upper_bound)]
+            if filtered_prices.empty:
+              filtered_prices = positive_prices
+
+          min_price = filtered_prices.min()
+          max_price = filtered_prices.max()
+
         return pd.Series({
-            'median_price': group['price'].median(),
-            'p5_price': round(group['price'].quantile(0.05), 2),
-            'p95_price': round(group['price'].quantile(0.95), 2),
+            'median_price': prices.median(),
+            'min_price': min_price,
+            'max_price': max_price,
             'new_listings_count': (group['addedOn'].dt.to_period('M').astype(str) == last_month).sum()
         })
 
     if expanded_df.empty:
       # Create empty results with expected columns
-      results = pd.DataFrame(columns=['geog_id', 'propertyType', 'median_price', 'p5_price', 'p95_price', 'new_listings_count'])
-      all_property_types = pd.DataFrame(columns=['geog_id', 'propertyType', 'median_price', 'p5_price', 'p95_price', 'new_listings_count'])
+      results = pd.DataFrame(columns=['geog_id', 'propertyType', 'median_price', 'min_price', 'max_price', 'new_listings_count'])
+      all_property_types = pd.DataFrame(columns=['geog_id', 'propertyType', 'median_price', 'min_price', 'max_price', 'new_listings_count'])
     else:
       # Calculate metrics for specific property types
       results = expanded_df.groupby(['geog_id', 'propertyType']).apply(calculate_metrics).reset_index()
@@ -412,7 +444,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     final_results = pd.concat([results, all_property_types], ignore_index=True)
 
     # Reorder columns
-    final_results = final_results[['geog_id', 'propertyType', 'median_price', 'p5_price', 'p95_price', 'new_listings_count']]
+    final_results = final_results[['geog_id', 'propertyType', 'median_price', 'min_price', 'max_price', 'new_listings_count']]
 
     final_results.new_listings_count = final_results.new_listings_count.fillna(0).astype(int)
 
@@ -556,24 +588,24 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     self.logger.info(f"Updating last month's ({last_month}) median asking price on ES")
     success_price, failed_price = self.update_last_mth_median_asking_price(last_month)
 
-    self.logger.info(f"Updating last month's ({last_month}) p5 asking price on ES")
-    success_p5, failed_p5 = self.update_last_mth_p5_asking_price(last_month)
+    self.logger.info(f"Updating last month's ({last_month}) min asking price on ES")
+    success_min, failed_min = self.update_last_mth_min_asking_price(last_month)
 
-    self.logger.info(f"Updating last month's ({last_month}) p95 asking price on ES")
-    success_p95, failed_p95 = self.update_last_mth_p95_asking_price(last_month)
+    self.logger.info(f"Updating last month's ({last_month}) max asking price on ES")
+    success_max, failed_max = self.update_last_mth_max_asking_price(last_month)
 
     self.logger.info(f"Updating last month's ({last_month}) new listings count on ES")
     success_listings, failed_listings = self.update_last_mth_new_listings(last_month)
 
-    total_success = success_price + success_p5 + success_p95 + success_listings
-    total_failed = len(failed_price) + len(failed_p5) + len(failed_p95) + len(failed_listings)
+    total_success = success_price + success_min + success_max + success_listings
+    total_failed = len(failed_price) + len(failed_min) + len(failed_max) + len(failed_listings)
 
     # Perform bulk update with error handling
     self.logger.info(f"Successfully updated {total_success} documents in market trends index")
     if total_failed > 0:
       self.logger.error(f"Failed to update {total_failed} documents in market trends index")
 
-    return total_success, failed_price + failed_p5 + failed_p95 + failed_listings
+    return total_success, failed_price + failed_min + failed_max + failed_listings
   
 
   def update_last_mth_median_asking_price(self, last_month):
@@ -640,7 +672,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     return bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
 
 
-  def update_last_mth_p5_asking_price(self, last_month):
+  def update_last_mth_min_asking_price(self, last_month):
     def generate_actions():
       for _, row in self.last_mth_metrics_results.iterrows():
         composite_id = f"{row['geog_id']}_{row['propertyType']}"
@@ -653,23 +685,23 @@ class LastMthMetricsProcessor(BaseETLProcessor):
             if (ctx._source.metrics == null) {
               ctx._source.metrics = new HashMap();
             }
-            if (ctx._source.metrics.last_mth_asking_price_p5 == null) {
-              ctx._source.metrics.last_mth_asking_price_p5 = [];
+            if (ctx._source.metrics.last_mth_min_asking_price == null) {
+              ctx._source.metrics.last_mth_min_asking_price = [];
             }
             // Check if an entry for this month already exists
             int existingIndex = -1;
-            for (int i = 0; i < ctx._source.metrics.last_mth_asking_price_p5.size(); i++) {
-              if (ctx._source.metrics.last_mth_asking_price_p5[i].month == params.new_metric.month) {
+            for (int i = 0; i < ctx._source.metrics.last_mth_min_asking_price.size(); i++) {
+              if (ctx._source.metrics.last_mth_min_asking_price[i].month == params.new_metric.month) {
                 existingIndex = i;
                 break;
               }
             }
             if (existingIndex >= 0) {
               // Replace existing entry
-              ctx._source.metrics.last_mth_asking_price_p5[existingIndex] = params.new_metric;
+              ctx._source.metrics.last_mth_min_asking_price[existingIndex] = params.new_metric;
             } else {
               // Append new entry
-              ctx._source.metrics.last_mth_asking_price_p5.add(params.new_metric);
+              ctx._source.metrics.last_mth_min_asking_price.add(params.new_metric);
             }
             ctx._source.geog_id = params.geog_id;
             ctx._source.propertyType = params.propertyType;
@@ -679,7 +711,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
             "params": {
               "new_metric": {
                 "month": last_month,
-                "value": float(row['p5_price'])
+                "value": float(row['min_price'])
               },
               "geog_id": row['geog_id'],
               "propertyType": row['propertyType'],
@@ -692,9 +724,9 @@ class LastMthMetricsProcessor(BaseETLProcessor):
             "propertyType": row['propertyType'],
             "geo_level": int(row['geog_id'].split('_')[0][1:]),
             "metrics": {
-              "last_mth_asking_price_p5": [{
+              "last_mth_min_asking_price": [{
                 "month": last_month,
-                "value": float(row['p5_price'])
+                "value": float(row['min_price'])
               }]
             },
             "last_updated": self.get_current_datetime().isoformat()
@@ -704,7 +736,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     return bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
 
 
-  def update_last_mth_p95_asking_price(self, last_month):
+  def update_last_mth_max_asking_price(self, last_month):
     def generate_actions():
       for _, row in self.last_mth_metrics_results.iterrows():
         composite_id = f"{row['geog_id']}_{row['propertyType']}"
@@ -717,23 +749,23 @@ class LastMthMetricsProcessor(BaseETLProcessor):
             if (ctx._source.metrics == null) {
               ctx._source.metrics = new HashMap();
             }
-            if (ctx._source.metrics.last_mth_asking_price_p95 == null) {
-              ctx._source.metrics.last_mth_asking_price_p95 = [];
+            if (ctx._source.metrics.last_mth_max_asking_price == null) {
+              ctx._source.metrics.last_mth_max_asking_price = [];
             }
             // Check if an entry for this month already exists
             int existingIndex = -1;
-            for (int i = 0; i < ctx._source.metrics.last_mth_asking_price_p95.size(); i++) {
-              if (ctx._source.metrics.last_mth_asking_price_p95[i].month == params.new_metric.month) {
+            for (int i = 0; i < ctx._source.metrics.last_mth_max_asking_price.size(); i++) {
+              if (ctx._source.metrics.last_mth_max_asking_price[i].month == params.new_metric.month) {
                 existingIndex = i;
                 break;
               }
             }
             if (existingIndex >= 0) {
               // Replace existing entry
-              ctx._source.metrics.last_mth_asking_price_p95[existingIndex] = params.new_metric;
+              ctx._source.metrics.last_mth_max_asking_price[existingIndex] = params.new_metric;
             } else {
               // Append new entry
-              ctx._source.metrics.last_mth_asking_price_p95.add(params.new_metric);
+              ctx._source.metrics.last_mth_max_asking_price.add(params.new_metric);
             }
             ctx._source.geog_id = params.geog_id;
             ctx._source.propertyType = params.propertyType;
@@ -743,7 +775,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
             "params": {
               "new_metric": {
                 "month": last_month,
-                "value": float(row['p95_price'])
+                "value": float(row['max_price'])
               },
               "geog_id": row['geog_id'],
               "propertyType": row['propertyType'],
@@ -756,9 +788,9 @@ class LastMthMetricsProcessor(BaseETLProcessor):
             "propertyType": row['propertyType'],
             "geo_level": int(row['geog_id'].split('_')[0][1:]),
             "metrics": {
-              "last_mth_asking_price_p95": [{
+              "last_mth_max_asking_price": [{
                 "month": last_month,
-                "value": float(row['p95_price'])
+                "value": float(row['max_price'])
               }]
             },
             "last_updated": self.get_current_datetime().isoformat()

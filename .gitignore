@@ -183,3 +183,6 @@ node_modules/
 # Claude/Codex stuff
 .claude
 .agents
+
+# Debug artifacts (never tracked)
+debug/

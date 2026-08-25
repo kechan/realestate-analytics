@@ -265,3 +265,58 @@ def send_zero_sold_listings_alert(job_id: str, prov_code: str, start_time, end_t
     logging.info("Zero sold listings alert email sent successfully")
   except Exception as e:
     logging.error(f"Failed to send zero sold listings alert: {e}")
+
+
+def send_absorption_rate_gaveup_alert(job_id: str, prov_code: str, expected_yearmonth: str):
+  """
+  Send email alert when AbsorptionRateProcessor gives up backfilling a month-end
+  listing count snapshot after its 10-day self-heal window has passed.
+
+  This is a warning alert (not a failure) - the ETL continues successfully, but the
+  affected month will permanently have no current-count / absorption-rate data for
+  this province unless someone intervenes before the next month's cycle.
+
+  Args:
+      job_id: The ETL job identifier
+      prov_code: Province code (e.g., 'ON', 'BC')
+      expected_yearmonth: The year-month (e.g., '2026-02') that could not be captured
+  """
+  try:
+    _ = load_dotenv(find_dotenv())
+    sender_email = os.getenv('ANALYTICS_ETL_SENDER_EMAIL')
+    receiver_emails = os.getenv('ANALYTICS_ETL_RECEIVER_EMAILS', '').split(',')
+    email_password = os.getenv('ANALYTICS_ETL_EMAIL_PASSWORD')
+
+    if not sender_email or not email_password or not receiver_emails:
+      logging.warning("Email credentials not configured. Absorption rate backfill give-up alert not sent.")
+      return
+
+    subject = f"⚠️ Absorption Rate: Gave Up Backfilling {prov_code}/{expected_yearmonth} - {job_id}"
+    html_content = f"""
+    <html>
+      <body>
+        <h2 style="color:orange">⚠️ Absorption Rate Month-End Snapshot Gap</h2>
+        <p><strong>Job ID:</strong> {job_id}</p>
+        <p><strong>Province:</strong> {prov_code}</p>
+        <p><strong>Missing Month:</strong> {expected_yearmonth}</p>
+        <p><strong>Status:</strong> <span style="color:orange">WARNING</span> (ETL continues, but this month's data is now permanently gapped)</p>
+        <p>The current-listing-count snapshot for {expected_yearmonth} was not captured within
+        the 10-day self-healing window after month end. This province's {expected_yearmonth}
+        absorption_rate and months_of_inventory time series will have no data point for this
+        month, and no further automatic retry will happen until the next month's cycle.</p>
+        <h3>Possible Causes:</h3>
+        <ul>
+          <li>ETL did not run at all during the first 10 days of this month (outage, halted-on-prior-failure gate, maintenance)</li>
+          <li>Elasticsearch connectivity issues during those days</li>
+        </ul>
+        <p><strong>Action Required:</strong> Investigate why the ETL didn't run/succeed during
+        the backfill window; if needed, the gap can only be manually reconstructed from other
+        historical records, since live listing data has no point-in-time history.</p>
+      </body>
+    </html>
+    """
+
+    send_email_alert(subject, html_content, sender_email, receiver_emails, email_password)
+    logging.info("Absorption rate backfill give-up alert email sent successfully")
+  except Exception as e:
+    logging.error(f"Failed to send absorption rate backfill give-up alert: {e}")

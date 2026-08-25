@@ -73,6 +73,24 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
     self.BATCH_SIZE_MONTHS = 12   # this is the batch size (in # of months) for the time series computation
 
+    # Master switch for the quarterly sold-metrics feature (median/min/max/DOM/over-ask/
+    # below-ask/sold-count computed and written per quarter, alongside the existing monthly
+    # ones). Requirement is still not firm as of 2026-07, so default OFF - flip to True to
+    # enable the whole feature (compute, cache/diff, and ES writes) without deleting any code.
+    self.ENABLE_QUARTERLY_METRICS = False
+
+    self.final_quarterly_price_series = None
+    self.final_quarterly_dom_series = None
+    self.final_quarterly_over_ask_series = None
+    self.final_quarterly_below_ask_series = None
+    self.final_quarterly_sold_listing_count_series = None
+
+    self.diff_quarterly_price_series = None
+    self.diff_quarterly_dom_series = None
+    self.diff_quarterly_over_ask_series = None
+    self.diff_quarterly_below_ask_series = None
+    self.diff_quarterly_sold_listing_count_series = None
+
   def extract(self, from_cache=False):
     super().extract(from_cache=from_cache)
   
@@ -186,10 +204,19 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       self.diff_over_ask_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_over_ask_series")
       self.diff_below_ask_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_below_ask_series")
       self.diff_sold_listing_count_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_sold_listing_count_series")
+
+      if self.ENABLE_QUARTERLY_METRICS:
+        self.diff_quarterly_price_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_quarterly_price_series")
+        self.diff_quarterly_dom_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_quarterly_dom_series")
+        self.diff_quarterly_over_ask_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_quarterly_over_ask_series")
+        self.diff_quarterly_below_ask_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_quarterly_below_ask_series")
+        self.diff_quarterly_sold_listing_count_series = self.cache.get(f"{self.cache_prefix}{self.job_id}_diff_quarterly_sold_listing_count_series")
       return
 
     try:
       self.compute_5_year_metrics()  # compute and place results onto self.final_*_series
+      if self.ENABLE_QUARTERLY_METRICS:
+        self.compute_5_year_quarterly_metrics()  # compute and place results onto self.final_quarterly_*_series
 
       # Add geog_ids to sold listings, this is needed only for legacy data
       # self.add_geog_ids_to_sold_listings()  # this could be obsolete
@@ -203,7 +230,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       prev_below_ask_series = self.cache.get(f'{prov_prefix}five_years_below_ask_series')
       prev_sold_listing_count_series = self.cache.get(f'{prov_prefix}five_years_sold_listing_count_series')
 
-      if (prev_price_series is None or prev_dom_series is None or 
+      if (prev_price_series is None or prev_dom_series is None or
           prev_over_ask_series is None or prev_below_ask_series is None or prev_sold_listing_count_series is None):
         self.logger.info("No previous times series found. Keeping entire currently computed time series.")
         self.diff_price_series = self.final_price_series
@@ -219,12 +246,42 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
         self.diff_below_ask_series = self._get_delta_dataframe(self.final_below_ask_series, prev_below_ask_series)
         self.diff_sold_listing_count_series = self._get_delta_dataframe(self.final_sold_listing_count_series, prev_sold_listing_count_series)
 
+      if self.ENABLE_QUARTERLY_METRICS:
+        prev_quarterly_price_series = self.cache.get(f'{prov_prefix}five_years_quarterly_price_series')
+        prev_quarterly_dom_series = self.cache.get(f'{prov_prefix}five_years_quarterly_dom_series')
+        prev_quarterly_over_ask_series = self.cache.get(f'{prov_prefix}five_years_quarterly_over_ask_series')
+        prev_quarterly_below_ask_series = self.cache.get(f'{prov_prefix}five_years_quarterly_below_ask_series')
+        prev_quarterly_sold_listing_count_series = self.cache.get(f'{prov_prefix}five_years_quarterly_sold_listing_count_series')
+
+        if (prev_quarterly_price_series is None or prev_quarterly_dom_series is None or
+            prev_quarterly_over_ask_series is None or prev_quarterly_below_ask_series is None or prev_quarterly_sold_listing_count_series is None):
+          self.logger.info("No previous quarterly time series found. Keeping entire currently computed quarterly time series.")
+          self.diff_quarterly_price_series = self.final_quarterly_price_series
+          self.diff_quarterly_dom_series = self.final_quarterly_dom_series
+          self.diff_quarterly_over_ask_series = self.final_quarterly_over_ask_series
+          self.diff_quarterly_below_ask_series = self.final_quarterly_below_ask_series
+          self.diff_quarterly_sold_listing_count_series = self.final_quarterly_sold_listing_count_series
+        else:
+          self.logger.info("Previous quarterly time series found. Computing update delta.")
+          self.diff_quarterly_price_series = self._get_delta_dataframe(self.final_quarterly_price_series, prev_quarterly_price_series)
+          self.diff_quarterly_dom_series = self._get_delta_dataframe(self.final_quarterly_dom_series, prev_quarterly_dom_series)
+          self.diff_quarterly_over_ask_series = self._get_delta_dataframe(self.final_quarterly_over_ask_series, prev_quarterly_over_ask_series)
+          self.diff_quarterly_below_ask_series = self._get_delta_dataframe(self.final_quarterly_below_ask_series, prev_quarterly_below_ask_series)
+          self.diff_quarterly_sold_listing_count_series = self._get_delta_dataframe(self.final_quarterly_sold_listing_count_series, prev_quarterly_sold_listing_count_series)
+
       self.logger.info(f'Prepared to update {len(self.diff_price_series)} price time series, '
                          f'{len(self.diff_dom_series)} DOM time series, and '
                          f'{len(self.diff_over_ask_series)} over-ask percentage time series, and '
                          f'{len(self.diff_below_ask_series)} below-ask percentage time series, and '
                          f'{len(self.diff_sold_listing_count_series)} listing count time series.'
                          )
+      if self.ENABLE_QUARTERLY_METRICS:
+        self.logger.info(f'Prepared to update {len(self.diff_quarterly_price_series)} quarterly price time series, '
+                           f'{len(self.diff_quarterly_dom_series)} quarterly DOM time series, and '
+                           f'{len(self.diff_quarterly_over_ask_series)} quarterly over-ask percentage time series, and '
+                           f'{len(self.diff_quarterly_below_ask_series)} quarterly below-ask percentage time series, and '
+                           f'{len(self.diff_quarterly_sold_listing_count_series)} quarterly listing count time series.'
+                           )
 
       # Cache the current data for the next run
       prov_prefix = f'{self.cache_prefix}{self.prov_code.lower()}_'
@@ -233,6 +290,13 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       self.cache.set(f'{prov_prefix}five_years_over_ask_series', self.final_over_ask_series)
       self.cache.set(f'{prov_prefix}five_years_below_ask_series', self.final_below_ask_series)
       self.cache.set(f'{prov_prefix}five_years_sold_listing_count_series', self.final_sold_listing_count_series)
+
+      if self.ENABLE_QUARTERLY_METRICS:
+        self.cache.set(f'{prov_prefix}five_years_quarterly_price_series', self.final_quarterly_price_series)
+        self.cache.set(f'{prov_prefix}five_years_quarterly_dom_series', self.final_quarterly_dom_series)
+        self.cache.set(f'{prov_prefix}five_years_quarterly_over_ask_series', self.final_quarterly_over_ask_series)
+        self.cache.set(f'{prov_prefix}five_years_quarterly_below_ask_series', self.final_quarterly_below_ask_series)
+        self.cache.set(f'{prov_prefix}five_years_quarterly_sold_listing_count_series', self.final_quarterly_sold_listing_count_series)
 
       # checkpoint the diff_*_series, this will be cleared when the entire ETL process is completed.
       self.diff_price_series.reset_index(drop=True, inplace=True)
@@ -246,6 +310,19 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_over_ask_series", self.diff_over_ask_series)
       self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_below_ask_series", self.diff_below_ask_series)
       self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_sold_listing_count_series", self.diff_sold_listing_count_series)
+
+      if self.ENABLE_QUARTERLY_METRICS:
+        self.diff_quarterly_price_series.reset_index(drop=True, inplace=True)
+        self.diff_quarterly_dom_series.reset_index(drop=True, inplace=True)
+        self.diff_quarterly_over_ask_series.reset_index(drop=True, inplace=True)
+        self.diff_quarterly_below_ask_series.reset_index(drop=True, inplace=True)
+        self.diff_quarterly_sold_listing_count_series.reset_index(drop=True, inplace=True)
+
+        self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_quarterly_price_series", self.diff_quarterly_price_series)
+        self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_quarterly_dom_series", self.diff_quarterly_dom_series)
+        self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_quarterly_over_ask_series", self.diff_quarterly_over_ask_series)
+        self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_quarterly_below_ask_series", self.diff_quarterly_below_ask_series)
+        self.cache.set(f"{self.cache_prefix}{self.job_id}_diff_quarterly_sold_listing_count_series", self.diff_quarterly_sold_listing_count_series)
 
       self._mark_success('transform')
 
@@ -361,8 +438,70 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
       # Rename the geog_id_<N> uniformly to geog_id
       series.reset_index(inplace=True)
 
-      # Replace NaN with None in the propertyType 
-      series['propertyType'] = series['propertyType'].where(series['propertyType'].notna(), None)                                              
+      # Replace NaN with None in the propertyType
+      series['propertyType'] = series['propertyType'].where(series['propertyType'].notna(), None)
+
+    return price_series, dom_series, over_ask_series, below_ask_series, sold_listing_count_series
+
+  def compute_quarterly_metrics(self, df):
+    """
+    Quarterly counterpart of compute_metrics(). Mirrors it exactly (same columns,
+    same aggregations, same ALL-property-type combination), except grouping is by
+    calendar quarter instead of calendar month. This is a separate method (not a
+    parameterized version of compute_metrics) so the existing monthly code path is
+    never touched by this addition.
+    """
+    grouped = df.groupby(['geog_id', 'propertyType', pd.Grouper(key='lastTransition', freq='Q')])
+    metrics = grouped.agg({
+      'soldPrice': 'median',
+      'daysOnMarket': 'median',
+      'sold_over_ask': lambda x: (x.sum() / len(x)) * 100,
+      'sold_below_ask': lambda x: (x.sum() / len(x)) * 100,
+      '_id': 'count'
+    }).reset_index()
+
+    # Calculate metrics for all property types combined
+    grouped_all = df.groupby(['geog_id', pd.Grouper(key='lastTransition', freq='Q')])
+    metrics_all = grouped_all.agg({
+      'soldPrice': 'median',
+      'daysOnMarket': 'median',
+      'sold_over_ask': lambda x: (x.sum() / len(x)) * 100,
+      'sold_below_ask': lambda x: (x.sum() / len(x)) * 100,
+      '_id': 'count'
+    }).reset_index()
+    metrics_all['propertyType'] = None
+
+    metrics_combined = pd.concat([metrics, metrics_all], ignore_index=True)
+
+    # Pivot the data to create time series
+    price_series = metrics_combined.pivot(index=['geog_id', 'propertyType'],
+                                          columns='lastTransition',
+                                          values='soldPrice')
+    dom_series = metrics_combined.pivot(index=['geog_id', 'propertyType'],
+                                        columns='lastTransition',
+                                        values='daysOnMarket')
+    over_ask_series = metrics_combined.pivot(index=['geog_id', 'propertyType'],
+                                              columns='lastTransition',
+                                              values='sold_over_ask')
+    below_ask_series = metrics_combined.pivot(index=['geog_id', 'propertyType'],
+                                              columns='lastTransition',
+                                              values='sold_below_ask')
+    sold_listing_count_series = metrics_combined.pivot(index=['geog_id', 'propertyType'],
+                                                  columns='lastTransition',
+                                                  values='_id')
+
+    # Rename columns to YYYY-Qn format (e.g. 2026-Q1)
+    for series in [price_series, dom_series, over_ask_series, below_ask_series, sold_listing_count_series]:
+      series.columns = [f'{ts.year}-Q{ts.quarter}' for ts in series.columns]
+
+      # Remove the 'lastTransition' label from the column index
+      series.columns.name = None
+
+      # Reset index to make geog_id and propertyType regular columns
+      series.reset_index(inplace=True)
+
+      # Replace NaN with None in the propertyType
+      series['propertyType'] = series['propertyType'].where(series['propertyType'].notna(), None)
 
     return price_series, dom_series, over_ask_series, below_ask_series, sold_listing_count_series
 
@@ -405,6 +544,11 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
                   f'{self.prov_code.lower()}_five_years_over_ask_series',
                   f'{self.prov_code.lower()}_five_years_below_ask_series',
                   f'{self.prov_code.lower()}_five_years_sold_listing_count_series',
+                  f'{self.prov_code.lower()}_five_years_quarterly_dom_series',
+                  f'{self.prov_code.lower()}_five_years_quarterly_price_series',
+                  f'{self.prov_code.lower()}_five_years_quarterly_over_ask_series',
+                  f'{self.prov_code.lower()}_five_years_quarterly_below_ask_series',
+                  f'{self.prov_code.lower()}_five_years_quarterly_sold_listing_count_series',
                   ]
     
     for key in cache_keys:
@@ -429,6 +573,18 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     self.diff_over_ask_series = None
     self.diff_below_ask_series = None
     self.diff_sold_listing_count_series = None
+
+    self.final_quarterly_price_series = None
+    self.final_quarterly_dom_series = None
+    self.final_quarterly_over_ask_series = None
+    self.final_quarterly_below_ask_series = None
+    self.final_quarterly_sold_listing_count_series = None
+
+    self.diff_quarterly_price_series = None
+    self.diff_quarterly_dom_series = None
+    self.diff_quarterly_over_ask_series = None
+    self.diff_quarterly_below_ask_series = None
+    self.diff_quarterly_sold_listing_count_series = None
 
     self.logger.info("Instance variables reset.")
 
@@ -519,7 +675,98 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     self.final_sold_listing_count_series['geo_level'] = self.final_sold_listing_count_series['geog_id'].apply(_extract_geo_level)
 
 
-  def add_geog_ids_to_sold_listings(self):    
+  def compute_5_year_quarterly_metrics(self):
+    """
+    Quarterly counterpart of compute_5_year_metrics(). This is a fully independent
+    batching loop (own start_date, own while-loop, own final_quarterly_*_series
+    outputs) - it does NOT share any state or code path with compute_5_year_metrics(),
+    so it cannot regress the existing monthly metrics.
+
+    A separate loop (rather than reusing compute_5_year_metrics()'s batching) is
+    necessary because that method's start_date is only month-aligned, not
+    quarter-aligned. Since it steps forward in fixed 12-month batches, a
+    non-quarter-aligned start_date would cause every batch boundary to split a
+    calendar quarter's data across two adjacent batches - and since batches are
+    merged by outer-joining on (geog_id, propertyType) and dropping duplicate
+    columns (see _merge_series), a split quarter would silently keep only one
+    batch's partial data instead of the true full-quarter aggregate. Snapping
+    start_date to the nearest quarter start below avoids this entirely, without
+    touching compute_5_year_metrics() or its start_date at all.
+    """
+    current_date = self.get_current_datetime().date()
+    current_month_start = date(current_date.year, current_date.month, 1)
+    monthly_aligned_start_date = (current_month_start.replace(day=1) - pd.DateOffset(months=60))
+
+    # Floor monthly_aligned_start_date to the nearest quarter start (Jan/Apr/Jul/Oct)
+    # so that every subsequent 12-month batch boundary is also a quarter boundary.
+    quarter_start_month = ((monthly_aligned_start_date.month - 1) // 3) * 3 + 1
+    start_date = pd.Timestamp(year=monthly_aligned_start_date.year, month=quarter_start_month, day=1)
+
+    self.logger.info(f'Computing 5 yr quarterly metrics for start_date: {start_date} to current_date: {current_date}')
+
+    all_quarterly_price_series = []
+    all_quarterly_dom_series = []
+    all_quarterly_over_ask_series = []
+    all_quarterly_below_ask_series = []
+    all_quarterly_sold_listing_count_series = []
+
+    current_date_ts = pd.Timestamp(current_date)
+
+    # Note: compute_5_year_metrics() already performs this same guid cleanup on
+    # self.sold_listing_df. Repeating it here is defensive/idempotent (a second
+    # replace/dropna is a no-op if there's nothing left to clean) so this method
+    # remains correct regardless of call order relative to compute_5_year_metrics().
+    self.sold_listing_df['guid'].replace("None", np.nan, inplace=True)
+    self.sold_listing_df.dropna(subset=['guid'], inplace=True)
+
+    if self.sold_listing_df.empty:
+      self.logger.warning(f"No sold listings available for {self.prov_code} - skipping quarterly metrics computation.")
+      empty_cols = ['geog_id', 'propertyType', 'geo_level']
+      self.final_quarterly_price_series = pd.DataFrame(columns=empty_cols)
+      self.final_quarterly_dom_series = pd.DataFrame(columns=empty_cols)
+      self.final_quarterly_over_ask_series = pd.DataFrame(columns=empty_cols)
+      self.final_quarterly_below_ask_series = pd.DataFrame(columns=empty_cols)
+      self.final_quarterly_sold_listing_count_series = pd.DataFrame(columns=empty_cols)
+      return
+
+    while start_date < current_date_ts:
+      end_date = min(start_date + pd.DateOffset(months=self.BATCH_SIZE_MONTHS), current_date_ts)
+
+      batch_df = self._get_batch(start_date, end_date)
+      expanded_batch_df = self._expand_batch(batch_df)
+
+      price_series, dom_series, over_ask_series, below_ask_series, sold_listing_count_series = self.compute_quarterly_metrics(expanded_batch_df)
+
+      all_quarterly_price_series.append(price_series)
+      all_quarterly_dom_series.append(dom_series)
+      all_quarterly_over_ask_series.append(over_ask_series)
+      all_quarterly_below_ask_series.append(below_ask_series)
+      all_quarterly_sold_listing_count_series.append(sold_listing_count_series)
+
+      start_date = end_date
+
+    # Merge results from all batches on 'geog_id' and 'propertyType'
+    self.final_quarterly_price_series = self._merge_series(all_quarterly_price_series)
+    self.final_quarterly_dom_series = self._merge_series(all_quarterly_dom_series)
+    self.final_quarterly_over_ask_series = self._merge_series(all_quarterly_over_ask_series)
+    self.final_quarterly_below_ask_series = self._merge_series(all_quarterly_below_ask_series)
+    self.final_quarterly_sold_listing_count_series = self._merge_series(all_quarterly_sold_listing_count_series)
+
+    # Add 'geo_level' column to each final series
+    def _extract_geo_level(geog_id):
+      match = re.match(r'g(\d+)_', geog_id)
+      if match:
+          return int(match.group(1))
+      return None  # or handle unexpected patterns as needed
+
+    self.final_quarterly_price_series['geo_level'] = self.final_quarterly_price_series['geog_id'].apply(_extract_geo_level)
+    self.final_quarterly_dom_series['geo_level'] = self.final_quarterly_dom_series['geog_id'].apply(_extract_geo_level)
+    self.final_quarterly_over_ask_series['geo_level'] = self.final_quarterly_over_ask_series['geog_id'].apply(_extract_geo_level)
+    self.final_quarterly_below_ask_series['geo_level'] = self.final_quarterly_below_ask_series['geog_id'].apply(_extract_geo_level)
+    self.final_quarterly_sold_listing_count_series['geo_level'] = self.final_quarterly_sold_listing_count_series['geog_id'].apply(_extract_geo_level)
+
+
+  def add_geog_ids_to_sold_listings(self):
     """
     Warning: this method is obsolete
     """
@@ -565,10 +812,11 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
   def update_mkt_trends_ts_index(self):
     """
     Updates the market trends time series index in ES with new median price,
-    days on market (DOM), and over-ask percentage metrics.
+    days on market (DOM), and over-ask percentage metrics, both monthly and
+    quarterly.
 
     Returns:
-        tuple: A tuple containing the number of successfully updated documents and a list of any failures.    
+        tuple: A tuple containing the number of successfully updated documents and a list of any failures.
     """
     def generate_actions():
       # Process price series
@@ -826,6 +1074,262 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
           }
         }
 
+      if self.ENABLE_QUARTERLY_METRICS:
+        # Process quarterly price series
+        for _, row in self.diff_quarterly_price_series.iterrows():
+          new_metrics = {
+            "quarterly_median_sold_price": []
+          }
+
+          for col in self.diff_quarterly_price_series.columns:
+            if col.startswith('20'):
+              quarter = col
+              value = row[col]
+              if pd.notna(value):
+                new_metrics["quarterly_median_sold_price"].append({
+                  "quarter": quarter,
+                  "value": float(value)
+                })
+
+          property_type_id = "ALL" if row['propertyType'] is None else row['propertyType']
+          composite_id = f"{row['geog_id']}_{property_type_id}"
+
+          yield {
+            "_op_type": "update",
+            "_index": self.datastore.mkt_trends_index_name,
+            "_id": composite_id,
+            "script": {
+              "source": """
+              if (ctx._source.metrics == null) {
+                ctx._source.metrics = new HashMap();
+              }
+              ctx._source.metrics.quarterly_median_sold_price = params.new_metrics.quarterly_median_sold_price;
+              ctx._source.geog_id = params.geog_id;
+              ctx._source.propertyType = params.propertyType;
+              ctx._source.geo_level = params.geo_level;
+              ctx._source.last_updated = params.last_updated;
+              """,
+              "params": {
+                "new_metrics": new_metrics,
+                "geog_id": row['geog_id'],
+                "propertyType": property_type_id,
+                "geo_level": int(row['geo_level']),
+                "last_updated": self.get_current_datetime().isoformat()
+              }
+            },
+            "upsert": {
+              "geog_id": row['geog_id'],
+              "propertyType": property_type_id,
+              "geo_level": int(row['geo_level']),
+              "metrics": new_metrics,
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          }
+
+        # Process quarterly DOM series
+        for _, row in self.diff_quarterly_dom_series.iterrows():
+          new_metrics = {
+            "quarterly_median_dom": []
+          }
+
+          for col in self.diff_quarterly_dom_series.columns:
+            if col.startswith('20'):
+              quarter = col
+              value = row[col]
+              if pd.notna(value):
+                new_metrics["quarterly_median_dom"].append({
+                  "quarter": quarter,
+                  "value": float(value)
+                })
+
+          property_type_id = "ALL" if row['propertyType'] is None else row['propertyType']
+          composite_id = f"{row['geog_id']}_{property_type_id}"
+
+          yield {
+            "_op_type": "update",
+            "_index": self.datastore.mkt_trends_index_name,
+            "_id": composite_id,
+            "script": {
+              "source": """
+              if (ctx._source.metrics == null) {
+                ctx._source.metrics = new HashMap();
+              }
+              ctx._source.metrics.quarterly_median_dom = params.new_metrics.quarterly_median_dom;
+              ctx._source.geog_id = params.geog_id;
+              ctx._source.propertyType = params.propertyType;
+              ctx._source.geo_level = params.geo_level;
+              ctx._source.last_updated = params.last_updated;
+              """,
+              "params": {
+                "new_metrics": new_metrics,
+                "geog_id": row['geog_id'],
+                "propertyType": property_type_id,
+                "geo_level": int(row['geo_level']),
+                "last_updated": self.get_current_datetime().isoformat()
+              }
+            },
+            "upsert": {
+              "geog_id": row['geog_id'],
+              "propertyType": property_type_id,
+              "geo_level": int(row['geo_level']),
+              "metrics": new_metrics,
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          }
+
+        # Process quarterly over-ask % series
+        for _, row in self.diff_quarterly_over_ask_series.iterrows():
+          new_metrics = {
+            "quarterly_over_ask_percentage": []
+          }
+
+          for col in self.diff_quarterly_over_ask_series.columns:
+            if col.startswith('20'):
+              quarter = col
+              value = row[col]
+              if pd.notna(value):
+                new_metrics["quarterly_over_ask_percentage"].append({
+                  "quarter": quarter,
+                  "value": round(float(value), self.OVER_ASK_PERC_ROUND_DIGITS)
+                })
+
+          property_type_id = "ALL" if row['propertyType'] is None else row['propertyType']
+          composite_id = f"{row['geog_id']}_{property_type_id}"
+
+          yield {
+            "_op_type": "update",
+            "_index": self.datastore.mkt_trends_index_name,
+            "_id": composite_id,
+            "script": {
+              "source": """
+              if (ctx._source.metrics == null) {
+                ctx._source.metrics = new HashMap();
+              }
+              ctx._source.metrics.quarterly_over_ask_percentage = params.new_metrics.quarterly_over_ask_percentage;
+              ctx._source.geog_id = params.geog_id;
+              ctx._source.propertyType = params.propertyType;
+              ctx._source.geo_level = params.geo_level;
+              ctx._source.last_updated = params.last_updated;
+              """,
+              "params": {
+                "new_metrics": new_metrics,
+                "geog_id": row['geog_id'],
+                "propertyType": property_type_id,
+                "geo_level": int(row['geo_level']),
+                "last_updated": self.get_current_datetime().isoformat()
+              }
+            },
+            "upsert": {
+              "geog_id": row['geog_id'],
+              "propertyType": property_type_id,
+              "geo_level": int(row['geo_level']),
+              "metrics": new_metrics,
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          }
+
+        # Process quarterly below-ask % series
+        for _, row in self.diff_quarterly_below_ask_series.iterrows():
+          new_metrics = {
+            "quarterly_below_ask_percentage": []
+          }
+
+          for col in self.diff_quarterly_below_ask_series.columns:
+            if col.startswith('20'):
+              quarter = col
+              value = row[col]
+              if pd.notna(value):
+                new_metrics["quarterly_below_ask_percentage"].append({
+                  "quarter": quarter,
+                  "value": round(float(value), self.BELOW_ASK_PERC_ROUND_DIGITS)
+                })
+
+          property_type_id = "ALL" if row['propertyType'] is None else row['propertyType']
+          composite_id = f"{row['geog_id']}_{property_type_id}"
+
+          yield {
+            "_op_type": "update",
+            "_index": self.datastore.mkt_trends_index_name,
+            "_id": composite_id,
+            "script": {
+              "source": """
+              if (ctx._source.metrics == null) {
+                ctx._source.metrics = new HashMap();
+              }
+              ctx._source.metrics.quarterly_below_ask_percentage = params.new_metrics.quarterly_below_ask_percentage;
+              ctx._source.geog_id = params.geog_id;
+              ctx._source.propertyType = params.propertyType;
+              ctx._source.geo_level = params.geo_level;
+              ctx._source.last_updated = params.last_updated;
+              """,
+              "params": {
+                "new_metrics": new_metrics,
+                "geog_id": row['geog_id'],
+                "propertyType": property_type_id,
+                "geo_level": int(row['geo_level']),
+                "last_updated": self.get_current_datetime().isoformat()
+              }
+            },
+            "upsert": {
+              "geog_id": row['geog_id'],
+              "propertyType": property_type_id,
+              "geo_level": int(row['geo_level']),
+              "metrics": new_metrics,
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          }
+
+        # Process quarterly listing count series
+        for _, row in self.diff_quarterly_sold_listing_count_series.iterrows():
+          new_metrics = {
+            "quarterly_sold_listing_count": []
+          }
+
+          for col in self.diff_quarterly_sold_listing_count_series.columns:
+            if col.startswith('20'):
+              quarter = col
+              value = row[col]
+              if pd.notna(value):
+                new_metrics["quarterly_sold_listing_count"].append({
+                  "quarter": quarter,
+                  "value": int(value)
+                })
+
+          property_type_id = "ALL" if row['propertyType'] is None else row['propertyType']
+          composite_id = f"{row['geog_id']}_{property_type_id}"
+
+          yield {
+            "_op_type": "update",
+            "_index": self.datastore.mkt_trends_index_name,
+            "_id": composite_id,
+            "script": {
+              "source": """
+              if (ctx._source.metrics == null) {
+                ctx._source.metrics = new HashMap();
+              }
+              ctx._source.metrics.quarterly_sold_listing_count = params.new_metrics.quarterly_sold_listing_count;
+              ctx._source.geog_id = params.geog_id;
+              ctx._source.propertyType = params.propertyType;
+              ctx._source.geo_level = params.geo_level;
+              ctx._source.last_updated = params.last_updated;
+              """,
+              "params": {
+                "new_metrics": new_metrics,
+                "geog_id": row['geog_id'],
+                "propertyType": property_type_id,
+                "geo_level": int(row['geo_level']),
+                "last_updated": self.get_current_datetime().isoformat()
+              }
+            },
+            "upsert": {
+              "geog_id": row['geog_id'],
+              "propertyType": property_type_id,
+              "geo_level": int(row['geo_level']),
+              "metrics": new_metrics,
+              "last_updated": self.get_current_datetime().isoformat()
+            }
+          }
+
     # Perform bulk update
     success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
 
@@ -875,6 +1379,11 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
                 ctx._source.metrics.remove('over_ask_percentage');
                 ctx._source.metrics.remove('below_ask_percentage');
                 ctx._source.metrics.remove('sold_listing_count');
+                ctx._source.metrics.remove('quarterly_median_sold_price');
+                ctx._source.metrics.remove('quarterly_median_dom');
+                ctx._source.metrics.remove('quarterly_over_ask_percentage');
+                ctx._source.metrics.remove('quarterly_below_ask_percentage');
+                ctx._source.metrics.remove('quarterly_sold_listing_count');
               }
             """,
           }
@@ -985,6 +1494,13 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
     self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_below_ask_series")
     self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_sold_listing_count_series")
 
+    if self.ENABLE_QUARTERLY_METRICS:
+      self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_quarterly_price_series")
+      self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_quarterly_dom_series")
+      self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_quarterly_over_ask_series")
+      self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_quarterly_below_ask_series")
+      self.cache.delete(f"{self.cache_prefix}{self.job_id}_diff_quarterly_sold_listing_count_series")
+
 
 if __name__ == '__main__':
   job_id = 'hist_median_metrics_xxx'
@@ -1062,7 +1578,23 @@ if __name__ == '__main__':
     'sold_listing_count': [{'month': '2019-09', 'value': 122},
     {'month': '2019-10', 'value': 127},
     {'month': '2019-11', 'value': 95},
-    {'month': '2019-12', 'value': 54}]
+    {'month': '2019-12', 'value': 54}],
+
+    'quarterly_median_sold_price': [{'quarter': '2023-Q1', 'value': 1450000.0},
+     etc. etc.
+     {'quarter': '2026-Q2', 'value': 1310000.0}],
+    'quarterly_median_dom': [{'quarter': '2023-Q1', 'value': 6.0},
+     etc. etc.
+     {'quarter': '2026-Q2', 'value': 11.0}],
+    'quarterly_over_ask_percentage': [{'quarter': '2023-Q1', 'value': 55.2},
+     etc. etc.
+     {'quarter': '2026-Q2', 'value': 42.1}],
+    'quarterly_below_ask_percentage': [{'quarter': '2023-Q1', 'value': 22.4},
+     etc. etc.
+     {'quarter': '2026-Q2', 'value': 48.9}],
+    'quarterly_sold_listing_count': [{'quarter': '2023-Q1', 'value': 341},
+     etc. etc.
+     {'quarter': '2026-Q2', 'value': 298}]
    },
    
   

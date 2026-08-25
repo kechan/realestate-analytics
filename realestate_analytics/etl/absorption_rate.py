@@ -6,6 +6,7 @@ from pathlib import Path
 import pytz, logging, calendar
 
 from .base_etl import BaseETLProcessor
+from .run_utils import send_absorption_rate_gaveup_alert
 from ..data.caching import FileBasedCache
 from ..data.es import Datastore
 from ..data.archive import Archiver
@@ -31,7 +32,6 @@ class AbsorptionRateProcessor(BaseETLProcessor):
 
     # Raw data loaded from cache
     self.sold_listing_df = None                 # 5-year sold listings from SoldMedianMetricsProcessor (IMS data)
-    self.listing_df = None                      # Current active listings from NearbyComparableSoldsProcessor (for month-end snapshots)
     self.current_counts_ts_df = None            # Persistent cache for historic current listing snapshots (long format: geog_id, propertyType, year-month, current_count)
 
     # Time series data structures (pivot tables)
@@ -47,6 +47,7 @@ class AbsorptionRateProcessor(BaseETLProcessor):
     self.LOAD_SUCCESS_THRESHOLD = 0.5
     self.ABSORPTION_RATE_ROUND_DIGITS = 4
     self.MONTHS_OF_INVENTORY_ROUND_DIGITS = 2
+    self.MONTH_END_SNAPSHOT_BACKFILL_WINDOW_DAYS = 10   # give up self-healing a missed month-end snapshot after this many days into the new month
 
   def extract(self, from_cache=True):
     # ignore the from_cache flag, always load from cache
@@ -202,60 +203,110 @@ class AbsorptionRateProcessor(BaseETLProcessor):
     return success, failed
 
 
-  def _handle_month_end_snapshot(self):
-    """Archive current listing snapshot and update persistent cache if month boundary"""
-    current_date = self.get_current_datetime()
-    is_month_boundary = (current_date.day == 1)
-    
-    if is_month_boundary:
-      last_month = current_date.replace(day=1) - timedelta(days=1)
-      last_month_yearmonth = last_month.strftime('%Y-%m')
-      
-      # Create snapshot for archival
-      def expand_guid(df):
-        return df.assign(geog_id=df['guid'].str.split(',')).explode('geog_id')
+  def _fetch_active_listing_counts(self) -> pd.DataFrame:
+    """
+    Live query against ES for every currently-active listing in self.prov_code, expanded
+    to geog_id, contamination-filtered, and aggregated to (geog_id, propertyType) counts.
 
-      expanded_current = expand_guid(self.listing_df)
+    This replaces the old dependency on NearbyComparableSoldsProcessor's cached listing_df,
+    which was fed by a fragile incremental delta pipeline. We only ever need a simple count
+    of what's active right now, so we query for that directly instead.
 
-      # Filter out cross-province geog_ids to prevent contamination
-      if not self.geog_id_validator.bypass_mode:
-        before_count = len(expanded_current)
-        expanded_current = expanded_current[expanded_current['geog_id'].isin(self.geog_id_validator.valid_geog_ids)].reset_index(drop=True)
-        after_count = len(expanded_current)
+    Returns:
+      DataFrame with columns [geog_id, propertyType, current_count]
+    """
+    success, listing_df = self.datastore.get_current_active_listings(
+      selects=['guid', 'listingType', 'searchCategoryType'],
+      prov_code=self.prov_code,
+      active=True
+    )
+    if not success:
+      self.logger.error(f"Failed to fetch current active listings for {self.prov_code}.")
+      raise ValueError(f"Failed to fetch current active listings for {self.prov_code}.")
 
-        contaminated_count = before_count - after_count
-        if contaminated_count > 0:
-          contamination_pct = 100 * contaminated_count / before_count
-          self.logger.warning(
-            f"[CONTAMINATION] Filtered {contaminated_count} cross-province geog_ids "
-            f"({contamination_pct:.2f}%) for province {self.prov_code} in month-end snapshot"
-          )
-        else:
-          self.logger.info(f"No cross-province contamination detected for {self.prov_code} in month-end snapshot")
-      else:
+    self.logger.info(f"Fetched {len(listing_df)} live active listings for {self.prov_code}.")
+
+    # propertyType is already derived by get_current_active_listings itself
+    def expand_guid(df):
+      return df.assign(geog_id=df['guid'].str.split(',')).explode('geog_id')
+
+    expanded_current = expand_guid(listing_df)
+
+    # Filter out cross-province geog_ids to prevent contamination
+    if not self.geog_id_validator.bypass_mode:
+      before_count = len(expanded_current)
+      expanded_current = expanded_current[expanded_current['geog_id'].isin(self.geog_id_validator.valid_geog_ids)].reset_index(drop=True)
+      after_count = len(expanded_current)
+
+      contaminated_count = before_count - after_count
+      if contaminated_count > 0:
+        contamination_pct = 100 * contaminated_count / before_count
         self.logger.warning(
-          f"[VALIDATION BYPASS] Skipping geog_id validation for {self.prov_code} month-end snapshot - "
-          f"validator is in bypass mode. Contamination checks are NOT active."
+          f"[CONTAMINATION] Filtered {contaminated_count} cross-province geog_ids "
+          f"({contamination_pct:.2f}%) for province {self.prov_code} in month-end snapshot"
         )
+      else:
+        self.logger.info(f"No cross-province contamination detected for {self.prov_code} in month-end snapshot")
+    else:
+      self.logger.warning(
+        f"[VALIDATION BYPASS] Skipping geog_id validation for {self.prov_code} month-end snapshot - "
+        f"validator is in bypass mode. Contamination checks are NOT active."
+      )
 
-      current_counts = expanded_current.groupby(['geog_id', 'propertyType']).size().reset_index(name='current_count')
-      
-      # Archive the snapshot
-      self.archiver.archive(current_counts, f'{self.prov_code.lower()}_current_listing_counts_{last_month_yearmonth}')
-      
-      # Append to persistent cache time series
-      self._append_to_current_counts_cache(current_counts, last_month_yearmonth)
+    return expanded_current.groupby(['geog_id', 'propertyType']).size().reset_index(name='current_count')
 
-      # Create version WITH 'ALL' for ES updates
-      all_property_types = current_counts.groupby('geog_id')['current_count'].sum().reset_index()
-      all_property_types['propertyType'] = 'ALL'
-      current_counts_with_all = pd.concat([current_counts, all_property_types], ignore_index=True)
-      
-      # Store ES version for load()
-      self.month_end_snapshot_data = {
-        'current_counts': current_counts_with_all,  # This version has 'ALL'
-        'last_month_yearmonth': last_month_yearmonth
-      }
+
+  def _handle_month_end_snapshot(self):
+    """
+    Self-healing check: ensure the most-recently-completed calendar month has a
+    current-listing-count snapshot archived and appended to the persistent cache.
+
+    Runs on every invocation (not just day 1) but is a no-op once the expected month is
+    already captured. If it's missing, self-heals by fetching a live snapshot as long as
+    we're within MONTH_END_SNAPSHOT_BACKFILL_WINDOW_DAYS days into the new month; beyond
+    that window it gives up (logs + alerts) and waits for next month's cycle rather than
+    retrying indefinitely.
+    """
+    current_date = self.get_current_datetime()
+    expected_yearmonth = (current_date.replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
+
+    already_captured = False
+    if self.current_counts_ts_df is not None and not self.current_counts_ts_df.empty:
+      existing_months = self.current_counts_ts_df['year-month'].dt.strftime('%Y-%m').unique()
+      already_captured = expected_yearmonth in existing_months
+
+    if already_captured:
+      self.logger.info(f"Month {expected_yearmonth} already present in current_counts_ts_df for {self.prov_code} - no snapshot action needed")
+      return
+
+    if current_date.day > self.MONTH_END_SNAPSHOT_BACKFILL_WINDOW_DAYS:
+      self.logger.warning(
+        f"Gave up attempting to backfill {self.prov_code}/{expected_yearmonth} after the "
+        f"{self.MONTH_END_SNAPSHOT_BACKFILL_WINDOW_DAYS}-day window; will not retry until next month's cycle."
+      )
+      send_absorption_rate_gaveup_alert(self.job_id, self.prov_code, expected_yearmonth)
+      return
+
+    # Missing, and still within the backfill window: fetch a live snapshot as the proxy
+    # for this month's inventory state.
+    current_counts = self._fetch_active_listing_counts()
+
+    # Archive the snapshot
+    self.archiver.archive(current_counts, f'{self.prov_code.lower()}_current_listing_counts_{expected_yearmonth}')
+
+    # Append to persistent cache time series
+    self._append_to_current_counts_cache(current_counts, expected_yearmonth)
+
+    # Create version WITH 'ALL' for ES updates
+    all_property_types = current_counts.groupby('geog_id')['current_count'].sum().reset_index()
+    all_property_types['propertyType'] = 'ALL'
+    current_counts_with_all = pd.concat([current_counts, all_property_types], ignore_index=True)
+
+    # Store ES version for load()
+    self.month_end_snapshot_data = {
+      'current_counts': current_counts_with_all,  # This version has 'ALL'
+      'last_month_yearmonth': expected_yearmonth
+    }
 
   def _append_to_current_counts_cache(self, current_counts, last_month_yearmonth):
     """
@@ -307,21 +358,19 @@ class AbsorptionRateProcessor(BaseETLProcessor):
     # Load sold listings from new IMS source (5 years) - now available for all provinces
     self.sold_listing_df = self.cache.get(f'SoldMedianMetricsProcessor/{self.prov_code.lower()}_five_years_sold_listing')
 
-    self.listing_df = self.cache.get(f'NearbyComparableSoldsProcessor/{self.prov_code.lower()}_listing')
-
     # Load cached current counts time series
-    # IMPORTANT: this has to be pre-seeded from current staging run 
+    # IMPORTANT: this has to be pre-seeded from current staging run
     self.current_counts_ts_df = self.cache.get(f'{self.cache_prefix}{self.prov_code.lower()}_current_counts_time_series')
-    
-    if self.sold_listing_df is None or self.listing_df is None:
-      self.logger.error(f"Missing sold_listing_df or listing_df for {self.prov_code}.")
-      raise ValueError(f"Missing sold_listing_df or listing_df for {self.prov_code}. ")
-    
+
+    if self.sold_listing_df is None:
+      self.logger.error(f"Missing sold_listing_df for {self.prov_code}.")
+      raise ValueError(f"Missing sold_listing_df for {self.prov_code}. ")
+
     if self.current_counts_ts_df is None:
       self.logger.warning(f"No current_counts_ts_df found for {self.prov_code} - this may be first run or no snapshots exist yet")
 
-    
-    self.logger.info(f"Loaded {len(self.sold_listing_df)} sold listings and {len(self.listing_df)} current listings from cache.")
+
+    self.logger.info(f"Loaded {len(self.sold_listing_df)} sold listings from cache.")
 
 
   def update_mkt_trends_ts_index_old(self):

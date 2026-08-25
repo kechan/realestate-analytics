@@ -60,16 +60,15 @@ class TestLastMthMetrics(unittest.TestCase):
 
     self.assertIsInstance(last_mth_metrics_results, pd.DataFrame)
 
-    expected_columns = ['geog_id', 'propertyType', 'median_price', 'p5_price', 'p95_price', 'new_listings_count']
+    expected_columns = ['geog_id', 'propertyType', 'median_price', 'min_price', 'max_price', 'new_listings_count']
     self.assertSetEqual(set(expected_columns), set(last_mth_metrics_results.columns))
 
     # Content checks
     self.assertFalse(last_mth_metrics_results.empty)
     self.assertTrue(all(last_mth_metrics_results['median_price'] >= 0))
-    self.assertTrue(all(last_mth_metrics_results['p5_price'] >= 0))
-    self.assertTrue(all(last_mth_metrics_results['p95_price'] >= 0))
-    self.assertTrue(all(last_mth_metrics_results['p5_price'] <= last_mth_metrics_results['median_price']))
-    self.assertTrue(all(last_mth_metrics_results['median_price'] <= last_mth_metrics_results['p95_price']))
+    self.assertTrue(all(last_mth_metrics_results['min_price'] >= 0))
+    self.assertTrue(all(last_mth_metrics_results['max_price'] >= 0))
+    self.assertTrue(all(last_mth_metrics_results['min_price'] <= last_mth_metrics_results['max_price']))
     self.assertTrue(all(last_mth_metrics_results['new_listings_count'] >= 0))
 
     expanded_listing_df = self.listing_df.assign(geog_id=self.listing_df['guid'].str.split(',')).explode('geog_id')
