@@ -1581,8 +1581,12 @@ class Datastore:
       self._safe_remove_scroll_id(scroll_id)
 
     if not sources:
+      # A query that executed successfully and legitimately matched zero documents is not a
+      # failure - it's a valid result. Returning False here would make it indistinguishable
+      # from the real error paths above (ConnectionError/RequestError/Exception), forcing
+      # every caller to guess whether "False" means "confirmed zero" or "query broke".
       self.logger.info("No current active listings found")
-      return False, pd.DataFrame()
+      return True, pd.DataFrame(columns=list(selects) + ['_id', 'propertyType'])
 
     try:
 

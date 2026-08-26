@@ -320,3 +320,57 @@ def send_absorption_rate_gaveup_alert(job_id: str, prov_code: str, expected_year
     logging.info("Absorption rate backfill give-up alert email sent successfully")
   except Exception as e:
     logging.error(f"Failed to send absorption rate backfill give-up alert: {e}")
+
+
+def send_absorption_rate_fetch_failure_alert(job_id: str, prov_code: str, error: str):
+  """
+  Send email alert when AbsorptionRateProcessor's live active-listing-count fetch (ES query)
+  fails with a genuine error (connection/request/unexpected) during month-end snapshot
+  handling. get_current_active_listings() now returns success=True with an empty DataFrame
+  for a legitimate zero-hit query, so a success=False here means a real failure, not a zero.
+
+  For provinces in AbsorptionRateProcessor.ASSUME_ZERO_ON_FETCH_FAILURE (currently NT, NU -
+  confirmed to have zero real listings in the source feed, so tolerating a failure there by
+  assuming zero is low-stakes) the ETL swallows this and continues; for every other province
+  the same failure also raises and fails the ETL run. Either way this alert surfaces the
+  failure via email immediately, rather than relying on someone reading logs or noticing the
+  run history CSV.
+
+  Args:
+      job_id: The ETL job identifier
+      prov_code: Province code (e.g., 'ON', 'BC')
+      error: Description of the failure (e.g. the error message logged at the call site)
+  """
+  try:
+    _ = load_dotenv(find_dotenv())
+    sender_email = os.getenv('ANALYTICS_ETL_SENDER_EMAIL')
+    receiver_emails = os.getenv('ANALYTICS_ETL_RECEIVER_EMAILS', '').split(',')
+    email_password = os.getenv('ANALYTICS_ETL_EMAIL_PASSWORD')
+
+    if not sender_email or not email_password or not receiver_emails:
+      logging.warning("Email credentials not configured. Absorption rate fetch failure alert not sent.")
+      return
+
+    subject = f"⚠️ Absorption Rate: Live Listing Fetch Failed for {prov_code} - {job_id}"
+    html_content = f"""
+    <html>
+      <body>
+        <h2 style="color:red">⚠️ Absorption Rate Active-Listing Fetch Failure</h2>
+        <p><strong>Job ID:</strong> {job_id}</p>
+        <p><strong>Province:</strong> {prov_code}</p>
+        <p><strong>Error:</strong> {error}</p>
+        <p>The live Elasticsearch query for currently-active listings failed while handling
+        the month-end snapshot for {prov_code}. This is most likely a transient ES connectivity
+        issue.</p>
+        <p><strong>Action Required:</strong> Check ES cluster health/connectivity. If
+        {prov_code} is not in AbsorptionRateProcessor.ASSUME_ZERO_ON_FETCH_FAILURE, this run
+        also failed outright and will halt subsequent runs via the shared run-history CSV gate
+        until investigated.</p>
+      </body>
+    </html>
+    """
+
+    send_email_alert(subject, html_content, sender_email, receiver_emails, email_password)
+    logging.info("Absorption rate fetch failure alert email sent successfully")
+  except Exception as e:
+    logging.error(f"Failed to send absorption rate fetch failure alert: {e}")
