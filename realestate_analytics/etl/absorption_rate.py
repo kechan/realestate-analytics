@@ -6,7 +6,7 @@ from pathlib import Path
 import pytz, logging, calendar
 
 from .base_etl import BaseETLProcessor
-from .run_utils import send_absorption_rate_gaveup_alert, send_absorption_rate_fetch_failure_alert
+from .run_utils import send_absorption_rate_fetch_failure_alert, send_absorption_rate_snapshot_push_failure_alert, send_absorption_rate_snapshot_error_alert
 from ..data.caching import FileBasedCache
 from ..data.es import Datastore
 from ..data.archive import Archiver
@@ -42,7 +42,6 @@ class AbsorptionRateProcessor(BaseETLProcessor):
     # Raw data loaded from cache
     self.sold_listing_df = None                 # 5-year sold listings from SoldMedianMetricsProcessor (IMS data)
     self.current_counts_ts_df = None            # Persistent cache for historic current listing snapshots (long format: geog_id, propertyType, year-month, current_count)
-    self.resolved_snapshot_month = None         # Persistent cache: the single most recent '%Y-%m' for which month-end snapshot handling is done (captured live OR gave up) - independent of current_counts_ts_df row count, since a legitimately zero-listing month contributes no rows and would otherwise look indistinguishable from "never attempted". Only the most recent month is ever relevant since _handle_month_end_snapshot only ever checks the single current expected_yearmonth.
 
     # Time series data structures (pivot tables)
     self.current_counts_ts_pivot = None         # Current counts pivot: index=(geog_id, propertyType), columns=year-month, values=current_count
@@ -57,7 +56,6 @@ class AbsorptionRateProcessor(BaseETLProcessor):
     self.LOAD_SUCCESS_THRESHOLD = 0.5
     self.ABSORPTION_RATE_ROUND_DIGITS = 4
     self.MONTHS_OF_INVENTORY_ROUND_DIGITS = 2
-    self.MONTH_END_SNAPSHOT_BACKFILL_WINDOW_DAYS = 10   # give up self-healing a missed month-end snapshot after this many days into the new month
 
   def extract(self, from_cache=True):
     # ignore the from_cache flag, always load from cache
@@ -101,8 +99,18 @@ class AbsorptionRateProcessor(BaseETLProcessor):
       self._prepare_current_counts_time_series()
       self._calculate_absorption_rates_time_series()  # produces self.absorption_rates_ts_df and self.months_of_inventory_ts_df
 
-      # Step 2.5: Handle month-end snapshot if needed
-      self._handle_month_end_snapshot()
+      # Step 2.5: Handle month-end snapshot if needed. This is a side-quest bolted onto the
+      # daily absorption-rate computation - it must never be able to block or fail that
+      # primary, recurring work. Any failure (capture, caching, or building the ES payload;
+      # fetch and push failures already alert internally) is logged and emailed here, not
+      # allowed to propagate into transform()'s own except block below.
+      try:
+        self._handle_month_end_snapshot()
+      except Exception as e:
+        current_date = self.get_current_datetime()
+        expected_yearmonth = (current_date.replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
+        self.logger.error(f"Month-end snapshot handling failed for {self.prov_code}/{expected_yearmonth}: {e}", exc_info=True)
+        send_absorption_rate_snapshot_error_alert(self.job_id, self.prov_code, expected_yearmonth, str(e))
 
       # Step 3: Compare and diff current vs prior run
       self.changes_df = self._detect_changes(old_absorption_rates_ts_df, self.absorption_rates_ts_df)
@@ -159,18 +167,21 @@ class AbsorptionRateProcessor(BaseETLProcessor):
 
     # Handle month-end snapshot updates (new logic - always check)
     if hasattr(self, 'month_end_snapshot_data'):
+      snapshot_yearmonth = self.month_end_snapshot_data['last_month_yearmonth']
       snapshot_success, snapshot_failed = self.update_month_end_snapshot_in_es(
         self.month_end_snapshot_data['current_counts'],
-        self.month_end_snapshot_data['last_month_yearmonth']
+        snapshot_yearmonth
       )
-      
+
       snapshot_total = snapshot_success + len(snapshot_failed)
       if snapshot_total > 0:
         if snapshot_success / snapshot_total < self.LOAD_SUCCESS_THRESHOLD:
           self.logger.error(f"Month-end snapshot update: Less than 50% success rate. Only {snapshot_success} out of {snapshot_total} documents updated.")
           self.datastore.summarize_update_failures(snapshot_failed)
+          send_absorption_rate_snapshot_push_failure_alert(self.job_id, self.prov_code, snapshot_yearmonth, snapshot_success, len(snapshot_failed))
         else:
           self.logger.info(f"Month-end snapshot update: Successfully updated {snapshot_success} documents")
+      # else: nothing to push (genuinely zero-listing month, e.g. NT/NU) - nothing can fail.
     else:
       self.logger.info("No month-end snapshot to update")
 
@@ -236,15 +247,23 @@ class AbsorptionRateProcessor(BaseETLProcessor):
       # success=False here means a real ES failure (connection/request/unexpected error).
       error_msg = f"Failed to fetch current active listings for {self.prov_code}."
       self.logger.error(error_msg)
-      send_absorption_rate_fetch_failure_alert(self.job_id, self.prov_code, error_msg)
 
       if self.prov_code in self.ASSUME_ZERO_ON_FETCH_FAILURE:
+        # Tolerated - the exception below never raises, so this is the *only* place this
+        # failure can ever be surfaced (the caller's generic snapshot-error alert only fires
+        # on an actual exception, which won't happen here).
+        send_absorption_rate_fetch_failure_alert(self.job_id, self.prov_code, error_msg)
         self.logger.warning(
           f"{self.prov_code} is in ASSUME_ZERO_ON_FETCH_FAILURE - treating this failure as zero "
           f"active listings and proceeding rather than raising."
         )
         listing_df = pd.DataFrame(columns=['guid', 'listingType', 'searchCategoryType', '_id', 'propertyType'])
       else:
+        # Not tolerated - raise and let it propagate. The caller (transform()'s wrapper around
+        # _handle_month_end_snapshot()) sends the one alert for this case with accurate,
+        # up-to-date wording; sending a second alert here would be both redundant and (per the
+        # halt-gate claim in send_absorption_rate_fetch_failure_alert's copy, written before
+        # that wrapper existed) actively wrong about what happens next.
         raise ValueError(error_msg)
 
     self.logger.info(f"Fetched {len(listing_df)} live active listings for {self.prov_code}.")
@@ -281,86 +300,40 @@ class AbsorptionRateProcessor(BaseETLProcessor):
 
   def _handle_month_end_snapshot(self):
     """
-    Self-healing check: ensure the most-recently-completed calendar month has a
-    current-listing-count snapshot archived and appended to the persistent cache.
-
-    Runs on every invocation (not just day 1) but is a no-op once the expected month is
-    already resolved. If it's missing, self-heals by fetching a live snapshot as long as
-    we're within MONTH_END_SNAPSHOT_BACKFILL_WINDOW_DAYS days into the new month; beyond
-    that window it gives up (logs + alerts) and waits for next month's cycle rather than
-    retrying indefinitely.
-
-    "Resolved" is tracked explicitly via self.resolved_snapshot_months rather than inferred
-    solely from current_counts_ts_df row presence: a province/month with a genuinely zero
-    active-listing count (e.g. NT/NU, which have zero listings in the source feed) produces
-    zero rows in that long-format table, which is indistinguishable from "never attempted" -
-    without an explicit marker this would re-trigger a live fetch (or a repeat give-up alert)
-    on every single run, forever.
+    Runs only on the 1st of the month - no self-healing, no retry window, no cross-day
+    markers. If it fails, the caller (transform()) logs and emails; devops reruns the job
+    manually. This is safe to just rerun because the snapshot itself is a time-blind live ES
+    query (not an incremental delta against any cache), and _append_to_current_counts_cache()
+    already no-ops if this month's row is already present - so a manual rerun on the same day
+    (or a deliberate rerun on a later day) is a plain, idempotent retry with no state to
+    reconcile. A rerun on a day other than the 1st needs devops to work around the day==1
+    gate below (e.g. temporarily patching get_current_datetime()) - not automated here.
     """
     current_date = self.get_current_datetime()
+    if current_date.day != 1:
+      self.logger.info(f"Today is not the 1st of the month for {self.prov_code} - skipping month-end snapshot.")
+      return
+
     expected_yearmonth = (current_date.replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
 
-    already_resolved = self.resolved_snapshot_month == expected_yearmonth
-
-    # Backward-compatible signal for months captured before self.resolved_snapshot_month
-    # existed: if current_counts_ts_df already has rows for this month, it was captured (with
-    # a real, non-zero count) under the old logic - recognize that and backfill the marker.
-    if not already_resolved and self.current_counts_ts_df is not None and not self.current_counts_ts_df.empty:
-      existing_months = self.current_counts_ts_df['year-month'].dt.strftime('%Y-%m').unique()
-      if expected_yearmonth in existing_months:
-        already_resolved = True
-        self._mark_snapshot_month_resolved(expected_yearmonth)
-
-    if already_resolved:
-      self.logger.info(f"Month {expected_yearmonth} already resolved for {self.prov_code} - no snapshot action needed")
-      return
-
-    if current_date.day > self.MONTH_END_SNAPSHOT_BACKFILL_WINDOW_DAYS:
-      self.logger.warning(
-        f"Gave up attempting to backfill {self.prov_code}/{expected_yearmonth} after the "
-        f"{self.MONTH_END_SNAPSHOT_BACKFILL_WINDOW_DAYS}-day window; will not retry until next month's cycle."
-      )
-      send_absorption_rate_gaveup_alert(self.job_id, self.prov_code, expected_yearmonth)
-      self._mark_snapshot_month_resolved(expected_yearmonth)   # don't re-alert every day for the rest of this month
-      return
-
-    # Missing, and still within the backfill window: fetch a live snapshot as the proxy
-    # for this month's inventory state.
     current_counts = self._fetch_active_listing_counts()
 
     # Archive the snapshot
     self.archiver.archive(current_counts, f'{self.prov_code.lower()}_current_listing_counts_{expected_yearmonth}')
 
-    # Append to persistent cache time series
+    # Append to persistent cache time series (no-ops if this month is already present)
     self._append_to_current_counts_cache(current_counts, expected_yearmonth)
-    self._mark_snapshot_month_resolved(expected_yearmonth)   # covers the zero-row/empty-count case too
 
     # Create version WITH 'ALL' for ES updates
     all_property_types = current_counts.groupby('geog_id')['current_count'].sum().reset_index()
     all_property_types['propertyType'] = 'ALL'
     current_counts_with_all = pd.concat([current_counts, all_property_types], ignore_index=True)
 
-    # Store ES version for load()
+    # Store ES version for load() to push
     self.month_end_snapshot_data = {
       'current_counts': current_counts_with_all,  # This version has 'ALL'
       'last_month_yearmonth': expected_yearmonth
     }
-
-  def _mark_snapshot_month_resolved(self, yearmonth: str):
-    """
-    Persist that month-end snapshot handling for `yearmonth` is done (captured live, captured
-    via legacy rows, or given up on) so _handle_month_end_snapshot doesn't revisit it again
-    until next month's cycle produces a new expected_yearmonth.
-
-    Stores a single string (not a list) - FileBasedCache only round-trips pd.DataFrame or
-    str(value)/datetime for non-DataFrame values, and only the current expected_yearmonth is
-    ever checked against this, so there's no need to accumulate history here.
-    """
-    if self.resolved_snapshot_month == yearmonth:
-      return
-
-    self.resolved_snapshot_month = yearmonth
-    self.cache.set(f'{self.cache_prefix}{self.prov_code.lower()}_snapshot_resolved_month', yearmonth)
 
   def _append_to_current_counts_cache(self, current_counts, last_month_yearmonth):
     """
@@ -415,9 +388,6 @@ class AbsorptionRateProcessor(BaseETLProcessor):
     # Load cached current counts time series
     # IMPORTANT: this has to be pre-seeded from current staging run
     self.current_counts_ts_df = self.cache.get(f'{self.cache_prefix}{self.prov_code.lower()}_current_counts_time_series')
-
-    # Load the month-end snapshot resolution marker (see _handle_month_end_snapshot)
-    self.resolved_snapshot_month = self.cache.get(f'{self.cache_prefix}{self.prov_code.lower()}_snapshot_resolved_month')
 
     if self.sold_listing_df is None:
       self.logger.error(f"Missing sold_listing_df for {self.prov_code}.")

@@ -35,8 +35,6 @@ class TestLastMthMetrics(unittest.TestCase):
     cls.cache_prefix = cls.last_mth_metrics_processor.cache_prefix
 
     cls.listing_df = cls.cache.get(f'{cls.cache_prefix}on_current_listing')
-    cls.listing_df = cls.listing_df[~cls.listing_df['is_deleted']]    # account for soft deletions
-    cls.listing_df.reset_index(drop=True, inplace=True)
     print(f'# of current listings: {cls.listing_df.shape[0]}')
 
     cls.last_mth_metrics_processor.extract(from_cache=True)

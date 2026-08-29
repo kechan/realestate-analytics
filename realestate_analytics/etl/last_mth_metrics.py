@@ -1,4 +1,4 @@
-from typing import Dict, List, Union, Callable
+from typing import Callable
 import pandas as pd
 import numpy as np
 from datetime import datetime, date, timedelta
@@ -11,6 +11,7 @@ from ..data.es import Datastore
 from ..data.bq import BigQueryDatastore
 from ..data.archive import Archiver
 from ..utils.validators import ProvinceGeogIdValidator
+from .run_utils import send_etl_error_alert
 from elasticsearch.helpers import scan, bulk
 from elasticsearch.exceptions import NotFoundError, ConnectionError, RequestError, TransportError
 
@@ -49,63 +50,17 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     # self.es_store_script_name  = "update_last_month_metrics"
     # self.ensure_stored_script_exists()
 
-  def setup_extra_stages(self, 
-                         add_extra_stage: Callable[[str], None], 
+  def setup_extra_stages(self,
+                         add_extra_stage: Callable[[str], None],
                          add_extra_cleanup_stage: Callable[[str], None]) -> None:
     add_extra_stage('end_of_mth_run')
-    add_extra_cleanup_stage('compute_last_month_metrics')
-    add_extra_cleanup_stage('remove_deleted_listings')
-    add_extra_cleanup_stage('update_mkt_trends')
-  
-  """
-  def run(self):
-    if self._was_success('all'):
-      self.logger.info(f"Job {self.job_id} has already run successfully.")
-      return
-
-    self._extract()
-    self._transform()
-    success, failed = self._load()
-
-    self.end_of_mth_run()
-
-    # if the whole job is successful, clean up the temporary checkpoints and markers
-
-    stages = ['extract', 'transform', 'load', 'end_of_mth_run']
-    all_stages_successful = all(self._was_success(stage) for stage in stages)
-
-    if all_stages_successful:
-      # remove all possible checkpt markers
-      for stage in ['extract', 'transform', 'load', 'compute_last_month_metrics', 'remove_deleted_listings', 'update_mkt_trends', 'end_of_mth_run']:
-        self._unmark_success(stage)
-
-      # remove intermediate result cached by transform
-      self.delete_checkpoints_data()
-  
-      # finally mark it as all success
-      self._mark_success('all')
-
-      self.logger.info(f"Job {self.job_id} completed successfully.")
-  """
 
   def extract(self, from_cache=False):
-    try:      
+    try:
       if from_cache:
         self._load_from_cache()
       else:
-        last_run = self.cache.get(self.last_run_key)
-        self.logger.info(f"last_run: {last_run}")
-
-        if last_run is None:
-          self._initialize_extract_from_datastore()
-        else:
-          self._delta_extract_from_datastore(last_run=last_run)
-
-        # is_deleted is updated during end of month run, we shouldnt consider
-        # is_deleted = True during all stages. 
-        self.listing_df = self.listing_df[~self.listing_df['is_deleted']]
-        self.listing_df.reset_index(drop=True, inplace=True)
-
+        self._extract_from_datastore()
         self._mark_success('extract')
 
     except (ConnectionError, RequestError, TransportError) as e:
@@ -156,142 +111,99 @@ class LastMthMetricsProcessor(BaseETLProcessor):
       raise
 
 
-  def _initialize_extract_from_datastore(self):
+  def _extract_from_datastore(self):
+    """
+    Time-blind full pull: fetch every current listing for the province (no addedOn/updated
+    bounds), merge onto whatever's already cached, and dedupe. Run every day regardless of
+    month-end. A missing/empty cache (first-ever run, or right after reset_listing_cache())
+    is just a fresh start, not a special case - concat onto an empty frame.
+    """
     if self._was_success('extract'):
       self.logger.info("Extract stage already completed. Loading from cache.")
       self._load_from_cache()
       return
 
-    # get everything till now
-    start_time = datetime(1970, 1, 1)     # distant past
-    end_time = self.get_current_datetime()
-    success, self.listing_df = self.datastore.get_listings(
-      use_script_for_last_update=True,    # TODO: Undo after dev.
-
-      addedOn_start_time=start_time,
-      updated_start_time=start_time,
-      
-      addedOn_end_time=end_time,
-      updated_end_time=end_time,
-
-      selects=self.listing_selects,
-      prov_code=self.prov_code
-    )
-    
-    if not success:
-      self.logger.error(f"Failed to load listings from {start_time} to {end_time}")
-      raise ValueError("Failed to load listings from datastore")
-
-    # Add is_deleted column, for tracking soft-deleted listings
-    self.listing_df['is_deleted'] = False
-    
-    self.logger.info(f"Initially extracted {len(self.listing_df)} listings.")
-    
-    self._save_to_cache()
-    self.cache.set(key=self.last_run_key, value=end_time)
-
-    # checkpoint such that listing_df can be picked on on rerun 
-    self.cache.set(key=f'{self.cache_prefix}{self.job_id}_delta_{self.prov_code.lower()}_current_listing', value=self.listing_df)
-
-    
-  def _delta_extract_from_datastore(self, last_run: datetime):
-    if self._was_success('extract'):
-      self.logger.info("Extract stage already completed. Loading from cache.")
-      self._load_from_cache()
-      return
-
-    start_time = last_run
     end_time = self.get_current_datetime()
 
     success, self.delta_listing_df = self.datastore.get_listings(
-      use_script_for_last_update=True,    # TODO: Undo after dev.
-      addedOn_start_time=start_time,
-      addedOn_end_time=end_time,
-      updated_start_time=start_time,
-      updated_end_time=end_time,
-                
       selects=self.listing_selects,
-      prov_code=self.prov_code                
+      prov_code=self.prov_code
     )
-    
+
     if not success:
-      self.logger.error(f"Failed to load delta listings from {start_time} to {end_time}")
-      raise ValueError("Failed to load delta listings from datastore")
-    
+      self.logger.error(f"Failed to load listings for {self.prov_code}")
+      raise ValueError("Failed to load listings from datastore")
+
     if len(self.delta_listing_df) == 0:
-      self.logger.warning(f"No new listings found between {start_time} and {end_time}")
-      # Create an empty DataFrame with the expected structure, but no dummy row
+      self.logger.warning(f"No listings found for {self.prov_code}")
       self.delta_listing_df = pd.DataFrame(columns=self.listing_selects + ['_id'])
       self.delta_listing_df.reset_index(drop=True, inplace=True)
     else:
-      self.logger.info(f'Loaded {len(self.delta_listing_df)} listings from {start_time} to {end_time}')
+      self.logger.info(f'Fetched {len(self.delta_listing_df)} listings for {self.prov_code}')
 
-    listing_df = self.cache.get(f'{self.cache_prefix}{self.prov_code.lower()}_current_listing')
-    self.delta_listing_df['is_deleted'] = False  # New delta listings are not considered deleted.
+    existing_listing_df = self.cache.get(f'{self.cache_prefix}{self.prov_code.lower()}_current_listing')
+    if existing_listing_df is None:
+      # no cache (first-ever run, or the month just rolled over via reset_listing_cache())
+      existing_listing_df = pd.DataFrame(columns=self.listing_selects + ['_id'])
 
-    self.listing_df = pd.concat([listing_df, self.delta_listing_df], ignore_index=True)
+    # existing rows first, fresh pull appended after - keep='last' then always keeps the
+    # fresh pull's row for any _id present in both, without needing to sort by lastUpdate
+    # (which es.py's own schema notes flag as oddly formatted and unreliable to sort on).
+    self.listing_df = pd.concat([existing_listing_df, self.delta_listing_df], ignore_index=True)
+    self.listing_df = self.listing_df.drop_duplicates('_id', keep='last').reset_index(drop=True)
 
-    # if all operations are successful, update the cache
     self._save_to_cache()
     self.cache.set(key=self.last_run_key, value=end_time)
 
-    # checkpoint the delta cache, such that this can be picked on on rerun 
+    # checkpoint today's fetch, such that this can be picked up on rerun
     self.cache.set(key=f'{self.cache_prefix}{self.job_id}_delta_{self.prov_code.lower()}_current_listing', value=self.delta_listing_df)
 
 
   def end_of_mth_run(self):
-    self.logger.info("End of month run")
+    """
+    Runs only on the 1st of the month - no self-heal, no retry window, no cross-day markers.
+    Compute last month's metrics, archive them (the manual-recovery artifact if the push below
+    fails), then push to ES - if any step fails, log + email + re-raise so the existing
+    halt-gate (is_last_run_successful()/last_mth_metrics_run.csv)
+    applies, same as any other ETL failure in this codebase. Devops reruns the job manually;
+    safe to do since a rerun just redoes the same steps against the current cache, with no
+    state to reconcile.
+    """
     self.pre_end_of_mth_run()
-
-    if self._was_success('end_of_mth_run'):
-      self.logger.info("End of month run already successful.")
-      return
-
-    today = self.get_current_datetime()
-    if today.day != 1:
-      self.logger.warning("Today is not the 1st of the month. Skipping end of month run.")
-      self._mark_success('end_of_mth_run')   # 'cos nothing needs to be done, this is still marked a "success"
-      return
-
     try:
-      # (1) Compute last month's metrics
-      if not self._was_success('compute_last_month_metrics'):
+      current_date = self.get_current_datetime()
+      if current_date.day != 1:
+        self.logger.info(f"Not the 1st of the month for {self.prov_code} - skipping end of month run.")
+        self._mark_success('end_of_mth_run')   # nothing to do today
+        return
+
+      expected_yearmonth = (current_date.replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
+
+      try:
         self.compute_last_month_metrics()
-        self._archive_results()
-        self._mark_success('compute_last_month_metrics')
-
-      # (2) Remove deleted listings from df and ES tracking index
-      if not self._was_success('remove_deleted_listings'):
-        success, failed = self.remove_deleted_listings()
-        total_attempts = success + len(failed)
-        if total_attempts != 0 and success / total_attempts < self.LOAD_SUCCESS_THRESHOLD:
-          self.logger.error(f"Less than 50% success rate. Only {success} out of {total_attempts} documents deleted.")
-          # don't raise 'cos there are many valid errors (such as not found)
-          # we will just log error here without causing trouble
-          # raise ValueError("Failed to remove deleted listings. This must be successful to proceed.")      
-        else:
-          self._mark_success('remove_deleted_listings')
-
-      # (3) Update market trends index
-      if not self._was_success('update_mkt_trends'):
-        if self.last_mth_metrics_results is None:
-          # load from archive
-          self.last_mth_metrics_results = self.archiver.retrieve(f'{self.prov_code.lower()}_last_mth_metrics_results')
-          self.logger.info("Loaded last month's metrics results from archive.")
+        self._archive_results()   # before the push - this is the manual-recovery artifact if the push below fails
 
         success, failed = self.update_mkt_trends()
         total_attempts = success + len(failed)
         if total_attempts != 0 and success / total_attempts < 0.5:
-          self.logger.error(f"Less than 50% success rate. Only {success} out of {total_attempts} documents updated.")
-          raise ValueError("Failed to update market trends index. This must be successful to proceed.")
-        else:
-          self._mark_success('update_mkt_trends')
+          raise ValueError(f"Failed to update market trends index: only {success}/{total_attempts} documents succeeded.")
+      except Exception as e:
+        self.logger.error(f"End of month run failed for {self.prov_code}/{expected_yearmonth}: {e}", exc_info=True)
+        send_etl_error_alert(self.job_id, f"LastMthMetricsProcessor/{self.prov_code} end_of_mth_run/{expected_yearmonth}", str(e))
+        raise   # propagate -- halts subsequent runs via the existing halt-gate, same as any other failure
 
       self._mark_success('end_of_mth_run')
 
-    except Exception as e:
-      self.logger.error(f"Unexpected error during end of month run: {e}", exc_info=True)
-      raise
+      # Reset is best-effort and must never affect today's ETL status - even though it has
+      # no ES calls, cache.delete() is still file I/O and could in principle raise. Swallow
+      # (don't re-raise): an uncaught exception here would propagate out of run()'s stage loop
+      # and skip its own _mark_success('all') check entirely, incorrectly halting tomorrow's
+      # run despite the metrics having genuinely succeeded.
+      try:
+        self.reset_listing_cache(expected_yearmonth)
+      except Exception as e:
+        self.logger.error(f"Cache reset failed unexpectedly for {self.prov_code}/{expected_yearmonth} "
+                           f"(metrics already succeeded - this does not affect today's ETL status): {e}", exc_info=True)
 
     finally:
       self.post_end_of_mth_run()
@@ -351,14 +263,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     last_month = (today.replace(day=1) - pd.Timedelta(days=1)).strftime('%Y-%m')
     self.logger.info(f'Calculating metrics for {last_month}')
 
-    # Deduplicate listings based on _id, keeping the last (most current) entry
-    self.listing_df = self.listing_df.sort_values('lastUpdate').drop_duplicates('_id', keep='last')
-
-    # This is now done during extract
-    # Filter out soft-deleted listings
-    # active_listings = self.listing_df[~self.listing_df['is_deleted']]
-    # self.logger.info(f'# of listing before filtering out soft-deleted: {len(self.listing_df)}')
-    # self.logger.info(f'# of listing after filtering out soft-deleted: {len(active_listings)}')
+    # listing_df is already deduped by _extract_from_datastore() on every daily merge.
 
     # Convert 'addedOn' to datetime if it's not already
     self.listing_df.addedOn = pd.to_datetime(self.listing_df.addedOn)
@@ -453,127 +358,23 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     self.last_mth_metrics_results = final_results
   
 
-  def remove_deleted_listings(self):
+  def reset_listing_cache(self, expected_yearmonth: str):
     """
-    Remove deleted listings from Elasticsearch tracking index.
-    this is to be run at the 1st min of a new month after compute_last_month_metrics(), 
-    We do not want deleted stuff to roll over to next month.
+    Runs once, immediately after last month's metrics are computed, archived (the small,
+    aggregated last_mth_metrics_results - see _archive_results()), and pushed to ES. Deletes
+    the raw listing_df cache key outright - no archiving of listing_df itself. At
+    tens/hundreds of thousands of rows per province, archiving the raw listing cache every
+    month indefinitely is a real disk-space/maintenance hazard for a dataframe nothing
+    downstream ever reads back - the only value it had was "just in case" per-listing
+    forensics, deliberately traded away here in favour of a single delete with no failure mode
+    to reason about. The very next daily _extract_from_datastore() call sees a missing cache
+    and treats it exactly like the original first-ever-run case (fresh start, no concat),
+    naturally repopulating via the regular time-blind full pull.
     """
+    self.cache.delete(f'{self.cache_prefix}{self.prov_code.lower()}_current_listing')
+    self.listing_df = None
 
-    current_date = self.get_current_datetime()
-
-    first_day_current_month = current_date.replace(day=1)
-    last_month_start = (first_day_current_month - timedelta(days=1)).replace(day=1)
-    # last_month_end = first_day_current_month - timedelta(days=1)  # bug
-    last_month_end = first_day_current_month
-
-    last_month_start = last_month_start.date()
-    last_month_end = last_month_end.date()
-
-    # len_before = len(self.listing_df)
-
-    # Consult BQ to figure out what has become inactive/deleted during last mth
-    self.logger.info(f'Remove deleted listings from {last_month_start} to {last_month_end}')
-    deleted_listings_df = self.bq_datastore.get_deleted_listings(start_time=last_month_start, end_time=last_month_end)
-    self.logger.info(f'Found {len(deleted_listings_df)} deleted listings')
-
-    if len(deleted_listings_df) == 0:  # no deleted listings
-      self.logger.info("No deleted listings found in BQ")
-      soft_deleted_ids = set()
-    else:      
-      deleted_listing_ids = set(deleted_listings_df['listingId'].tolist())
-      existing_listing_ids = set(self.listing_df['_id'])
-      soft_deleted_ids = deleted_listing_ids.intersection(existing_listing_ids)
-
-      self.listing_df.loc[self.listing_df['_id'].isin(soft_deleted_ids), 'is_deleted'] = True
-      self.logger.info(f'Soft deleted {len(soft_deleted_ids)} listings in self.listing_df')
-
-    # Consult ES to figure out what has become inactive/deleted during last mth
-    more_soft_delete_ids = []
-    more_soft_delete_ids = self.soft_delete_by_checking_es()  #TODO: Uncomment before official run (Done), remove this TODO when extra verificaiton is complete
-
-    # After both BQ and ES verification, get all soft-deleted IDs
-    soft_deleted_ids.update(more_soft_delete_ids)
-
-    # Skip ES tracking index operations if disabled
-    success = 0
-    failed = []
-
-    if self.ENABLE_TRACKING_INDEX:
-      # (2) Remove from Elasticsearch tracking index
-      def generate_actions():
-        for listing_id in soft_deleted_ids:
-          yield {
-            "_op_type": "delete",
-            "_index": self.datastore.listing_tracking_index_name,
-            "_id": listing_id
-          }
-
-      success, failed = bulk(self.datastore.es, generate_actions(), raise_on_error=False, raise_on_exception=False)
-      self.logger.info(f"Successfully deleted {success} documents from Elasticsearch")
-      if failed:
-        self.logger.error(f"Failed to delete {len(failed)} documents from Elasticsearch")
-        self.datastore.summarize_delete_failures(failed)
-    else:
-      self.logger.info("Tracking index is disabled. Skipping deletion from tracking index.")
-
-    if self.cache.cache_dir:
-      self._save_to_cache()
-
-    return success, failed
-
-
-  def soft_delete_by_checking_es(self) -> List[str]:
-    """
-    Check active status of listings by checking against ES.
-    This provides a comprehensive cleanup beyond BQ deletions table.
-
-    Mark those not found or inactive status with is_deleted=True.
-
-    Return a list of unique listing IDs that are to be marked as deleted.
-    """
-    if not hasattr(self, 'listing_df') or self.listing_df is None:
-      self.logger.warning("No listing_df available for verification")
-      return []
-      
-    # Get unique listing IDs excluding those with is_deleted=True
-    listing_ids = list(set(self.listing_df[~self.listing_df['is_deleted']]['_id'].tolist()))
-    
-    # Query ES in batches to avoid large requests
-    batch_size = 1000
-    inactive_listings = []
-    
-    for i in range(0, len(listing_ids), batch_size):
-      batch_ids = listing_ids[i:i + batch_size]
-      
-      # Query for active listings
-      query = {
-        "query": {
-          "terms": {
-            "_id": batch_ids
-          }
-        }
-      }
-      
-      # Get IDs of active listings from ES
-      active_ids = {
-        hit["_id"] for hit in scan(
-          self.datastore.es,
-          index=self.datastore.listing_index_name,
-          query=query,
-          _source=["listingStatus"]
-        ) if hit["_source"]["listingStatus"] == "ACTIVE"
-      }
-      
-      # IDs not found as active are inactive
-      inactive_listings.extend(set(batch_ids) - active_ids)
-
-    # Mark all instances of inactive listings as deleted
-    self.listing_df.loc[self.listing_df._id.isin(inactive_listings), 'is_deleted'] = True
-    
-    self.logger.info(f"Marked {len(inactive_listings)} unique listings as deleted based on ES verification")
-
-    return inactive_listings
+    self.logger.info(f"Reset listing cache for {self.prov_code}/{expected_yearmonth}")
 
 
   def update_mkt_trends(self):
@@ -911,9 +712,9 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     # regard less of first_load, we will always load from the same cache
     self.listing_df = self.cache.get(f'{self.cache_prefix}{self.prov_code.lower()}_current_listing')
 
-    if 'is_deleted' in self.listing_df.columns:
-      self.listing_df = self.listing_df[~self.listing_df['is_deleted']]
-      self.listing_df.reset_index(drop=True, inplace=True)
+    if self.listing_df is None:
+      # no cache yet (first-ever run, or right after reset_listing_cache()) -- fresh start
+      self.listing_df = pd.DataFrame(columns=self.listing_selects + ['_id'])
 
     self.logger.info(f"Loaded {len(self.listing_df)} listings from cache.")
 

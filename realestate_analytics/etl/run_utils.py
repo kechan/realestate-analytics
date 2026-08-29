@@ -267,78 +267,25 @@ def send_zero_sold_listings_alert(job_id: str, prov_code: str, start_time, end_t
     logging.error(f"Failed to send zero sold listings alert: {e}")
 
 
-def send_absorption_rate_gaveup_alert(job_id: str, prov_code: str, expected_yearmonth: str):
-  """
-  Send email alert when AbsorptionRateProcessor gives up backfilling a month-end
-  listing count snapshot after its 10-day self-heal window has passed.
-
-  This is a warning alert (not a failure) - the ETL continues successfully, but the
-  affected month will permanently have no current-count / absorption-rate data for
-  this province unless someone intervenes before the next month's cycle.
-
-  Args:
-      job_id: The ETL job identifier
-      prov_code: Province code (e.g., 'ON', 'BC')
-      expected_yearmonth: The year-month (e.g., '2026-02') that could not be captured
-  """
-  try:
-    _ = load_dotenv(find_dotenv())
-    sender_email = os.getenv('ANALYTICS_ETL_SENDER_EMAIL')
-    receiver_emails = os.getenv('ANALYTICS_ETL_RECEIVER_EMAILS', '').split(',')
-    email_password = os.getenv('ANALYTICS_ETL_EMAIL_PASSWORD')
-
-    if not sender_email or not email_password or not receiver_emails:
-      logging.warning("Email credentials not configured. Absorption rate backfill give-up alert not sent.")
-      return
-
-    subject = f"⚠️ Absorption Rate: Gave Up Backfilling {prov_code}/{expected_yearmonth} - {job_id}"
-    html_content = f"""
-    <html>
-      <body>
-        <h2 style="color:orange">⚠️ Absorption Rate Month-End Snapshot Gap</h2>
-        <p><strong>Job ID:</strong> {job_id}</p>
-        <p><strong>Province:</strong> {prov_code}</p>
-        <p><strong>Missing Month:</strong> {expected_yearmonth}</p>
-        <p><strong>Status:</strong> <span style="color:orange">WARNING</span> (ETL continues, but this month's data is now permanently gapped)</p>
-        <p>The current-listing-count snapshot for {expected_yearmonth} was not captured within
-        the 10-day self-healing window after month end. This province's {expected_yearmonth}
-        absorption_rate and months_of_inventory time series will have no data point for this
-        month, and no further automatic retry will happen until the next month's cycle.</p>
-        <h3>Possible Causes:</h3>
-        <ul>
-          <li>ETL did not run at all during the first 10 days of this month (outage, halted-on-prior-failure gate, maintenance)</li>
-          <li>Elasticsearch connectivity issues during those days</li>
-        </ul>
-        <p><strong>Action Required:</strong> Investigate why the ETL didn't run/succeed during
-        the backfill window; if needed, the gap can only be manually reconstructed from other
-        historical records, since live listing data has no point-in-time history.</p>
-      </body>
-    </html>
-    """
-
-    send_email_alert(subject, html_content, sender_email, receiver_emails, email_password)
-    logging.info("Absorption rate backfill give-up alert email sent successfully")
-  except Exception as e:
-    logging.error(f"Failed to send absorption rate backfill give-up alert: {e}")
-
-
 def send_absorption_rate_fetch_failure_alert(job_id: str, prov_code: str, error: str):
   """
   Send email alert when AbsorptionRateProcessor's live active-listing-count fetch (ES query)
-  fails with a genuine error (connection/request/unexpected) during month-end snapshot
-  handling. get_current_active_listings() now returns success=True with an empty DataFrame
-  for a legitimate zero-hit query, so a success=False here means a real failure, not a zero.
+  fails with a genuine error (connection/request/unexpected) for a province in
+  ASSUME_ZERO_ON_FETCH_FAILURE (currently NT, NU). get_current_active_listings() now returns
+  success=True with an empty DataFrame for a legitimate zero-hit query, so a success=False
+  here means a real failure, not a zero.
 
-  For provinces in AbsorptionRateProcessor.ASSUME_ZERO_ON_FETCH_FAILURE (currently NT, NU -
-  confirmed to have zero real listings in the source feed, so tolerating a failure there by
-  assuming zero is low-stakes) the ETL swallows this and continues; for every other province
-  the same failure also raises and fails the ETL run. Either way this alert surfaces the
-  failure via email immediately, rather than relying on someone reading logs or noticing the
-  run history CSV.
+  Only called for the tolerated case: for those provinces the failure is swallowed (assumed
+  zero) and no exception is raised, so this is the *only* place this specific failure can ever
+  be surfaced - there's no exception for a wrapping try/except to catch and alert on elsewhere.
+  For every other province, _fetch_active_listing_counts() raises instead of calling this, and
+  transform()'s own wrapper around _handle_month_end_snapshot() sends the one alert for that
+  case (send_absorption_rate_snapshot_error_alert) - not this function, to avoid sending two
+  emails for one failure.
 
   Args:
       job_id: The ETL job identifier
-      prov_code: Province code (e.g., 'ON', 'BC')
+      prov_code: Province code (e.g., 'NT', 'NU')
       error: Description of the failure (e.g. the error message logged at the call site)
   """
   try:
@@ -351,21 +298,22 @@ def send_absorption_rate_fetch_failure_alert(job_id: str, prov_code: str, error:
       logging.warning("Email credentials not configured. Absorption rate fetch failure alert not sent.")
       return
 
-    subject = f"⚠️ Absorption Rate: Live Listing Fetch Failed for {prov_code} - {job_id}"
+    subject = f"⚠️ Absorption Rate: Live Listing Fetch Failed for {prov_code} (tolerated) - {job_id}"
     html_content = f"""
     <html>
       <body>
-        <h2 style="color:red">⚠️ Absorption Rate Active-Listing Fetch Failure</h2>
+        <h2 style="color:orange">⚠️ Absorption Rate Active-Listing Fetch Failure (Tolerated)</h2>
         <p><strong>Job ID:</strong> {job_id}</p>
         <p><strong>Province:</strong> {prov_code}</p>
         <p><strong>Error:</strong> {error}</p>
         <p>The live Elasticsearch query for currently-active listings failed while handling
         the month-end snapshot for {prov_code}. This is most likely a transient ES connectivity
-        issue.</p>
-        <p><strong>Action Required:</strong> Check ES cluster health/connectivity. If
-        {prov_code} is not in AbsorptionRateProcessor.ASSUME_ZERO_ON_FETCH_FAILURE, this run
-        also failed outright and will halt subsequent runs via the shared run-history CSV gate
-        until investigated.</p>
+        issue. {prov_code} is in ASSUME_ZERO_ON_FETCH_FAILURE, so this is being tolerated
+        (treated as zero active listings) and the ETL run continues normally - it does not
+        fail or halt.</p>
+        <p><strong>Action Required:</strong> Check ES cluster health/connectivity. Since the
+        run continues, there is no urgency to unblock anything - but a genuine zero for
+        {prov_code} this month should be verified against this alert, not assumed correct.</p>
       </body>
     </html>
     """
@@ -374,3 +322,164 @@ def send_absorption_rate_fetch_failure_alert(job_id: str, prov_code: str, error:
     logging.info("Absorption rate fetch failure alert email sent successfully")
   except Exception as e:
     logging.error(f"Failed to send absorption rate fetch failure alert: {e}")
+
+
+def send_etl_error_alert(job_id: str, context: str, error: str):
+  """
+  General-purpose email alert for an ETL failure that a processor wants to surface
+  immediately, rather than waiting on update_run_csv()'s generic send_etl_failure_alert
+  (which only reports stage pass/fail booleans, not the actual error). The caller supplies a
+  short, freeform `context` string identifying what failed (e.g. "LastMthMetricsProcessor/ON
+  end_of_mth_run") and the error detail - everything needed goes in these two strings rather
+  than requiring a dedicated alert function per failure type.
+
+  Intended usage: let the underlying exception propagate (don't swallow it) - call this from
+  a single try/except wrapping the risky steps, log + send this alert, then re-raise so the
+  existing halt-gate (is_last_run_successful()/run CSV) still applies, same as any other ETL
+  failure in this codebase.
+
+  Args:
+      job_id: The ETL job identifier
+      context: Short description of what was running when this failed (processor, province, stage)
+      error: Description of the failure (e.g. str(exception))
+  """
+  try:
+    _ = load_dotenv(find_dotenv())
+    sender_email = os.getenv('ANALYTICS_ETL_SENDER_EMAIL')
+    receiver_emails = os.getenv('ANALYTICS_ETL_RECEIVER_EMAILS', '').split(',')
+    email_password = os.getenv('ANALYTICS_ETL_EMAIL_PASSWORD')
+
+    if not sender_email or not email_password or not receiver_emails:
+      logging.warning("Email credentials not configured. ETL error alert not sent.")
+      return
+
+    subject = f"⚠️ ETL Error: {context} - {job_id}"
+    html_content = f"""
+    <html>
+      <body>
+        <h2 style="color:red">⚠️ ETL Error</h2>
+        <p><strong>Job ID:</strong> {job_id}</p>
+        <p><strong>Context:</strong> {context}</p>
+        <p><strong>Error:</strong> {error}</p>
+        <p>Check the logs for the full traceback around this job ID.</p>
+      </body>
+    </html>
+    """
+
+    send_email_alert(subject, html_content, sender_email, receiver_emails, email_password)
+    logging.info("ETL error alert email sent successfully")
+  except Exception as e:
+    logging.error(f"Failed to send ETL error alert: {e}")
+
+
+def send_absorption_rate_snapshot_push_failure_alert(job_id: str, prov_code: str, expected_yearmonth: str,
+                                                       success: int, failed: int):
+  """
+  Send email alert when AbsorptionRateProcessor's month-end snapshot ES push
+  (update_month_end_snapshot_in_es) fails below LOAD_SUCCESS_THRESHOLD.
+
+  This is distinct from send_absorption_rate_fetch_failure_alert: the live ES fetch and local
+  caching of the snapshot (current_counts_ts_df) already succeeded - only the push of that
+  already-captured data to rlp_mkt_trends_current failed. Month-end snapshot handling only
+  ever runs on the 1st of the month (no self-heal/retry window) - if this fires, devops needs
+  to manually rerun the job to retry the push (safe to do: the snapshot is a time-blind live
+  query and the local cache append is idempotent, so a rerun is a plain, no-state-to-reconcile
+  retry).
+
+  Args:
+      job_id: The ETL job identifier
+      prov_code: Province code (e.g., 'ON', 'BC')
+      expected_yearmonth: The year-month (e.g., '2026-02') whose snapshot push failed
+      success: Number of documents successfully updated
+      failed: Number of documents that failed to update
+  """
+  try:
+    _ = load_dotenv(find_dotenv())
+    sender_email = os.getenv('ANALYTICS_ETL_SENDER_EMAIL')
+    receiver_emails = os.getenv('ANALYTICS_ETL_RECEIVER_EMAILS', '').split(',')
+    email_password = os.getenv('ANALYTICS_ETL_EMAIL_PASSWORD')
+
+    if not sender_email or not email_password or not receiver_emails:
+      logging.warning("Email credentials not configured. Absorption rate snapshot push failure alert not sent.")
+      return
+
+    subject = f"⚠️ Absorption Rate: Snapshot Push Failed for {prov_code}/{expected_yearmonth} - {job_id}"
+    html_content = f"""
+    <html>
+      <body>
+        <h2 style="color:red">⚠️ Month-End Snapshot ES Push Failure</h2>
+        <p><strong>Job ID:</strong> {job_id}</p>
+        <p><strong>Province:</strong> {prov_code}</p>
+        <p><strong>Month:</strong> {expected_yearmonth}</p>
+        <p><strong>Success/Failed:</strong> {success} / {failed}</p>
+        <p>The month-end snapshot for {prov_code}/{expected_yearmonth} was already captured and
+        cached locally, but pushing it to rlp_mkt_trends_current (mth_end_snapshot_listing_count)
+        failed below the success threshold. There is no automatic retry - month-end snapshot
+        handling only runs on the 1st of the month.</p>
+        <p><strong>Action Required:</strong> Check ES cluster health/connectivity, then manually
+        rerun the job. No data has been lost - the captured snapshot remains in the local cache
+        regardless of the push outcome, and a rerun is a plain, idempotent retry.</p>
+      </body>
+    </html>
+    """
+
+    send_email_alert(subject, html_content, sender_email, receiver_emails, email_password)
+    logging.info("Absorption rate snapshot push failure alert email sent successfully")
+  except Exception as e:
+    logging.error(f"Failed to send absorption rate snapshot push failure alert: {e}")
+
+
+def send_absorption_rate_snapshot_error_alert(job_id: str, prov_code: str, expected_yearmonth: str, error: str):
+  """
+  Send email alert when AbsorptionRateProcessor's _handle_month_end_snapshot() raises for any
+  reason not already covered by a more specific alert. This is the catch-all - including a
+  non-tolerated fetch failure (ASSUME_ZERO_ON_FETCH_FAILURE provinces alert internally via
+  send_absorption_rate_fetch_failure_alert instead, since for them nothing raises and this
+  wrapper never runs), local capture/caching, and building the ES payload from the
+  already-cached snapshot. Push failures alert separately via
+  send_absorption_rate_snapshot_push_failure_alert (that failure surfaces in load(), not here).
+
+  Deliberately never re-raised at the call site: the daily absorption rate / months-of-
+  inventory computation is the important, recurring work in transform(), and a bug isolated to
+  the month-end snapshot side-quest must not be able to block it or halt the day's ETL run.
+
+  Args:
+      job_id: The ETL job identifier
+      prov_code: Province code (e.g., 'ON', 'BC')
+      expected_yearmonth: The year-month (e.g., '2026-02') being processed when this failed
+      error: Description of the failure (e.g. the error message logged at the call site)
+  """
+  try:
+    _ = load_dotenv(find_dotenv())
+    sender_email = os.getenv('ANALYTICS_ETL_SENDER_EMAIL')
+    receiver_emails = os.getenv('ANALYTICS_ETL_RECEIVER_EMAILS', '').split(',')
+    email_password = os.getenv('ANALYTICS_ETL_EMAIL_PASSWORD')
+
+    if not sender_email or not email_password or not receiver_emails:
+      logging.warning("Email credentials not configured. Absorption rate snapshot error alert not sent.")
+      return
+
+    subject = f"⚠️ Absorption Rate: Snapshot Handling Error for {prov_code}/{expected_yearmonth} - {job_id}"
+    html_content = f"""
+    <html>
+      <body>
+        <h2 style="color:red">⚠️ Month-End Snapshot Handling Error</h2>
+        <p><strong>Job ID:</strong> {job_id}</p>
+        <p><strong>Province:</strong> {prov_code}</p>
+        <p><strong>Month:</strong> {expected_yearmonth}</p>
+        <p><strong>Error:</strong> {error}</p>
+        <p>_handle_month_end_snapshot() raised while processing {prov_code}/{expected_yearmonth}.
+        This has been swallowed - it does NOT block or fail the daily absorption rate ETL run,
+        which is the important, recurring work. Month-end snapshot handling only runs on the
+        1st of the month, so there is no automatic retry.</p>
+        <p><strong>Action Required:</strong> Check the logs for the full traceback around this
+        job ID to identify where in capture/caching/payload-building this failed, then manually
+        rerun the job once resolved.</p>
+      </body>
+    </html>
+    """
+
+    send_email_alert(subject, html_content, sender_email, receiver_emails, email_password)
+    logging.info("Absorption rate snapshot error alert email sent successfully")
+  except Exception as e:
+    logging.error(f"Failed to send absorption rate snapshot error alert: {e}")
