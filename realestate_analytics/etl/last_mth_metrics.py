@@ -72,6 +72,10 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
 
   def transform(self):
+    # NOTE: the "_delta_" in this checkpoint key is legacy naming from the old windowed-query
+    # design (see _extract_from_datastore()) -- it holds today's fresh pull, not an incremental
+    # delta. This reload also guarantees self.delta_listing_df is populated by the time
+    # end_of_mth_run() -> reset_listing_cache() runs, even on a same-job_id rerun.
     if self._was_success('transform'):
       self.logger.info("Transform stage already completed. Loading checkpoints from cache.")
       self.delta_listing_df = self.cache.get(f'{self.cache_prefix}{self.job_id}_delta_{self.prov_code.lower()}_current_listing')
@@ -81,7 +85,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     if self.delta_listing_df is None:
       self.logger.info("No transform needed. Just loading checkpoints from cache.")
       self.delta_listing_df = self.cache.get(f'{self.cache_prefix}{self.job_id}_delta_{self.prov_code.lower()}_current_listing')
-    
+
     self._mark_success('transform')
 
   
@@ -115,8 +119,9 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     """
     Time-blind full pull: fetch every current listing for the province (no addedOn/updated
     bounds), merge onto whatever's already cached, and dedupe. Run every day regardless of
-    month-end. A missing/empty cache (first-ever run, or right after reset_listing_cache())
-    is just a fresh start, not a special case - concat onto an empty frame.
+    month-end. A missing cache (first-ever run only - reset_listing_cache() no longer leaves
+    the cache missing, see below) is just a fresh start, not a special case - concat onto an
+    empty frame.
     """
     if self._was_success('extract'):
       self.logger.info("Extract stage already completed. Loading from cache.")
@@ -125,6 +130,11 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
     end_time = self.get_current_datetime()
 
+    # Despite the name (kept for now - renaming deferred to avoid unrelated regression risk;
+    # see reset_listing_cache()), this is NOT a time-bounded delta: get_listings() here is an
+    # unbounded, time-blind full pull. It's "delta" only in the sense of "today's fetch," as
+    # opposed to self.listing_df below, the multi-day accumulated cache it gets concatenated
+    # onto.
     success, self.delta_listing_df = self.datastore.get_listings(
       selects=self.listing_selects,
       prov_code=self.prov_code
@@ -143,7 +153,8 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
     existing_listing_df = self.cache.get(f'{self.cache_prefix}{self.prov_code.lower()}_current_listing')
     if existing_listing_df is None:
-      # no cache (first-ever run, or the month just rolled over via reset_listing_cache())
+      # no cache yet - only happens on a genuine first-ever run now; reset_listing_cache()
+      # leaves today's fresh pull behind rather than deleting the cache outright
       existing_listing_df = pd.DataFrame(columns=self.listing_selects + ['_id'])
 
     # existing rows first, fresh pull appended after - keep='last' then always keeps the
@@ -195,7 +206,7 @@ class LastMthMetricsProcessor(BaseETLProcessor):
       self._mark_success('end_of_mth_run')
 
       # Reset is best-effort and must never affect today's ETL status - even though it has
-      # no ES calls, cache.delete() is still file I/O and could in principle raise. Swallow
+      # no ES calls, cache.set() is still file I/O and could in principle raise. Swallow
       # (don't re-raise): an uncaught exception here would propagate out of run()'s stage loop
       # and skip its own _mark_success('all') check entirely, incorrectly halting tomorrow's
       # run despite the metrics having genuinely succeeded.
@@ -220,6 +231,11 @@ class LastMthMetricsProcessor(BaseETLProcessor):
       self.logger.info("Tracking index is disabled. Skipping update.")
       return 0, []
 
+    # Deliberately scoped to just today's fetch (self.delta_listing_df), not the full
+    # accumulated self.listing_df -- only today's listings need their tracking record
+    # touched. The "delta" name coincidentally still reads right for this one usage, but for
+    # the wrong reason: it's "today's data," not "changed-since-last-run data" (see
+    # _extract_from_datastore()).
     if self.delta_listing_df is not None:
       to_be_updated_listing_df = self.delta_listing_df
     else:
@@ -361,20 +377,22 @@ class LastMthMetricsProcessor(BaseETLProcessor):
   def reset_listing_cache(self, expected_yearmonth: str):
     """
     Runs once, immediately after last month's metrics are computed, archived (the small,
-    aggregated last_mth_metrics_results - see _archive_results()), and pushed to ES. Deletes
-    the raw listing_df cache key outright - no archiving of listing_df itself. At
-    tens/hundreds of thousands of rows per province, archiving the raw listing cache every
-    month indefinitely is a real disk-space/maintenance hazard for a dataframe nothing
-    downstream ever reads back - the only value it had was "just in case" per-listing
-    forensics, deliberately traded away here in favour of a single delete with no failure mode
-    to reason about. The very next daily _extract_from_datastore() call sees a missing cache
-    and treats it exactly like the original first-ever-run case (fresh start, no concat),
-    naturally repopulating via the regular time-blind full pull.
+    aggregated last_mth_metrics_results - see _archive_results()), and pushed to ES. Resets
+    the current_listing cache to *today's fresh pull only* (self.delta_listing_df, guaranteed
+    populated by transform() by this point) rather than deleting the cache key outright. This
+    still discards the whole month's worth of accumulated listings - the point of the reset,
+    so zombie listings stop contaminating next month's metrics - but the cache is never left
+    literally empty: CurrentMthMetricsProcessor reads this same cache, same day, right after
+    this job finishes, with no fallback of its own - an outright delete left every province's
+    cache empty simultaneously on the 1st of every month, crashing it (see the 2026-09-01
+    current_mth_metrics_561 incident). Tomorrow's regular _extract_from_datastore() concats
+    onto this exactly as it would onto any other day's cache.
     """
-    self.cache.delete(f'{self.cache_prefix}{self.prov_code.lower()}_current_listing')
-    self.listing_df = None
+    self.cache.set(f'{self.cache_prefix}{self.prov_code.lower()}_current_listing', self.delta_listing_df)
+    self.listing_df = self.delta_listing_df
 
-    self.logger.info(f"Reset listing cache for {self.prov_code}/{expected_yearmonth}")
+    self.logger.info(f"Reset listing cache for {self.prov_code}/{expected_yearmonth} "
+                      f"to today's {len(self.delta_listing_df)} fresh listings")
 
 
   def update_mkt_trends(self):
@@ -713,7 +731,8 @@ class LastMthMetricsProcessor(BaseETLProcessor):
     self.listing_df = self.cache.get(f'{self.cache_prefix}{self.prov_code.lower()}_current_listing')
 
     if self.listing_df is None:
-      # no cache yet (first-ever run, or right after reset_listing_cache()) -- fresh start
+      # no cache yet -- only a genuine first-ever run now; reset_listing_cache() leaves
+      # today's fresh pull behind rather than deleting the cache outright -- fresh start
       self.listing_df = pd.DataFrame(columns=self.listing_selects + ['_id'])
 
     self.logger.info(f"Loaded {len(self.listing_df)} listings from cache.")
@@ -744,11 +763,17 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
 
   def cleanup(self):
+    """
+    Full manual reset - NOT part of the automatic daily run() flow (only reachable via
+    full_refresh()/reset() in base_etl.py, which scripts/run_last_mth_metrics.py never calls).
+    Unrelated to reset_listing_cache(), the automatic month-end reset.
+    """
     super().cleanup()
     cache_key = f'{self.cache_prefix}{self.prov_code.lower()}_current_listing'
     self.cache.delete(cache_key)
 
-    # reset instance variables
+    # reset instance variables (delta_listing_df: legacy "delta" naming, see
+    # _extract_from_datastore() - it's today's fresh pull, not an incremental delta)
     self.listing_df = None
     self.delta_listing_df = None
     self.last_mth_metrics_results = None
@@ -757,6 +782,8 @@ class LastMthMetricsProcessor(BaseETLProcessor):
 
 
   def delete_checkpoints_data(self):
+    # "_delta_" here is the same legacy naming as self.delta_listing_df - see
+    # _extract_from_datastore(). This key holds today's fresh pull, not an incremental delta.
     self.cache.delete(f'{self.cache_prefix}{self.job_id}_delta_{self.prov_code.lower()}_current_listing')
 
   def pre_end_of_mth_run(self):
