@@ -35,8 +35,8 @@ curl -X PUT 'localhost:9200/_all/_settings' -H 'Content-Type: application/json' 
 # 4. Forcemerge to reclaim disk space (expunge deleted docs)
 # Run in background — rlp_ims_sold_listing_1 first (smaller, faster)
 curl -X POST 'localhost:9200/rlp_ims_sold_listing_1/_forcemerge?only_expunge_deletes=true' &
-curl -X POST 'localhost:9200/rlp_mkt_trends_1/_forcemerge?only_expunge_deletes=true' &
-# Note: rlp_mkt_trends_1 has ~629K deleted docs — leave overnight if needed
+curl -X POST 'localhost:9200/rlp_mkt_trends_current/_forcemerge?only_expunge_deletes=true' &
+# Note: the current market-trends backing index has ~629K deleted docs — leave overnight if needed
 
 # 5. After disk usage drops, restore watermark to defaults
 curl -X PUT 'localhost:9200/_cluster/settings' -H 'Content-Type: application/json' -d '{
@@ -68,17 +68,27 @@ support for that one field.
 **2026-09-01 incident:** `last_mth_min_asking_price` / `last_mth_max_asking_price` were added to
 `LastMthMetricsProcessor` without a matching entry in `MKT_TRENDS_INDEX_MAPPING`. Local ES (used for dev testing)
 already shows this exact drift — both fields exist there as implicit `object`, not `nested`. Caught before PROD's
-`rlp_mkt_trends_1` (real index behind the `rlp_mkt_trends_current` alias) ever wrote these fields for the first
-time (PROD's monthly `end_of_mth_run()` had not yet run against this code), so PROD was patched directly via
+index behind the `rlp_mkt_trends_current` alias ever wrote these fields for the first time (PROD's monthly
+`end_of_mth_run()` had not yet run against this code), so PROD was patched directly via
 `put_mapping` — safe specifically because the fields had **no prior mapping on PROD**; this only works for adding a
 net-new field, not for correcting one that already has data (that requires a reindex). Local ES's existing
 `object`-typed data was left as-is (dev-only, low stakes).
 
 **Fix — for any new nested metrics field going forward, after adding it to `MKT_TRENDS_INDEX_MAPPING`:**
 
+Before the mutating mapping update, confirm the alias resolves to exactly one backing index:
+
+```bash
+. ~/.rlp_es_env && curl -s -H "Authorization: ApiKey $RLP_LISTING_ES_API_KEY" \
+  "https://esp.royallepage.ca:443/_alias/rlp_mkt_trends_current" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d)==1, f'expected one backing index, got {list(d)}'; print(next(iter(d)))"
+```
+
+Then apply the mapping through the stable alias:
+
 ```bash
 . ~/.rlp_es_env && curl -s -X PUT -H "Authorization: ApiKey $RLP_LISTING_ES_API_KEY" -H "Content-Type: application/json" \
-  "https://esp.royallepage.ca:443/rlp_mkt_trends_1/_mapping" \
+  "https://esp.royallepage.ca:443/rlp_mkt_trends_current/_mapping" \
   -d '{
   "properties": {
     "metrics": {
@@ -96,12 +106,12 @@ net-new field, not for correcting one that already has data (that requires a rei
 }'
 ```
 
-Run this **before** the first ETL write to the new field, against every long-lived index that already exists
-(PROD `rlp_mkt_trends_1`, and UAT/local equivalents if they matter for that field). Verify with:
+Run this **before** the first ETL write to the new field, using each environment's
+`rlp_mkt_trends_current` alias. Verify the field mapping without assuming a particular backing-index version:
 
 ```bash
-curl -s -H "Authorization: ApiKey $RLP_LISTING_ES_API_KEY" "https://esp.royallepage.ca:443/rlp_mkt_trends_1/_mapping" \
-  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['rlp_mkt_trends_1']['mappings']['properties']['metrics']['properties']['<new_field_name>'])"
+curl -s -H "Authorization: ApiKey $RLP_LISTING_ES_API_KEY" "https://esp.royallepage.ca:443/rlp_mkt_trends_current/_mapping" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d)==1, f'expected one backing index, got {list(d)}'; m=next(iter(d.values())); print(m['mappings']['properties']['metrics']['properties']['<new_field_name>'])"
 ```
 
 **Key terms:** dynamic mapping, nested vs object type, put_mapping, index-creation-only schema application

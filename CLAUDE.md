@@ -34,6 +34,20 @@ code against PROD, Claude MUST:
 See **[docs/ES_ADMIN.md](docs/ES_ADMIN.md)** for the root cause, the `put_mapping` procedure, and the current
 concrete example (the `quarterly_*` fields, currently switched off).
 
+## Market-Trends Backing-Index Versioning Caveat
+
+`Datastore.create_mkt_trends_index()` currently hardcodes the backing index `rlp_mkt_trends_1`; normal ETL reads
+and writes use the stable `rlp_mkt_trends_current` alias. If market trends is ever reindexed to `_2` or a later
+version, update `create_mkt_trends_index()` before deleting `_1`. Otherwise, a later caller such as
+`scripts/copy_mkt_trends_data.py` will silently recreate an empty `_1`. If `rlp_mkt_trends_current` is also
+missing, the function can attach the alias to that recreated `_1`.
+
+Before any market-trends backing-index migration:
+1. Update `create_mkt_trends_index()` to use the intended version or make it version-aware.
+2. Keep all ETL and copy operations pointed at `rlp_mkt_trends_current`.
+3. Update `docs/ES_ADMIN.md` and `.claude/skills/realestate-es-query/references/mkt_trends_schema.md` to identify
+   the new backing index.
+
 ## Common Development Commands
 
 ### Environment Setup
