@@ -83,6 +83,41 @@ MKT_TRENDS_INDEX_MAPPING = {
               "value": {"type": "integer"}
             }
           },
+          "quarterly_median_sold_price": {
+            "type": "nested",
+            "properties": {
+              "quarter": {"type": "keyword"},
+              "value": {"type": "float"}
+            }
+          },
+          "quarterly_median_dom": {
+            "type": "nested",
+            "properties": {
+              "quarter": {"type": "keyword"},
+              "value": {"type": "float"}
+            }
+          },
+          "quarterly_over_ask_percentage": {
+            "type": "nested",
+            "properties": {
+              "quarter": {"type": "keyword"},
+              "value": {"type": "float"}
+            }
+          },
+          "quarterly_below_ask_percentage": {
+            "type": "nested",
+            "properties": {
+              "quarter": {"type": "keyword"},
+              "value": {"type": "float"}
+            }
+          },
+          "quarterly_sold_listing_count": {
+            "type": "nested",
+            "properties": {
+              "quarter": {"type": "keyword"},
+              "value": {"type": "integer"}
+            }
+          },
           "current_metrics": {
             "properties": {
               "median_asking_price": {"type": "float"},

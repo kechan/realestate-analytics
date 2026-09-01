@@ -11,6 +11,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Elasticsearch Disk Full — Bulk Update Fails
 If bulk updates return `0/N successful` with `cluster_block_exception` / `read-only-allow-delete` errors, the local ES disk has hit the flood-stage watermark. See **[docs/ES_ADMIN.md](docs/ES_ADMIN.md)** for the full fix (raise watermark → remove read-only blocks → forcemerge).
 
+## New ES Metrics Fields on Existing Indices — Schema Edits Alone Don't Reach PROD
+
+Editing `MKT_TRENDS_INDEX_MAPPING` (`realestate_analytics/data/es_index_schemas.py`) has **no effect on an
+already-existing index** — `create_mkt_trends_index()` only applies it when creating a brand-new index
+(`if not exists: create()`), never as an update. If a new metrics field is written for the first time against
+an index that already exists (true for PROD/UAT/local's long-lived `rlp_mkt_trends_*`), Elasticsearch dynamically
+infers a mapping from the first document's shape instead — arrays of `{key, value}` become plain `object`, never
+`nested` (which is only ever explicit). Once that happens it's **permanent**: an existing field's type cannot be
+changed without a full reindex.
+
+**Before any feature switch that writes a new nested metrics field for the first time is turned on** (e.g.
+`ENABLE_QUARTERLY_METRICS` in `historic_sold_median_metrics.py`, or any future equivalent) — before running that
+code against PROD, Claude MUST:
+1. Re-check that the field's mapping in `es_index_schemas.py` still matches exactly what the write code actually
+   produces (field/key names, nesting, `value` type) — schema and code can silently drift apart while a feature
+   sits disabled.
+2. Ask the user for explicit confirmation before applying `put_mapping` to PROD's live index. This is an
+   **irreversible** action — there is no API to remove a field mapping; recovering from a mistake means
+   reindexing into a new index.
+
+See **[docs/ES_ADMIN.md](docs/ES_ADMIN.md)** for the root cause, the `put_mapping` procedure, and the current
+concrete example (the `quarterly_*` fields, currently switched off).
+
 ## Common Development Commands
 
 ### Environment Setup

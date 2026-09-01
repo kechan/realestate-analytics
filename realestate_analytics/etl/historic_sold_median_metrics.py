@@ -73,7 +73,7 @@ class SoldMedianMetricsProcessor(BaseETLProcessor):
 
     self.BATCH_SIZE_MONTHS = 12   # this is the batch size (in # of months) for the time series computation
 
-    # Master switch for the quarterly sold-metrics feature (median/min/max/DOM/over-ask/
+    # Master switch for the quarterly sold-metrics feature (median price/DOM/over-ask/
     # below-ask/sold-count computed and written per quarter, alongside the existing monthly
     # ones). Requirement is still not firm as of 2026-07, so default OFF - flip to True to
     # enable the whole feature (compute, cache/diff, and ES writes) without deleting any code.
