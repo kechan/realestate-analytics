@@ -41,6 +41,20 @@ MKT_TRENDS_INDEX_MAPPING = {
               "value": {"type": "float"}
             }
           },
+          "last_mth_min_asking_price": {
+            "type": "nested",
+            "properties": {
+              "month": {"type": "date", "format": "yyyy-MM"},
+              "value": {"type": "float"}
+            }
+          },
+          "last_mth_max_asking_price": {
+            "type": "nested",
+            "properties": {
+              "month": {"type": "date", "format": "yyyy-MM"},
+              "value": {"type": "float"}
+            }
+          },
           "last_mth_new_listings": {
             "type": "nested",
             "properties": {

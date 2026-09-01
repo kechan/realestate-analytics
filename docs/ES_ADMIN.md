@@ -51,3 +51,57 @@ curl -X PUT 'localhost:9200/_cluster/settings' -H 'Content-Type: application/jso
 **After step 3, bulk updates will work again immediately** — no need to wait for forcemerge to complete.
 
 **Key terms:** flood-stage watermark, read-only-allow-delete block, segment bloat, forcemerge, deleted documents
+
+## Adding a New Field to `MKT_TRENDS_INDEX_MAPPING` — Must Also Be Patched onto Existing Indices
+
+**Root cause of the pattern:** `create_mkt_trends_index()` (`realestate_analytics/data/es.py`) only applies
+`MKT_TRENDS_INDEX_MAPPING` (`realestate_analytics/data/es_index_schemas.py`) when the index doesn't exist yet
+(`if not self.es.indices.exists(...): create(...)`). Editing the schema file has **no effect on an already-existing
+index** — there is no code path that ever calls `put_mapping` for an update. If a new metrics field is added to a
+processor's ES write logic but the index it writes to already exists (true for local/UAT/PROD's long-lived
+`rlp_mkt_trends_*` indices), the field only gets defined implicitly the first time a script-based update touches it
+— and Elasticsearch's dynamic mapping infers a plain `object` type for an array of `{month, value}` docs, never
+`nested` (which is only ever set explicitly, never inferred). This silently produces a field whose mapping is
+inconsistent with its siblings (e.g. `last_mth_median_asking_price`, which *is* `nested`), degrading nested-query
+support for that one field.
+
+**2026-09-01 incident:** `last_mth_min_asking_price` / `last_mth_max_asking_price` were added to
+`LastMthMetricsProcessor` without a matching entry in `MKT_TRENDS_INDEX_MAPPING`. Local ES (used for dev testing)
+already shows this exact drift — both fields exist there as implicit `object`, not `nested`. Caught before PROD's
+`rlp_mkt_trends_1` (real index behind the `rlp_mkt_trends_current` alias) ever wrote these fields for the first
+time (PROD's monthly `end_of_mth_run()` had not yet run against this code), so PROD was patched directly via
+`put_mapping` — safe specifically because the fields had **no prior mapping on PROD**; this only works for adding a
+net-new field, not for correcting one that already has data (that requires a reindex). Local ES's existing
+`object`-typed data was left as-is (dev-only, low stakes).
+
+**Fix — for any new nested metrics field going forward, after adding it to `MKT_TRENDS_INDEX_MAPPING`:**
+
+```bash
+. ~/.rlp_es_env && curl -s -X PUT -H "Authorization: ApiKey $RLP_LISTING_ES_API_KEY" -H "Content-Type: application/json" \
+  "https://esp.royallepage.ca:443/rlp_mkt_trends_1/_mapping" \
+  -d '{
+  "properties": {
+    "metrics": {
+      "properties": {
+        "<new_field_name>": {
+          "type": "nested",
+          "properties": {
+            "month": {"type": "date", "format": "yyyy-MM"},
+            "value": {"type": "float"}
+          }
+        }
+      }
+    }
+  }
+}'
+```
+
+Run this **before** the first ETL write to the new field, against every long-lived index that already exists
+(PROD `rlp_mkt_trends_1`, and UAT/local equivalents if they matter for that field). Verify with:
+
+```bash
+curl -s -H "Authorization: ApiKey $RLP_LISTING_ES_API_KEY" "https://esp.royallepage.ca:443/rlp_mkt_trends_1/_mapping" \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['rlp_mkt_trends_1']['mappings']['properties']['metrics']['properties']['<new_field_name>'])"
+```
+
+**Key terms:** dynamic mapping, nested vs object type, put_mapping, index-creation-only schema application
