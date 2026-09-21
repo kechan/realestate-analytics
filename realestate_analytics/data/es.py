@@ -1602,7 +1602,13 @@ class Datastore:
         # listings_df.addedOn = pd.to_datetime(listings_df.addedOn)
         listings_df.addedOn = listings_df.addedOn.apply(parse_datetime)
       if 'lastUpdate' in listings_df.columns:
-        listings_df.lastUpdate = pd.to_datetime(listings_df.lastUpdate, format='%y-%m-%d:%H:%M:%S')
+        parsed_lastupdate = pd.to_datetime(listings_df.lastUpdate, format='%y-%m-%d:%H:%M:%S', errors='coerce')
+        bad_lastupdate = parsed_lastupdate.isna() & listings_df.lastUpdate.notna()   # present but unparseable; missing stays NaT as before
+        listings_df.lastUpdate = parsed_lastupdate
+        if bad_lastupdate.any():
+          self.logger.warning(f"Dropping {bad_lastupdate.sum()} listing(s) with unparseable lastUpdate: "
+                              f"{listings_df.loc[bad_lastupdate, '_id'].tolist()}")
+          listings_df = listings_df[~bad_lastupdate].reset_index(drop=True)
 
       process_time = time.time() - start_process_time
       self.logger.info(f"Completed fetching current active listings in {process_time:.2f} seconds")
@@ -1767,7 +1773,13 @@ class Datastore:
         # listings_df.addedOn = pd.to_datetime(listings_df.addedOn)
         listings_df.addedOn = listings_df.addedOn.apply(parse_datetime)
       if 'lastUpdate' in listings_df.columns:
-        listings_df.lastUpdate = pd.to_datetime(listings_df.lastUpdate, format='%y-%m-%d:%H:%M:%S')
+        parsed_lastupdate = pd.to_datetime(listings_df.lastUpdate, format='%y-%m-%d:%H:%M:%S', errors='coerce')
+        bad_lastupdate = parsed_lastupdate.isna() & listings_df.lastUpdate.notna()   # present but unparseable; missing stays NaT as before
+        listings_df.lastUpdate = parsed_lastupdate
+        if bad_lastupdate.any():
+          self.logger.warning(f"Dropping {bad_lastupdate.sum()} listing(s) with unparseable lastUpdate: "
+                              f"{listings_df.loc[bad_lastupdate, '_id'].tolist()}")
+          listings_df = listings_df[~bad_lastupdate].reset_index(drop=True)
   
       process_time = time.time() - start_process_time
       self.logger.info(f"Completed fetching listings in {process_time:.2f} seconds")
