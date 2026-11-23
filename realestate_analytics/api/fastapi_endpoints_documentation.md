@@ -1,1061 +1,203 @@
-# Real Estate Analytics API Documentation
+# Standalone Real Estate Analytics API
 
-## Base URL
+The serving API reads published data directly from production Elasticsearch. Geography requests can fill missing information from an optional serialized GeoCollection; market metrics always read ES directly. Dependencies are listed in `requirements.txt`, including `dill` and `shapely` for the optional snapshot. Geography and metrics serving do not import ETL scripts or archives. The optional CSV preview imports the production mapper as a read-only third-party dependency; it never runs ETL or ES-writing routines.
 
-All endpoints are relative to the base URL: `http://your-api-domain.com`
+## Configuration and startup
 
-Replace `your-api-domain.com` with the actual domain where your API is hosted.
+The server loads `~/.env` without overriding exported values, then `~/.rlp_es_env` with `override=True`, and requires `RLP_LISTING_ES_API_KEY`. An exported key may be used if the key file does not exist. The host is `https://esp.royallepage.ca:443`; startup checks production node identity and access to the market trends, geography, and geography-details indices. Network access to the production ES host and a key with read permissions for these resources and node information are required. When geography fallback is configured, ES unavailability permits startup in degraded mode; readiness still returns 503. An unexpected ES environment identity always prevents startup.
 
-## Endpoints
+Optional environment variables:
 
-### 1. Historic Sold Median Price
+- `ALLOW_ORIGINS`: comma-separated browser origins; default `http://localhost:3000`.
+- `API_GEO_INDEX`: geography index; default `rlp_content_geo_4`.
+- `API_GEO_DETAILS_INDEX`: geography detail index; default `rlp_geo_details_en`.
+- `ANALYTICS_CACHE_DIR`: optional directory containing `geo_collection.dill`. Existing local configuration uses `/Users/kechan/tmp/listing_analytics_data`. When unset, geography fallback is disabled. Deploy the trusted snapshot alongside the standalone API and configure this directory there; the ETL project is not needed for geography/metrics serving. CSV preview additionally imports the existing production mapper as a read-only dependency.
 
-Retrieves the historic median sold price data for a specific geographic area and property type.
+Start the serving app with the project environment:
 
-**Endpoint:** `/metrics/historic_sold/price`
-
-**Method:** GET
-
-**Query Parameters:**
-- `geog_id` (required): Geographic ID to filter by
-- `property_type` (optional): Property type to filter by. Use 'ALL' or leave empty for all property types combined.
-- `return_geojson` (optional): Set to 'true' to return data in GeoJSON format. Default is 'false'.
-
-
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/metrics/historic_sold/price?geog_id=g20_dpz9hct3&property_type=ALL"
+```sh
+.venv/bin/python -m uvicorn realestate_analytics.api.main:app --port 8001
 ```
 
-**Response Example:**
-```json
-{
-  "geog_id": "g20_dpz9hct3",
-  "property_type": "ALL",
-  "data": [
-    {
-      "month": "2019-08",
-      "value": 600000
-    },
-    {
-      "month": "2019-09",
-      "value": 706500
-    },
-    {
-      "month": "2019-10",
-      "value": 678500
-    },
-    {
-      "month": "2024-06",
-      "value": 935000
-    },
-    {
-      "month": "2024-07",
-      "value": 943500
-    }
-  ]
-}
+Interactive OpenAPI documentation is at `/docs`. The old unversioned metric and geography endpoints have been replaced, and existing clients require an update.
+
+## Read-only IMS mapping monitor
+
+`GET /api/v1/ims-mappings` groups **all stored history** in
+`rlp_ims_sold_listing_current` by exact `Type`, `SubType`, `Style`, and stored
+`propertyType`. It returns counts rather than individual sold listings. Missing
+values remain included; a missing property type is a distinct outcome when
+detecting tuples with multiple classifications. Case and whitespace are retained.
+
+```sh
+curl --fail 'http://127.0.0.1:8013/api/v1/ims-mappings' -H 'accept: application/json'
 ```
 
-**Response Structure:**
+The frontend page is `/ims-property-type-mapping`. Its primary workflow is CSV
+preview. Choose File or drag one CSV onto the drop zone, then select **Compute
+property types**. Selecting or dropping a file does not upload or compute.
+Production queries run only after **Query Production ES** or **Refresh from ES**
+and explicit confirmation of the full-source-scan cost. Cancel sends no request.
+Filtering, sorting, result-source switching, and paging use completed results
+without further ES requests. No mapping or ES edits are offered.
 
-- `geog_id` (string): The geographic ID used for filtering the data.
-- `property_type` (string): The property type used for filtering the data.
-- `data` (array of objects): A list of date-value pairs representing the median sold price for each time period.
-  - `month` (string): The date for the data point, formatted as `YYYY-MM`.
-  - `value` (number): The median sold price for that specific month.
+### Read-only CSV preview
 
+`POST /api/v1/ims-mappings/preview` accepts one raw UTF-8 CSV (`text/csv` or
+`application/octet-stream`). For a batch, concatenate the original CSV bytes
+in order, use `Content-Type: application/vnd.ims.csv-batch`, and supply each
+file's byte length in the comma-separated `X-IMS-CSV-Sizes` header. Every file has
+its own header and may have a UTF-8 BOM. All inputs require `Type`, `SubType`,
+`Style`, and `Province`. Batches also require `MLSID`, `MLSNumber`, and
+`WrittenDate` in every file. Surrounding header whitespace is accepted. Missing
+or duplicate headers, empty files, and parser errors are rejected. The preview
+computes `propertyType` through the real mapper.
 
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/metrics/historic_sold/price?geog_id=g20_dpz9hct3&property_type=ALL&return_geojson=true"
+Uploads are streamed into temporary storage under `~/tmp` (spooling to disk
+above 8 MiB), deleted on exit, and never retained as an application cache.
+Limits are 20 files, 5 million input rows combined, and 100,000 unique normalized
+source tuples. Uploads exceeding available temporary storage return HTTP 507.
+The parser reads chunks and the API deduplicates
+with vectorized operations before grouping. It uses the production document ID
+components (province, MLS board, MLS number, sale year), preserving the
+identifier text from the CSV. The last occurrence in upload and row order wins.
+A legacy single file with just the four mapping columns still counts all rows.
+Rows without a usable ID remain separate. The response reports
+`csv_input_row_count`, retained `document_count`, and
+`csv_unidentified_row_count`.
+
+When there is a usable province value, the preview also returns
+`province_breakdown` with per-province grouped rows and their summary counts.
+Rows with unknown province remain included. The existing `rows` and top-level
+counts still describe the combined view. A tuple can have one type in each
+province and multiple types in the combined view.
+
+**Production code is an immutable third-party dependency.** The optional CSV
+path imports `IMSPropertyTypeMapper` through `api/ims_mapper_adapter.py`; it does
+not vendor its inference/override rules or modify any production source file.
+The adapter invokes the existing `load_dataframe()`,
+`generate_full_mapping_dataframe()`, and `apply_property_types()` methods on
+unique tuple/province groups. The mapper reuses its saved base mappings, infers
+only unseen tuples, and applies its manual override dataframe. Its own inference
+loop is reused only for unseen tuples; no per-listing mapper loop is added.
+The API's joins annotate lineage, not recompute those classifications.
+
+The adapter suppresses the mapper's two audit-file hooks, clears persistent
+save destinations after inputs are loaded, and rejects `save_mapping()`. It does
+not call the ES-writing bulk importer, GUID resolution, geocoding, or any save
+routine. Both current mapping files must be readable. Their hashes identify the
+inputs, and changed files cause an error rather than mixed-version results.
+
+**Sole explicit exception:** the final AB duplex rule is embedded in both
+`Datastore.bulk_import_ims_sold_listings()` and
+`Datastore.bulk_update_ims_sold_listings()` with no pure helper to import. With
+user approval, `api/ims_provincial_rules.py` mirrors it, shared by the preview and
+ES lineage monitor. Its code comments, root `TODO.md`, and root `AGENTS.md`
+document this temporary duplication. A drift regression test compares it with
+both production blocks. A future production-helper refactor is deferred.
+
+CSV output has `report_mode=csv` and check status `computed`, never a claim of
+ES verification. The source controls keep CSV and ES reports distinct. No ES
+request or write, cache save, or ETL sighting-log write occurs. The mapper code
+is imported when the worker loads it: restart FastAPI after production mapper
+source changes, and review the API provincial mirror if those rules change.
+`rules_version` fingerprints the executed mapper methods. Only one CSV preview
+runs per worker at a time. No additional frontend packages are needed.
+
+`SubType` and `Style` are text fields without aggregatable keyword subfields in
+the current Production index. An ES scripted metric therefore groups their
+exact `_source` values. A full scan exceeded the gateway timeout during QA, so
+the implementation opens one point-in-time snapshot, reads an exact baseline
+count, then processes 16 disjoint slices sequentially. Each slice has a 30-second
+ES timeout and returns only aggregates. The snapshot is closed in `finally`;
+its keep-alive also expires if closing fails. This uses 19 ES requests for a
+nonempty index (open, count, 16 slices, close), while each document is collected
+by only one aggregation slice. Failed shards, timeout, inexact totals, or a
+count mismatch cause an error rather than a successful partial report.
+See [Elastic's point-in-time documentation](https://www.elastic.co/guide/en/elasticsearch/reference/8.19/point-in-time-api.html).
+
+The ES monitor reads these existing files from `ANALYTICS_CACHE_DIR` afresh for
+each completed report, without importing or executing the ETL/mapper:
+
+- `ims_property_type_mapping_v4_df`: saved base `Inferred` lookup.
+- `ims_property_type_lookup_df`: current manual `propertyType` overrides.
+
+Pandas merges, masks, and grouped reductions reconcile the aggregated counts;
+there is no Python per-tuple iteration or dataframe `apply`. Current precedence
+matches ingestion: **AB duplex rule → non-null manual override → base lookup**.
+The AB rule applies to `Duplex`, `Full Duplex`, `Half Duplex`, and
+`Duplex Side By Side` subtypes and yields `SEMI-DETACHED`. Last duplicate lookup
+keys win; null overrides are not applied. Missing or unreadable lookup files do
+not hide ES counts, and their unavailable status is returned.
+
+`mapping_source` and `lineage_status` describe **current lookup consistency**.
+Historical mapping versions/provenance are not stored in ES, and the base cache
+may itself contain prior corrections. They do not prove which rule assigned an
+individual record historically. Provincial splits remain flagged as conflicts
+even if the AB rule explains them. Source counters report records, not tuple
+counts; no old cached `Count` column is presented as Production usage.
+
+This optional feature uses the dependencies in `requirements-ims-monitor.txt`;
+they are already installed in the current project environment. Core API startup
+does not import pandas or pyarrow. No packages are installed automatically.
+The API does not retain a report cache and permits one IMS scan per worker at a
+time (409 if busy). It changes no index mappings or ETL code. The ES key needs
+permission to read the IMS index and open/close its search snapshot.
+
+## Metrics
+
+`GET /api/v1/metrics` lists supported metrics, units, and descriptions: 12 monthly series and the `current_metrics` object. `GET /api/v1/metrics/{geog_id}` retrieves a published document by `{geog_id}_{property_type}` from `rlp_mkt_trends_current`.
+
+Parameters: `property_type` defaults to `ALL`; `metrics` may be repeated to select monthly series and/or `current_metrics`; `start_month` and `end_month` are inclusive `YYYY-MM` bounds applied to monthly series only. With `metrics` omitted, the response returns all 12 monthly series plus current metrics. With an explicit selection, only those metrics are included: `current_metrics` is omitted unless explicitly selected. Monthly metrics remain under `series`; the current snapshot remains in the top-level `current_metrics` field. Selecting only `current_metrics` returns an empty `series` object.
+
+```text
+/api/v1/metrics/g30_dpz89rm7?property_type=ALL&metrics=median_sold_price&metrics=months_of_inventory&start_month=2025-01
 ```
 
-**Response Example (GeoJSON format):**
-```json
-{
-  "type": "Feature",
-  "geometry": null,
-  "properties": {
-    "name": "Scarborough",
-    "geog_id": "g20_dpz9hct3",
-    "property_type": "ALL",
-    "level": 20,
-    "parent_geog_id": "g30_dpz89rm7",
-    "has_children": true,
-    "metric_type": "median_price",
-    "metric_data": [
-      {
-        "month": "2019-08",
-        "value": 600000
-      },
-      {
-        "month": "2019-09",
-        "value": 706500
-      },
-      // ... more data points ...
-    ]
-  }
-}
-```
+Each series supplies `available`, `latest_available_month` (across the source series before date filtering), and `data`. Missing fields have `available: false`; missing current fields are null. Zero remains zero. Absorption is a ratio and sold-over/below-ask series are percentages. Asking-price bounds are filtered, not literal extrema. The document timestamp is shared across metrics and does not prove individual metric freshness. Quarterly metrics are not part of this API.
 
-**Response Structure:**
-- `type` (string): Always "Feature" for GeoJSON format.
-- `geometry` (null): Geometry is not included in this response.
-- `properties` (object): Contains the geographic properties and metric data.
-  - `name` (string): The name of the geographic area.
-  - `geog_id` (string): The geographic ID used for filtering the data.
-  - `property_type`: The property type for which the data is reported.
-  - `level` (integer): The geographic level.
-  - `parent_geog_id` (string): The ID of the parent geographic area, if any.
-  - `has_children` (boolean): Indicates whether this geographic area has child areas.
-  - `metric_type` (string): The type of metric, in this case "median_price".
-  - `metric_data` (array of objects): The time series data for the metric.
-    - `month` (string): The month for the data point, formatted as "YYYY-MM".
-    - `value` (number): The median price value for that month.
+## Geography
 
-### 2. Historic Sold Median Days on Market (DOM)
+`GET /api/v1/geos` supports `query`, `province`, `level`, `parent_id`, `include_geometry`, `limit` (optional, 1–200), and `offset` (optional). Detail and ancestry are available at `/api/v1/geos/{geog_id}` and `/api/v1/geos/{geog_id}/hierarchy`. Results are GeoJSON features, sorted by name and ID. A polygon missing from both sources is null and marked `missing`; geometry omitted by request is marked `not_requested`. Parent status identifies source, uniquely inferred, cache, unresolved, or root relationships; an incomplete hierarchy is flagged. The detail route performs a single GET against `rlp_geo_details_en` and returns that document under `details`, including its `data` and `meta` fields, with missing values supplemented as described below. It does not query the base geo index or traverse parents. Its feature properties contain ID, name, province, geometry status, and a level derived from the ID; they omit parent fields. Parent traversal remains on the hierarchy route (and parent links on list results). The source `meta.geometry` is excluded from `details`: when requested, geometry is returned once in the GeoJSON `geometry` field with longitude-first coordinates. A detail absent from ES uses the snapshot when available; absence from both sources returns 404.
 
-Retrieves the historic median days on market data for a specific geographic area and property type.
+Geography metadata is requested from Elasticsearch on every request. Search filters are applied in ES before fetching candidate records, and parent details are looked up only for the selected page (or parent-filter candidates). Source fields are restricted and any ES scroll is explicitly cleared. ES result caching is not used.
 
-**Endpoint:** `/metrics/historic_sold/dom`
+### Province navigation
 
-**Method:** GET
+`GET /api/v1/provinces/{province}/children?include_geometry=false` returns the immediate navigation areas for a Canadian province or territory. Codes are case-insensitive and validated. Provinces are virtual navigation containers: this endpoint returns city-and-larger records without a resolved geo parent, excluding cities linked under regions. Unresolved cities stay reachable directly under the province; missing parent links are not invented from polygon containment. This is a geography hierarchy, not a guarantee of published metrics or a non-overlapping administrative partition.
 
-**Query Parameters:**
-- `geog_id` (required): Geographic ID to filter by
-- `property_type` (optional): Property type to filter by. Use 'ALL' or leave empty for all property types combined.
-- `return_geojson` (optional): Set to 'true' to return data in GeoJSON format. Default is 'false'.
+The API filters province and `level >= 30` in ES, requests only base metadata, and batches parent fields. Province discovery opens a scroll on its first search (2,000 metadata records per batch), retains that first page, and always clears the scroll. Parent-only `_mget` batches contain at most 2,000 IDs. Candidate names resolve within that metadata cohort. The frontend then sends the returned root IDs to the boundary endpoint, avoiding a repeated province search and parent lookup. No neighbourhood metadata, descendant polygons, profile prose, or metrics are fetched for this navigation request. ES remains primary and snapshot fallback fills missing data using the existing provenance rules.
 
+With `include_geometry=true`, boundaries are simplified at **0.0025 degrees** with topology preservation, and `geometry_tolerance` reports that value. This reduces navigation response size; it does not modify ES, the snapshot, or detail endpoint geometry. Use `/geos/{geog_id}?include_geometry=true` for exact published coordinates. Missing boundaries remain null and those areas remain navigable through metadata. There is no implicit pagination cap on province children. The combined `include_geometry=true` route remains available for independent clients.
 
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/metrics/historic_sold/dom?geog_id=g20_dpz9hct3&property_type=ALL"
-```
+### Bulk navigation boundaries
 
-**Response Example:**
-```json
-{
-  "geog_id": "g20_dpz9hct3",
-  "property_type": "ALL",
-  "data": [
-    {
-      "month": "2019-08",
-      "value": 14
-    },
-    {
-      "month": "2019-09",
-      "value": 13
-    },
-    {
-      "month": "2024-06",
-      "value": 11
-    },
-    {
-      "month": "2024-07",
-      "value": 17
-    }
-  ]
-}
-```
+`POST /api/v1/geos/boundaries` accepts `{"geog_ids": ["g40_dpz3tpuh"]}` and only reads data. It performs no ES writes, province search, parent lookup, or metric read. Supply 1–2,000 IDs per request. IDs are validated and deduplicated in first-occurrence order. The response is a GeoJSON FeatureCollection with ID, geometry status, provenance, and `geometry_tolerance: 0.0025`; metadata remains in the preceding province response.
 
-**Response Structure:**
+Boundary reads use source-filtered `_mget` batches of 100 with at most three concurrent ES requests per API request. ES geometry is atomic and primary; a missing boundary uses the existing in-memory snapshot. Validation, conversion, and the existing topology-preserving simplification run off the event loop. Exact geo-detail output and market metric queries are unchanged. No ES-result cache is introduced.
 
-- `geog_id` (string): The geographic ID used for filtering the data.
-- `property_type` (string): The property type used for filtering the data.
-- `data` (array of objects): A list of date-value pairs representing the median days on market (DOM) for each time period.
-  - `month` (string): The date for the data point, formatted as `YYYY-MM`.
-  - `value` (number): The median days on market for that specific month.
+The serving lifespan owns one `NavigationGeometryProcessor` per API process. It builds native geometries from NumPy coordinate arrays, batches Shapely validity/simplification operations, and shares a pool of **two native threads across requests**. Threads start lazily and are drained and joined on shutdown, including startup-failure cleanup. There is no Celery service, broker, custom Rust extension, or additional process to start. Multiple Uvicorn processes each have their own two-thread pool.
 
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/metrics/historic_sold/dom?geog_id=g20_dpz9hct3&property_type=ALL&return_geojson=true"
-```
+Strict coordinate validation still precedes array construction: strings, booleans, nonfinite values, invalid ranges, malformed points, and unclosed rings retain their existing behavior. Polygon holes, multipart geometry, missing/empty geometry, invalid topology, feature ordering, and provenance are preserved. Simplification uses the same 0.0025-degree tolerance and topology checks. NumPy is declared explicitly in this standalone API's requirements; it was already installed in the validated environment. No garbage-collection settings are changed; heavy concurrent requests can still encounter GC pauses.
 
-**Response Example (GeoJSON format):**
-```json
-{
-  "type": "Feature",
-  "geometry": null,
-  "properties": {
-    "name": "Scarborough",
-    "geog_id": "g20_dpz9hct3",
-    "property_type": "ALL",
-    "level": 20,
-    "parent_geog_id": "g30_dpz89rm7",
-    "has_children": true,
-    "metric_type": "median_dom",
-    "metric_data": [
-      {
-        "month": "2019-08",
-        "value": 14
-      },
-      {
-        "month": "2019-09",
-        "value": 13
-      },
-      // ... more data points ...
-    ]
-  }
-}
-```
+### Optional geography snapshot fallback
 
-**Response Structure:** (Same as the price endpoint, with "metric_type" being "median_dom")
+- ES is always attempted first. On ES errors or absent documents, a matching snapshot record can supply geography information. For an existing ES document, only absent, null, or empty-string fields are filled recursively. Populated ES values, including zero and false, stay unchanged. Cached fields are not written back to ES.
+- Geometry is atomic. An existing ES polygon is used as-is without inspecting cached coordinates. Only an entirely missing polygon is replaced with the complete cached geometry, and only when `include_geometry=true`. Geometry is never merged coordinate by coordinate.
+- Missing parent links can come from the snapshot. Hierarchy responses can therefore connect Toronto to GTA, and an empty GTA child search can find cached child IDs. Cached search candidates are re-read from ES in batches, preserving current fields and reapplying search filters. A nonempty ES result set is not expanded with older cached records. Pagination semantics remain the same for fallback results.
+- Each feature has `provenance.source` (`elasticsearch`, `mixed`, or `geo_collection`) and `provenance.fallback_fields` describing snapshot contributions. Collections also aggregate provenance. A cached parent is explicitly marked `parent_status: "cache"`.
+- The snapshot is loaded only on the first fallback, in a background thread with a lock, and retained in memory until process restart. Each server worker has its own instance. Updating the file requires a worker restart. The loader restores only the serialized state needed by the API, without importing analytics data or ETL code. Use a deployment-controlled trusted dill file; dill deserialization is not intended for untrusted uploads.
+- Missing/unreadable snapshots are logged and leave ES behavior in place. ES errors are logged even when a snapshot supplies a response. Readiness continues to check ES, and metric requests never consult this cache.
 
+Pagination semantics:
 
-### 3. Historic Sold Over Ask Percentage
+- Omitting `limit` returns **all matching geography records**, with or without search filters. There is no implicit page-size cap, and the response reports `limit: null`. The normal list fields are returned, with geometry controlled by `include_geometry`.
+- `offset` skips that many matching records; omitting it skips none. Providing `offset`, including `offset=0`, never imposes a result limit. Without `limit`, all remaining matches are returned.
+- With no search filters and an explicit `limit`, ES performs sorting and pagination using `from`/`size`. The response's `total` is the exact number of matching documents, independent of page size. Filtered requests apply an explicit limit after resolving the matching candidates. Sorting is case-insensitive by display name with geographic ID as the tie-breaker, consistently across full downloads and pages.
+- Deep offsets beyond ES's default 10,000-result window use sort cursors instead of failing or silently truncating the result. These requests can require additional ES calls.
 
-Retrieves the historic percentage of properties sold over asking price for a specific geographic area and property type.
+## Errors and administration
 
-**Endpoint:** `/metrics/historic_sold/over-ask`
+Invalid parameters return 422; missing documents 404; ES failures 503; malformed source data 502. Error responses do not contain credentials or raw ES errors.
 
-**Method:** GET
-
-**Query Parameters:**
-- `geog_id` (required): Geographic ID to filter by
-- `property_type` (optional): Property type to filter by. Use 'ALL' or leave empty for all property types combined.
-- `return_geojson` (optional): Set to 'true' to return data in GeoJSON format. Default is 'false'.
-
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/metrics/historic_sold/over-ask?geog_id=g20_dpz9hct3&property_type=DETACHED"
-```
-
-**Response Example:**
-```json
-{
-  "geog_id": "g20_dpz9hct3",
-  "property_type": "DETACHED",
-  "data": [
-    {
-      "month": "2019-08",
-      "value": 46.15384615384615
-    },
-    {
-      "month": "2019-09",
-      "value": 37.77777777777778
-    },
-    {
-      "month": "2024-06",
-      "value": 62.23404255319149
-    },
-    {
-      "month": "2024-07",
-      "value": 41.7989417989418
-    }
-  ]
-}
-```
-
-**Response Structure:**
-
-- `geog_id` (string): The geographic ID used for filtering the data.
-- `property_type` (string): The property type used for filtering the data.
-- `data` (array of objects): A list of date-value pairs representing the percentage of properties sold over the asking price for each time period.
-  - `month` (string): The date for the data point, formatted as `YYYY-MM`.
-  - `value` (number): The percentage of properties sold over the asking price for that specific month.
-
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/metrics/historic_sold/over-ask?geog_id=g20_dpz9hct3&property_type=DETACHED&return_geojson=true"
-```
-
-**Response Example (GeoJSON format):**
-```json
-{
-  "type": "Feature",
-  "geometry": null,
-  "properties": {
-    "name": "Scarborough",
-    "geog_id": "g20_dpz9hct3",
-    "property_type": "DETACHED",
-    "level": 20,
-    "parent_geog_id": "g30_dpz89rm7",
-    "has_children": true,
-    "metric_type": "over_ask_percentage",
-    "metric_data": [
-      {
-        "month": "2019-08",
-        "value": 46.15
-      },
-      {
-        "month": "2019-09",
-        "value": 37.78
-      },
-      // ... more data points ...
-    ]
-  }
-}
-```
-
-**Response Structure:** (Same as the price endpoint, with "metric_type" being "over_ask_percentage")
-
-
-### 4. Historic Sold Under Ask Percentage
-
-Retrieves the historic percentage of properties sold under asking price for a specific geographic area and property type.
-
-**Endpoint:** `/metrics/historic_sold/under-ask`
-
-**Method:** GET
-
-**Query Parameters:**
-- `geog_id` (required): Geographic ID to filter by
-- `property_type` (optional): Property type to filter by. Use 'ALL' or leave empty for all property types combined.
-- `return_geojson` (optional): Set to 'true' to return data in GeoJSON format. Default is 'false'.
-
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/metrics/historic_sold/under-ask?geog_id=g20_dpz9hct3&property_type=CONDO"
-```
-
-**Response Example:**
-```json
-{
-  "geog_id": "g20_dpz9hct3",
-  "property_type": "CONDO",
-  "data": [
-    {
-      "month": "2019-08",
-      "value": 70.83333333333334
-    },
-    {
-      "month": "2019-09",
-      "value": 53.70370370370371
-    },
-    {
-      "month": "2024-06",
-      "value": 77
-    },
-    {
-      "month": "2024-07",
-      "value": 67.07317073170732
-    }
-  ]
-}
-```
-
-**Response Structure:**
-
-- `geog_id` (string): The geographic ID used for filtering the data.
-- `property_type` (string): The property type used for filtering the data.
-- `data` (array of objects): A list of date-value pairs representing the percentage of properties sold under the asking price for each time period.
-  - `month` (string): The date for the data point, formatted as `YYYY-MM`.
-  - `value` (number): The percentage of properties sold under the asking price for that specific month.
-
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/metrics/historic_sold/under-ask?geog_id=g20_dpz9hct3&property_type=CONDO&return_geojson=true"
-```
-
-**Response Example (GeoJSON format):**
-```json
-{
-  "type": "Feature",
-  "geometry": null,
-  "properties": {
-    "name": "Scarborough",
-    "geog_id": "g20_dpz9hct3",
-    "property_type": "CONDO",
-    "level": 20,
-    "parent_geog_id": "g30_dpz89rm7",
-    "has_children": true,
-    "metric_type": "under_ask_percentage",
-    "metric_data": [
-      {
-        "month": "2019-08",
-        "value": 53.85
-      },
-      {
-        "month": "2019-09",
-        "value": 62.22
-      },
-      // ... more data points ...
-    ]
-  }
-}
-```
-
-**Response Structure:** (Same as the price endpoint, with "metric_type" being "under_ask_percentage")
-
-
-
-### 5. Historic Sold Listing Count
-
-Retrieves the historic count of sold listings for a specific geographic area and property type.
-
-**Endpoint:** `/metrics/historic_sold/sold-listing-count`
-
-**Method:** GET
-
-**Query Parameters:**
-- `geog_id` (required): Geographic ID to filter by
-- `property_type` (optional): Property type to filter by. Use 'ALL' or leave empty for all property types combined.
-- `return_geojson` (optional): Set to 'true' to return data in GeoJSON format. Default is 'false'.
-
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/metrics/historic_sold/sold-listing-count?geog_id=g20_dpz9hct3&property_type=DETACHED"
-```
-
-**Response Example:**
-```json
-{
-  "geog_id": "g20_dpz9hct3",
-  "property_type": "DETACHED",
-  "data": [
-    {
-      "month": "2019-08",
-      "value": 45
-    },
-    {
-      "month": "2019-09",
-      "value": 52
-    },
-    {
-      "month": "2024-06",
-      "value": 63
-    },
-    {
-      "month": "2024-07",
-      "value": 58
-    }
-  ]
-}
-```
-
-**Response Structure:**
-
-- `geog_id` (string): The geographic ID used for filtering the data.
-- `property_type` (string): The property type used for filtering the data.
-- `data` (array of objects): A list of date-value pairs representing the count of sold listings for each time period.
-  - `month` (string): The date for the data point, formatted as `YYYY-MM`.
-  - `value` (number): The count of sold listings for that specific month.
-
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/metrics/historic_sold/sold-listing-count?geog_id=g20_dpz9hct3&property_type=DETACHED&return_geojson=true"
-```
-
-**Response Example (GeoJSON format):**
-```json
-{
-  "type": "Feature",
-  "geometry": null,
-  "properties": {
-    "name": "Scarborough",
-    "geog_id": "g20_dpz9hct3",
-    "property_type": "DETACHED",
-    "level": 20,
-    "parent_geog_id": "g30_dpz89rm7",
-    "has_children": true,
-    "metric_type": "sold_listing_count",
-    "metric_data": [
-      {
-        "month": "2019-08",
-        "value": 45
-      },
-      {
-        "month": "2019-09",
-        "value": 52
-      },
-      // ... more data points ...
-    ]
-  }
-}
-```
-
-**Response Structure:** (Same as the price endpoint, with "metric_type" being "sold_listing_count")
-
-
-
-
-### 6. Last Month Metrics
-
-Retrieves various metrics for the last month for a specific geographic area and property type.
-
-**Endpoint:** `/metrics/last-month`
-
-**Method:** GET
-
-**Query Parameters:**
-- `geog_id` (required): Geographic ID to filter by
-- `property_type` (optional): Property type to filter by. Use 'ALL' or leave empty for all property types combined.
-- `return_geojson` (optional): Set to 'true' to return data in GeoJSON format. Default is 'false'.
-
-
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/metrics/last-month?geog_id=g20_dpz9hct3&property_type=DETACHED"
-```
-
-**Response Example:**
-```json
-{
-  "month": "202407",
-  "geog_id": "g20_dpz9hct3",
-  "property_type": "DETACHED",
-  "median_price": 1187000,
-  "new_listings_count": 288
-}
-```
-
-**Response Structure:**
-
-- `month` (string): The year and month for which the metrics are calculated, formatted as `YYYYMM`.
-- `geog_id` (string): The geographic ID used for filtering the data.
-- `property_type` (string): The property type used for filtering the data.
-- `median_price` (number): The median sold price for properties in that geographic area and property type during the specified month.
-- `new_listings_count` (number): The number of new listings in that geographic area and property type during the specified month.
-
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/metrics/last-month?geog_id=g20_dpz9hct3&property_type=ALL&return_geojson=true"
-```
-
-**Response Example (GeoJSON format):**
-```json
-{
-  "type": "Feature",
-  "geometry": null,
-  "properties": {
-    "name": "Scarborough",
-    "geog_id": "g20_dpz9hct3",
-    "property_type": "ALL",
-    "level": 20,
-    "parent_geog_id": "g30_dpz89rm7",
-    "has_children": true,
-    "metric_type": "last_month_metrics",
-    "metric_data": {
-      "month": "202407",
-      "median_price": 1187000,
-      "new_listings_count": 288
-    }
-  }
-}
-```
-
-**Response Structure:**
-- `type` (string): Always "Feature" for GeoJSON format.
-- `geometry` (null): Geometry is not included in this response.
-- `properties` (object): Contains the geographic properties and metric data.
-  - `name` (string): The name of the geographic area.
-  - `geog_id` (string): The geographic ID used for filtering the data.
-  - `property_type` (string): The property type for which the monthly metrics are calculated.
-  - `level` (integer): The geographic level.
-  - `parent_geog_id` (string): The ID of the parent geographic area, if any.
-  - `has_children` (boolean): Indicates whether this geographic area has child areas.
-  - `metric_type` (string): The type of metric, in this case "last_month_metrics".
-  - `metric_data` (object): The last month's metrics data.
-    - `month` (string): The month for which the data is reported, formatted as "YYYYMM".
-    - `median_price` (number): The median sold price for the last month.
-    - `new_listings_count` (integer): The number of new listings in the last month.
-
-### 7. Absorption Rate
-
-Retrieves the absorption rate for a specific geographic area and property type.
-
-**Endpoint:** `/metrics/absorption-rate`
-
-**Method:** GET
-
-**Query Parameters:**
-- `geog_id` (required): Geographic ID to filter by
-- `property_type` (optional): Property type to filter by. Use 'ALL' or leave empty for all property types combined.
-- `return_geojson` (optional): Set to 'true' to return data in GeoJSON format. Default is 'false'.
-
-
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/metrics/absorption-rate?geog_id=g20_dpz9hct3&property_type=ALL"
-```
-
-**Response Example:**
-```json
-{
-  "month": "202408",
-  "geog_id": "g20_dpz9hct3",
-  "property_type": "ALL",
-  "sold_count": 373,
-  "current_count": 718,
-  "absorption_rate": 0.5194986072423399
-}
-```
-
-**Response Structure:**
-
-- `month` (string): The year and month for which the absorption rate is calculated, formatted as `YYYYMM`.
-- `geog_id` (string): The geographic ID used for filtering the data.
-- `property_type` (string): The property type used for filtering the data.
-- `sold_count` (number): The number of properties sold during the specified month.
-- `current_count` (number): The number of properties currently on the market during the specified month.
-- `absorption_rate` (number): The absorption rate, calculated as the ratio of `sold_count` to `current_count`.
-
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/metrics/absorption-rate?geog_id=g20_dpz9hct3&property_type=ALL&return_geojson=true"
-```
-
-**Response Example (GeoJSON format):**
-```json
-{
-  "type": "Feature",
-  "geometry": null,
-  "properties": {
-    "name": "Scarborough",
-    "geog_id": "g20_dpz9hct3",
-    "property_type": "ALL",
-    "level": 20,
-    "parent_geog_id": "g30_dpz89rm7",
-    "has_children": true,    
-    "metric_type": "absorption_rate",
-    "metric_data": {
-      "month": "202408",
-      "sold_count": 376,
-      "current_count": 695,
-      "absorption_rate": 0.5410071942446043
-    }
-  }
-}
-```
-
-**Response Structure:**
-- `type` (string): Always "Feature" for GeoJSON format.
-- `geometry` (null): Geometry is not included in this response.
-- `properties` (object): Contains the geographic properties and metric data.
-  - `name` (string): The name of the geographic area.
-  - `geog_id` (string): The geographic ID used for filtering the data.
-  - `property_type` (string): The property type for which the absorption rate is calculated.
-  - `level` (integer): The geographic level.
-  - `parent_geog_id` (string): The ID of the parent geographic area, if any.
-  - `has_children` (boolean): Indicates whether this geographic area has child areas.
-  - `metric_type` (string): The type of metric, in this case "absorption_rate".
-  - `metric_data` (object): The absorption rate data.
-    - `month` (string): The month for which the data is reported, formatted as "YYYYMM".
-    - `sold_count` (integer): The number of properties sold during the specified month.
-    - `current_count` (integer): The number of properties currently on the market.
-    - `absorption_rate` (number): The absorption rate, calculated as the ratio of sold_count to current_count.
-
-
-### 8. Get Geographic Entities
-
-Retrieves a list of geographic entities, optionally filtered by level and/or parent.
-
-**Endpoint:** `/geos`
-
-**Method:** GET
-
-**Query Parameters:**
-- `level` (optional): Filter by geographic level (e.g., 10, 20, 30, 35, 40)
-- `parent_id` (optional): Filter by parent geographic ID
-- `geometry` (optional): Include simplified geometry data if set to `true`
-
-**Example CURL requests:**
-```bash
-curl -X GET "http://your-api-domain.com/geos"
-curl -X GET "http://your-api-domain.com/geos?level=30"
-curl -X GET "http://your-api-domain.com/geos?parent_id=g20_dpz9hct3"
-curl -X GET "http://your-api-domain.com/geos?parent_id=g20_dpz9hct3&level=30&geometry=true"
-```
-
-**Response Example:**
-```json
-{
-  "type": "FeatureCollection",
-  "features": [
-    {
-      "type": "Feature",
-      "geometry": {
-        "type": "Polygon",
-        "coordinates": [
-          [
-            [-79.13454, 43.80196],
-            [-79.13535, 43.801],
-            [-79.13454, 43.80196]
-          ]
-        ]
-      },
-      "properties": {
-        "name": "West Rouge",
-        "geog_id": "g10_dpz9p7cv",
-        "level": 10,
-        "parent_geog_id": "g20_dpz9hct3",
-        "has_children": false
-      }
-    },
-    {
-      "type": "Feature",
-      "geometry": null,
-      "properties": {
-        "name": "Centennial Scarborough",
-        "geog_id": "g10_dpz8sdmg",
-        "level": 10,
-        "parent_geog_id": "g20_dpz9hct3",
-        "has_children": false
-      }
-    }
-  ]
-}
-```
-
-**Response Structure:**
-- `type`: Always "FeatureCollection" for this endpoint
-- `features`: An array of GeoJSON Feature objects, each representing a geographic entity
-  - `type`: Always "Feature" for each entity
-  - `geometry`: The simplified geometry of the entity (if requested), or `null` if not included
-  - `properties`: Contains the attributes of the geographic entity
-    - `name`: The name of the geographic entity
-    - `geog_id`: The unique identifier for the geographic entity
-    - `level`: The hierarchical level of the geographic entity
-    - `parent_geog_id`: The ID of the parent geographic entity, if applicable
-    - `has_children`: Indicates whether this geographic entity has child entities
-
-
-### 9. Search Geographic Entities
-
-Searches for geographic entities by name, optionally filtered by level.
-
-**Endpoint:** `/geos/search`
-
-**Method:** GET
-
-**Query Parameters:**
-- `query` (required): Search query string
-- `level` (optional): Filter by geographic level (e.g., 10, 20, 30, 35, 40)
-- `geometry` (optional): Include simplified geometry data if set to `true`
-
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/geos/search?query=Scarborough&level=10&geometry=true"
-```
-
-**Response Example:**
-```json
-{
-  "type": "FeatureCollection",
-  "features": [
-    {
-      "type": "Feature",
-      "geometry": {
-        "type": "Polygon",
-        "coordinates": [
-          [
-            [-79.23454, 43.76196],
-            [-79.23535, 43.761],
-            [-79.23454, 43.76196]
-          ]
-        ]
-      },
-      "properties": {
-        "name": "Scarborough Village",
-        "geog_id": "g10_dpz8v6u2",
-        "level": 10,
-        "parent_geog_id": "g20_dpz9hct3",
-        "has_children": false
-      }
-    },
-    {
-      "type": "Feature",
-      "geometry": {
-        "type": "Polygon",
-        "coordinates": [
-          [
-            [-79.25454, 43.78196],
-            [-79.25535, 43.781],
-            [-79.25454, 43.78196]
-          ]
-        ]
-      },
-      "properties": {
-        "name": "Scarborough City Centre",
-        "geog_id": "g10_dpz9h2fm",
-        "level": 10,
-        "parent_geog_id": "g20_dpz9hct3",
-        "has_children": false
-      }
-    }
-  ]
-}
-```
-
-**Response Structure:**
-Same as the "Get Geographic Entities" endpoint.
-
-**Notes:**
-- Returns an empty list (`[]`) if no matching geographic entities are found.
-
-### 10. Get Specific Geographic Entity
-
-Retrieves details of a specific geographic entity by its ID.
-
-**Endpoint:** `/geos/{geog_id}`
-
-**Method:** GET
-
-**Path Parameters:**
-- `geog_id` (required): The ID of the geographic entity to retrieve
-
-**Query Parameters:**
-- `geometry` (optional): Include full geometry data if set to `true`
-
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/geos/g10_dpz9p7cv?geometry=true"
-```
-
-**Response Example:**
-```json
-{
-  "type": "Feature",
-  "geometry": {
-    "type": "Polygon",
-    "coordinates": [
-      [
-        [-79.13454, 43.80196],
-        [-79.13535, 43.801],
-        [-79.13454, 43.80196]
-      ]
-    ]
-  },
-  "properties": {
-    "name": "West Rouge",
-    "geog_id": "g10_dpz9p7cv",
-    "level": 10,
-    "parent_geog_id": "g20_dpz9hct3",
-    "has_children": false
-  }
-}
-```
-
-**Response Structure:**
-- `type`: Always "Feature" for this endpoint
-- `geometry`: The full geometry of the entity (if requested), or `null` if not included
-- `properties`: Contains the attributes of the geographic entity (same as in previous endpoints)
-
-
-### 11. Get Geographic Hierarchy
-
-Retrieves the full hierarchy (ancestors) of a geographic entity.
-
-**Endpoint:** `/geos/hierarchy/{geog_id}`
-
-**Method:** GET
-
-**Path Parameters:**
-- `geog_id` (required): The ID of the geographic entity for which to retrieve the hierarchy
-
-**Query Parameters:**
-- `geometry` (optional): Include simplified geometry data if set to `true`
-
-**Example CURL request:**
-```bash
-curl -X GET "http://your-api-domain.com/geos/hierarchy/g20_dpz9hct3?geometry=true"
-```
-
-**Response Example:**
-```json
-{
-  "type": "FeatureCollection",
-  "features": [
-    {
-      "type": "Feature",
-      "geometry": {
-        "type": "Polygon",
-        "coordinates": [
-          [
-            [-79.63454, 43.70196],
-            [-79.63535, 43.701],
-            [-79.63454, 43.70196]
-          ]
-        ]
-      },
-      "properties": {
-        "name": "Greater Toronto Area",
-        "geog_id": "g40_dpz3tpuh",
-        "level": 40,
-        "parent_geog_id": null,
-        "has_children": true
-      }
-    },
-    {
-      "type": "Feature",
-      "geometry": {
-        "type": "Polygon",
-        "coordinates": [
-          [
-            [-79.33454, 43.75196],
-            [-79.33535, 43.751],
-            [-79.33454, 43.75196]
-          ]
-        ]
-      },
-      "properties": {
-        "name": "Toronto",
-        "geog_id": "g30_dpz89rm7",
-        "level": 30,
-        "parent_geog_id": "g40_dpz3tpuh",
-        "has_children": true
-      }
-    },
-    {
-      "type": "Feature",
-      "geometry": {
-        "type": "Polygon",
-        "coordinates": [
-          [
-            [-79.23454, 43.77196],
-            [-79.23535, 43.771],
-            [-79.23454, 43.77196]
-          ]
-        ]
-      },
-      "properties": {
-        "name": "Scarborough",
-        "geog_id": "g20_dpz9hct3",
-        "level": 20,
-        "parent_geog_id": "g30_dpz89rm7",
-        "has_children": true
-      }
-    }
-  ]
-}
-```
-
-**Response Structure:**
-Same as the "Get Geographic Entities" endpoint, with features ordered from the top-most ancestor to the specified geographic entity.
-
-### 12. Get GTA Cities
-
-Retrieves a list of cities in the Greater Toronto Area (GTA), optionally including geometry data.
-
-**Endpoint:** `/geos/gta-cities`
-
-**Method:** GET
-
-**Query Parameters:**
-- `geometry` (optional): Include geometry data for each city if set to `true`. Default is `false`.
-
-**Example CURL requests:**
-```bash
-curl -X GET "http://your-api-domain.com/geos/gta-cities?geometry=false"
-```
-```bash
-curl -X GET "http://your-api-domain.com/geos/gta-cities?geometry=true"
-```
-
-**Response Example (without geometry):**
-```json
-{
-  "type": "FeatureCollection",
-  "features": [
-    {
-      "type": "Feature",
-      "geometry": null,
-      "properties": {
-        "name": "Ajax",
-        "geog_id": "g30_dpzc9djg",
-        "level": 30,
-        "parent_geog_id": "g40_dpz3tpuh",
-        "has_children": true
-      }
-    },
-    {
-      "type": "Feature",
-      "geometry": null,
-      "properties": {
-        "name": "Aurora",
-        "geog_id": "g30_dpzd21k0",
-        "level": 30,
-        "parent_geog_id": "g40_dpz3tpuh",
-        "has_children": false
-      }
-    },
-    {
-      "type": "Feature",
-      "geometry": null,
-      "properties": {
-        "name": "Bradford West Gwillimbury",
-        "geog_id": "g30_dpz6urb8",
-        "level": 30,
-        "parent_geog_id": "g40_dpz3tpuh",
-        "has_children": false
-      }
-    }
-  ]
-}
-```
-
-**Response Example (with geometry):**
-```json
-{
-  "type": "FeatureCollection",
-  "features": [
-    {
-      "type": "Feature",
-      "geometry": {
-        "type": "Polygon",
-        "coordinates": [
-          [
-            [-78.99693, 43.89518],
-            [-78.9705, 43.83349],
-            // ... more coordinates ...
-          ]
-        ]
-      },
-      "properties": {
-        "name": "Ajax",
-        "geog_id": "g30_dpzc9djg",
-        "level": 30,
-        "parent_geog_id": "g40_dpz3tpuh",
-        "has_children": true
-      }
-    },
-    {
-      "type": "Feature",
-      "geometry": {
-        "type": "Polygon",
-        "coordinates": [
-          [
-            [-79.46693, 44.00018],
-            [-79.4505, 43.95349],
-            // ... more coordinates ...
-          ]
-        ]
-      },
-      "properties": {
-        "name": "Aurora",
-        "geog_id": "g30_dpzd21k0",
-        "level": 30,
-        "parent_geog_id": "g40_dpz3tpuh",
-        "has_children": false
-      }
-    }
-  ]
-}
-```
-
-**Response Structure:**
-- `type`: Always "FeatureCollection" for this endpoint.
-- `features`: An array of GeoJSON Feature objects, each representing a city.
-  - `type`: Always "Feature" for each entity.
-  - `geometry`: The city's geometry data if `geometry=true`, otherwise `null`.
-  - `properties`: Contains the attributes of the city.
-    - `name`: The name of the city.
-    - `geog_id`: The unique identifier for the city.
-    - `level`: The hierarchical level of the city (always 30 for cities).
-    - `parent_geog_id`: The ID of the parent geographic entity (GTA level).
-    - `has_children`: Indicates whether this city has sub-geographic entities.
-
-
-## Notes
-
-- All endpoints return GeoJSON-compliant responses.
-- The `geometry` field is only included when the `geometry` query parameter is set to `true`.
-- For endpoints returning multiple entities (`/geos`, `/geos/search`, `/geos/hierarchy/{geog_id}`), a simplified geometry is provided when requested.
-- For the single entity endpoint (`/geos/{geog_id}`), the full geometry is provided when requested.
-- If no data is found for the specified parameters, the API will return a 404 error with an appropriate error message (except for `/geos/search` which returns an empty list).
-- The `/geos/search` endpoint returns an empty FeatureCollection if no matching entities are found.
-- The `property_type` parameter is case-sensitive. Common values include 'DETACHED', 'SEMI-DETACHED', 'CONDO', etc. Use 'ALL' or omit the parameter to get data for all property types combined.
-- Historic sold metrics (price, DOM, over-ask, under-ask) provide time series data over a period of time, typically the last 5 years.
-- Last month metrics and absorption rate provide the most recent monthly data point.
-- Geographic entity endpoints support hierarchical data retrieval and navigation.
+Existing `/op/*` and `/monitor/*` endpoints are available only through the separate ETL-server app, `realestate_analytics.api.admin:app`, which requires the ETL server's scripts, log paths, and cache configuration. Do not expose the admin app without appropriate access controls.

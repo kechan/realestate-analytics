@@ -14,7 +14,7 @@ from dotenv import load_dotenv, find_dotenv
 # from realestate_analytics.etl.last_mth_metrics import LastMthMetricsProcessor
 # from realestate_analytics.etl.absorption_rate import AbsorptionRateProcessor
 
-from realestate_analytics.api.dependencies import get_cache
+from realestate_analytics.api.admin_dependencies import get_cache
 
 from realestate_analytics.api.cache_diagnostics import (
     CacheKeyInfo, 

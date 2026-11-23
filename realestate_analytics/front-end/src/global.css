@@ -1,0 +1,40 @@
+:root {
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #18212d;
+  background: #f5f7fa;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --accent: #b4232c;
+  --muted: #5c6c82;
+  --border: #e4e8ee;
+  --surface: #ffffff;
+  --background: #f5f7fa;
+}
+* { box-sizing: border-box; }
+html, body, #root { min-width: 320px; min-height: 100%; margin: 0; }
+body { margin: 0; font-size: 14px; line-height: 1.5; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button, select { cursor: pointer; }
+button { -webkit-tap-highlight-color: transparent; }
+button:disabled { cursor: default; }
+button, input, select { outline-offset: 3px; }
+:focus-visible { outline: 2px solid var(--accent); }
+button { touch-action: manipulation; }
+a { color: inherit; }
+h1, h2, h3, p, dl, dd { margin: 0; }
+button svg, a svg { flex-shrink: 0; }
+select {
+  min-height: 36px; border: 1px solid #d5dde7; border-radius: 6px; padding: 7px 34px 7px 12px;
+  background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%235c6c82' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") no-repeat right 10px center;
+  appearance: none; max-width: 100%; font-size: 13px;
+}
+.leaflet-container { font-family: inherit; background: #eef1f4; }
+.leaflet-control-attribution { font-size: 10px !important; max-width: calc(100vw - 60px); }
+.leaflet-control-zoom a { color: #18212d !important; font-weight: 400 !important; }
+.leaflet-bar { border: 1px solid #d5dde7 !important; border-radius: 6px !important; overflow: hidden; box-shadow: 0 1px 4px #18212d10 !important; }
+.leaflet-control-scale { margin-bottom: 8px !important; }
+.leaflet-control-attribution a { color: #3e5267; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+}

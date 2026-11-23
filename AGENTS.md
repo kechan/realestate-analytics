@@ -1,9 +1,35 @@
 # Repository Guidelines
 
+## IMS CSV preview: production-code reuse and debugging
+
+- Treat the main analytics/ETL project as an immutable third-party dependency
+  while working on this secondary tool. Do not modify its source files to make
+  preview easier. Keep implementation changes in the API/frontend and their tests.
+- CSV preview imports the existing `IMSPropertyTypeMapper` through
+  `api/ims_mapper_adapter.py`. Reuse its actual cache-first generation, inference,
+  and `apply_property_types()` manual-override methods; do not vendor or rewrite
+  those business rules. The adapter suppresses audit-file logging, removes save
+  destinations after loading inputs, and blocks `save_mapping()`.
+- **Sole user-approved duplication:** the final AB duplex exception is embedded
+  inside `Datastore.bulk_import_ims_sold_listings()` and
+  `Datastore.bulk_update_ims_sold_listings()` in `data/es.py`, with no pure helper
+  to import. `api/ims_provincial_rules.py:apply_provincial_exception()` mirrors it,
+  shared by the CSV adapter and ES lineage monitor.
+  See the refactor TODO in `TODO.md`; do not perform that production refactor here.
+- If CSV/ES classifications disagree after a production change, check the real
+  mapper and both embedded provincial blocks first. Update the API exception if
+  those provincial rules changed, and run `test_api_ims_csv.py`, whose drift test
+  compares both live production blocks. Restart FastAPI after mapper source
+  changes; Python imports remain loaded in its worker until restart.
+- Verify preview changes leave mapping feather files, ETL sighting logs, caches,
+  and ES untouched. Never call the ES-writing bulk import/update routines just
+  to obtain classifications.
+
 ## Project Structure & Module Organization
 
 - `realestate_analytics/`: Python package
   - `api/`: FastAPI app and endpoints (`realestate_analytics.api.main:app`).
+  - `front-end/`: Standalone React/TypeScript Market Explorer; project-local Node tooling and npm dependencies.
   - `etl/`: Batch pipelines and processors (e.g., monthly metrics, absorption rate).
   - `data/`: Data access (Elasticsearch, BigQuery, caching).
   - `utils/`, `visualization/`: Shared helpers and simple visualizations.
@@ -16,11 +42,41 @@
 
 - Use the project-local `.venv/bin/python`. If `.venv` is missing, ask before using `~/Developer/python39_env` or `~/Developer/python310_env`; do not use macOS system Python.
 - Dependency installation or upgrades require explicit user permission; do not run `pip install` automatically.
-- Run API (dev): `.venv/bin/python -m uvicorn realestate_analytics.api.main:app --reload --port 8001`
 - Run ETL example: `.venv/bin/python scripts/run_last_mth_metrics.py --config scripts/uat_config.yaml --prov_code ON` (requires configured services and `.env`; writes metrics/caches).
 - Run all tests: `.venv/bin/python -m unittest discover -s tests`
 - Run a single test file: `.venv/bin/python -m unittest discover -s tests -p 'test_absorption_rate.py'`
 - Before changing pipelines, read `CLAUDE.md` for operational rules and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full architecture, endpoints, and environment reference.
+
+### Start FastAPI and Market Explorer
+
+Run the backend and frontend in **two separate terminals**. The user manages these servers; do not start, restart, or stop them unless requested.
+
+**Terminal 1 — FastAPI**, from the repository root:
+
+```sh
+.venv/bin/python -m uvicorn realestate_analytics.api.main:app --host 127.0.0.1 --port 8013
+```
+
+If already in `realestate_analytics/api` with the intended Python virtual environment active, the equivalent command is:
+
+```sh
+python -m uvicorn realestate_analytics.api.main:app --app-dir ../.. --host 127.0.0.1 --port 8013
+```
+
+Use **no `--reload`**: the user prefers manual restarts to avoid file-watcher CPU usage. After backend code changes, stop and relaunch the API manually. Swagger UI: <http://127.0.0.1:8013/docs>.
+
+**Terminal 2 — frontend**, starting from the repository root:
+
+```sh
+cd realestate_analytics/front-end
+npm run dev
+```
+
+Open <http://127.0.0.1:5173/>. The npm scripts automatically use this frontend's local Node 24 runtime in `.tooling/` when installed; this is separate from Python. Do not change global Node, shared Python environments, or other projects such as kefinance. Do not install npm packages automatically; provide project-local commands for the user to run. See [the frontend README](realestate_analytics/front-end/README.md) for installation and build instructions.
+
+The Vite development server forwards `/api/v1` to `http://127.0.0.1:8013` by default; it does not launch FastAPI. To change the backend address, copy `realestate_analytics/front-end/.env.example` to `.env.local` in that same directory, set `API_PROXY_TARGET`, and restart the frontend. This optional frontend file is separate from the backend's home-directory environment files. Never put ES credentials in frontend environment variables.
+
+Keep both terminals open while using the app. Stop each server with **Ctrl-C in its own terminal**. **Ctrl-Z suspends a server rather than terminating it**, leaving its port occupied and requests unanswered. If a port is occupied, identify the owning process before acting; do not start duplicate servers or terminate unrelated apps.
 
 ## Coding Style & Naming Conventions
 

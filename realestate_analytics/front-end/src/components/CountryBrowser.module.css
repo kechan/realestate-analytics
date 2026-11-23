@@ -1,0 +1,57 @@
+.heading { padding: 22px 26px; }
+.heading h1 { font-size: clamp(30px, 3vw, 42px); line-height: 1.15; letter-spacing: -1.2px; }
+.heading p { color: var(--muted); margin-top: 7px; font-size: 14px; }
+.eyebrow { color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: 1.5px; margin-bottom: 6px; }
+.mapPanel { position: relative; flex-shrink: 0; min-height: 350px; height: clamp(360px, 61dvh, 690px); border: 1px solid var(--border); border-radius: 8px; background: #fdfefe; overflow: hidden; }
+.provinceMap { height: clamp(420px, calc(100dvh - 330px), 850px); min-height: 420px; }
+.map { position: relative; width: 100%; height: 100%; padding: 10px 16px 34px; background: radial-gradient(ellipse at 50% 50%, #fff, #f2f6f8); }
+.mapSvg { display: block; width: 100%; height: 100%; overflow: hidden; }
+.region { cursor: pointer; outline: none; }
+.region path { fill: #e0e7eb; stroke: #fff; stroke-width: 1.2px; transition: fill .12s; }
+.region text { pointer-events: none; text-anchor: middle; dominant-baseline: central; font-size: 16px; font-weight: 650; fill: #3d5060; }
+.activeRegion path, .region:hover path, .region:focus-visible path { fill: #e7a8ac; stroke: #b4232c; }
+.region:focus-visible path { stroke-width: 2.5px; }
+.activeRegion text { fill: #7e1e27; }
+.quietRegion path { fill: #edf1f3; }
+.mapCaption { position: absolute; top: 15px; left: 18px; font-size: 13px; color: #43576a; pointer-events: none; background: #ffffffe6; border: 1px solid var(--border); padding: 6px 10px; border-radius: 5px; }
+.attribution { position: absolute; right: 12px; bottom: 9px; font-size: 10px; color: var(--muted); text-decoration: none; }
+.attribution:hover { text-decoration: underline; }
+.backToCanada { position: absolute; z-index: 2; top: 14px; left: 14px; display: flex; align-items: center; gap: 4px; background: #fff; border: 1px solid var(--border); border-radius: 5px; padding: 6px 9px; font-size: 12px; }
+.quickStart { display: flex; justify-content: space-between; align-items: center; gap: 20px; background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 17px 24px; }
+.quickStart h2, .markets h2 { font-size: 17px; letter-spacing: -.3px; }
+.quickStart p, .marketHeading p { color: var(--muted); font-size: 12px; margin-top: 3px; }
+.markets { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 20px 24px; }
+.marketHeading { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+.marketGrid { margin-top: 16px; }
+.marketHeading input { min-width: 220px; width: 280px; max-width: 100%; border: 1px solid #d5dde7; border-radius: 6px; padding: 8px 11px; font-size: 13px; }
+.marketGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.marketGrid button { display: flex; justify-content: space-between; align-items: center; gap: 12px; text-align: left; min-height: 48px; background: #fafbfd; border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; font-size: 13px; }
+.marketGrid button:hover { background: #f9edef; border-color: #dca7ac; color: var(--accent); }
+.marketName { display: flex; flex-direction: column; gap: 2px; }
+.marketName small { font-size: 11px; color: var(--muted); }
+.pagination { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 17px; font-size: 12px; color: var(--muted); }
+.pagination > div { display: flex; gap: 8px; }
+.pagination button { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--border); border-radius: 5px; background: #fff; padding: 6px 8px; color: #26394a; }
+.pagination button:disabled { opacity: .45; }
+@media (max-width: 1023px) {
+  .mapPanel { height: 53dvh; min-height: 330px; }
+  .provinceMap { height: 62dvh; min-height: 400px; }
+  .heading { padding: 20px; }
+  .marketGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 600px) {
+  .heading { padding: 18px; }
+  .heading h1 { font-size: 32px; }
+  .heading p { font-size: 13px; }
+  .mapPanel { min-height: 320px; height: 47dvh; }
+  .provinceMap { min-height: 400px; height: 62dvh; }
+  .map { padding: 28px 0 30px; }
+  .region text { font-size: 30px; }
+  .mapCaption { top: 9px; left: 9px; font-size: 11px; padding: 4px 7px; }
+  .quickStart { align-items: flex-start; flex-direction: column; padding: 18px; gap: 13px; }
+  .markets { padding: 18px; }
+  .marketHeading { flex-direction: column; align-items: stretch; gap: 12px; }
+  .marketHeading input { width: 100%; font-size: 16px; }
+  .marketGrid { grid-template-columns: 1fr; }
+  .pagination { align-items: flex-start; flex-direction: column; }
+}

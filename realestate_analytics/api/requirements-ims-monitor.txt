@@ -1,0 +1,7 @@
+# Optional read-only monitor dependencies; already present in the local project venv.
+-r requirements.txt
+pandas==1.5.3
+pyarrow==15.0.2
+# Existing production mapper imports these; no installation is performed by the API.
+requests==2.31.0
+tqdm==4.65.0
